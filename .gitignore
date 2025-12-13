@@ -1,0 +1,6 @@
+base/
+__pycache__/
+.env
+annotations/
+logs
+questions_and_model_answers_json_and_scripts/
