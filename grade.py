@@ -205,20 +205,36 @@ grade_prompt = ChatPromptTemplate.from_template(
 - Mappings: {mappings}
 - Student answers: {chunks}
 
-### Absolute Rules (Never Break)
-- Grade strictly on conveyed meaning only.
-- Rephrased wording is acceptable only if the meaning is identical and complete.
-- Never award marks for keywords alone, partial ideas, or superficial similarity.
-- Never infer, assume, imply, or complete missing logic.
-- If the student's text does not fully and accurately match the required meaning → award 0 for that point.
-- Partial credit only if the marking criteria explicitly permits it (e.g., "1 mark per correct example").
-- When uncertain → always award 0.
+### Core Grading Principles
+  - Award marks when the student clearly conveys the required meaning, even if wording differs from the model answer.
+  - Rephrased answers are fully acceptable if they express identical or equivalent technical meaning.
+  - Credit should be given for correct application of concepts, accurate calculations, and logical structure.
+  - Do not require exact reproduction of model answer phrasing.
+  - Keywords alone are insufficient, but correct use within proper context can contribute.
+  - Only withhold marks if meaning is incomplete, incorrect, or absent.
+  - When significantly uncertain whether a point is fully met, default to 0 — but lean toward credit where understanding is evident.
 
 ### Scoring Precision
 - All scores in increments of 0.5 only (0, 0.5, 1, 1.5, etc.).
 - Never exceed the maximum_marks.
 - If maximum marks are not specified for individual questions or sub-questions, use the total marks stated in the question text not in the model answer but in the question and in that case treat all the questions as one.
 - At all times, ensure that the total awarded marks do not exceed the total marks defined for the question.
+
+### Structured Criteria Handling (Preferred Format)
+ - If marking_criteria is an array of objects (each with 'marks' and 'description'):
+   → Evaluate each item independently.
+   → Award the specified marks if the student's answer clearly satisfies the description.
+   → For "1 each" or "max X" items: count valid instances up to the limit.
+   → Sum awarded marks at the end.
+
+### Step-by-Step Grading Process (Follow This Order)
+ 1. Review all marking criteria items (array) or parse pipe-separated string if present.
+ 2. For each criterion, search the full student answer for evidence.
+ 3. Quote relevant student phrases that match the required meaning.
+ 4. Decide if the point is fully met, partially met (only if explicitly allowed), or not met.
+ 5. Award marks accordingly.
+ 6. Only after evaluating all points, calculate total score.
+ 7. Then generate feedback and JSON.
 
 ### Question Structure Rules (CRITICAL)
 - Examine the "questions" input first to determine if the question is single or has formal sub-questions.
@@ -278,7 +294,6 @@ grade_prompt = ChatPromptTemplate.from_template(
 ### Final Safeguards
 - Never output anything except the exact JSON.
 - Never reveal or paraphrase model answer content.
-- Always default to 0 when uncertain.
 - Prioritize strictness and accuracy above all.
     """
 )
