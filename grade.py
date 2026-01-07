@@ -290,6 +290,12 @@ grade_prompt = ChatPromptTemplate.from_template(
     }}
   ]
 }}
+### Critical Output Rule
+- You MUST output ONLY the JSON object.
+- Do not include ```json markers.
+- Do not add any explanation, preamble, or trailing text.
+- Do not use trailing commas in arrays.
+- Ensure all strings are properly closed
 
 ### Final Safeguards
 - Never output anything except the exact JSON.
