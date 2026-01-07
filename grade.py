@@ -35,7 +35,7 @@ class GradingItem(BaseModel):
     question_number: str = Field(..., description="The number of the question/sub-question, e.g., '1.1'.")
     score: str = Field(..., description="Marks obtained by the student, e.g., '3'.")
     total_marks: str = Field(..., description="Total marks for the question, e.g., '5', from maximum_marks, only include integer value nothing else like marks and other words.")
-    comment: str = Field(..., description="Feedback comment for the student, Should be concise but covering what went wrong and to the point, should not exceed three lines")
+    comment: List[str] = Field(..., description="Feedback comment for the student, Should be concise but covering what went wrong and to the point, should not exceed three lines")
     correct_lines: List[str] = Field(..., description="Exact lines from the student's answer that are deemed correct, should be exact matching with same wording and everything")
     correct_words: List[str] = Field(..., description="Exact words from the student's answer explaining why the lines are correct.")
 
@@ -217,6 +217,19 @@ grade_prompt = ChatPromptTemplate.from_template(
 ### Scoring Precision
 - All scores in increments of 0.5 only (0, 0.5, 1, 1.5, etc.).
 - Never exceed the maximum_marks.
+- If maximum marks are not specified for individual questions or sub-questions, use the total marks stated in the question text not in the model answer but in the question and in that case treat all the questions as one.
+- At all times, ensure that the total awarded marks do not exceed the total marks defined for the question.
+
+### Question Structure Rules (CRITICAL)
+- Examine the "questions" input first to determine if the question is single or has formal sub-questions.
+- If "questions" contains only one question object with no "sub_questions" array (or sub_questions is null) AND the total_marks applies to the whole question → this is a SINGLE holistic question.
+- In this case: Output EXACTLY ONE object in the "grades" array.
+  → Use "question_number" from the top-level "question" field in student answers that is chunks (e.g., "Question 1" or "1").
+  → Grade the entire student answer (all sub_parts concatenated if present) against the full model answer and criteria.
+  → total_marks = the overall marks for the question (28 in this case).
+- Only output multiple objects in "grades" if questions explicitly defines separate sub-questions with their own maximum marks.
+
+- Never split the grades array based solely on descriptive headings in the student's answer.
 
 ### Evidence (only when marks > 0)
 - correct_words: List of verbatim phrases taken directly from the student's answer that directly and fully justified the awarded marks.
@@ -245,9 +258,9 @@ grade_prompt = ChatPromptTemplate.from_template(
 {{
   "grades": [
     {{
-      "question_number": "keep exactly as given in student answer",
+      "question_number": "Exact value of the 'question' field if single question, or the sub-question identifier from questions if multiple.",
       "score": Integer or float value as score that student got,
-      "total_marks": maximum marks available for the question, don't include any keywords like marks,
+      "total_marks": maximum marks available for the question, extract it if maximum marks given in the model answer against each question or sub question, else use total marks for that question from the question itself, don't include any keywords like marks,
       "comments": [
         "Exact student answer words. Sub-topic/error 1: Description of error. What was missing/incorrect. Actionable advice.",
         "Exact student answer words. Sub-topic/error 2: Description of error. What was missing/incorrect. Actionable advice.",
@@ -269,97 +282,6 @@ grade_prompt = ChatPromptTemplate.from_template(
 - Prioritize strictness and accuracy above all.
     """
 )
-
-
-# grade_prompt = ChatPromptTemplate.from_template(
-#     """
-#     You are an objective examiner. You award marks ONLY when the student's answer explicitly and fully conveys the exact meaning required by the model answer and marking criteria. When in doubt, always award 0. Never be lenient.
-
-#     ### Input
-#     - Questions: {questions}
-#     - Model answers & marking criteria: {model_data}
-   
-#     - Student answers: {chunks}
-
-#     ### Absolute Rules (Never Break These)
-#     - Grade on **meaning only** — never on keywords, wording similarity, or superficial matches.
-#     - Never combine non-consecutive sentences to manufacture a point.
-#     - Never infer, assume, imply, or complete missing logic.
-#     - If the meaning or idea in the student’s text does not **fully and accurately** align with the model point → award **zero** for that point.
-#     - Partial credit is allowed **only if the marking criteria explicitly states it** (e.g., “1 mark per example”, “0.5 for each factor”, “half if…”). Never invent your own partial-credit scheme.
-#     - If uncertain whether an idea matches → always choose **zero**.
-
-#     ### Scoring Precision
-#     - All scores and sub-scores must be in **increments of 0.5 only** (0, 0.5, 1, 1.5, 2, 2.5, …).
-#     - Never use 0.75, 1.25, 1.33, 1.67, etc.
-
-#     ### Grading Process
-#     1. For each question, note its maximum_marks.
-#     2. Process every scorable annotation/point in the marking_criteria one by one.
-#     3. For each point:
-#     - Identify the precise meaning/concept required.
-#     - Search the student answer for a coherent section that fully and correctly expresses that exact meaning.
-#     - Award marks **only** according to what the criteria explicitly permits.
-#     - Missing, incomplete, vague, or incorrect → 0 for that point.
-#     4. Sum awarded marks → final question score (must be X or X.5 only).
-
-#     ### Evidence (only when marks > 0)
-#     - correct_lines: The minimal continuous block(s) of student text containing the evidence (total max 8 lines). Up to 2 separate blocks allowed only if clearly part of the same point. Preserve exact formatting, punctuation, and line breaks.
-#     - correct_words: A complete list of **all** verbatim phrases from the student's answer that directly justified awarding marks.
-#     • Each item must be an **exact substring** as written by the student (no rephrasing).
-#     • Ideal length per phrase: 3–10 words (2–12 allowed).
-#     • Include every critical phrase that contributed to the score.
-#     • Do not artificially limit or pad the count.
-#     • These phrases will be underlined/highlighted for the student, so completeness and precision are essential.
-#     • Order roughly as they appear in the answer.
-
-#     ### Feedback (only when score < maximum_marks)
-#     - comment: 2–3 short sentences:
-#     • Name the specific required points/ideas that were missing or incorrect.
-#     • One sentence of clear, actionable advice.
-#     - Keep it concise. No fluff, no compliments, no model answer text.
-
-#     ### No-Leak / No-Inference Clause
-#     - Do not infer unstated facts or supply missing premises.
-#     - Ambiguous or only topically related answers → 0 unless criteria explicitly allows partial credit.
-#     - Never reveal model answer content in any field.
-
-#     ### Special Conditions
-#     - Blank, unmapped, or irrelevant answer → score 0.0, empty arrays, comment: "No relevant content provided."
-#     - Never exceed maximum_marks.
-#     - Never use information not explicitly in model_data.
-
-#     ### Final Internal Verification
-#     - Every awarded mark maps to one annotation point only.
-#     - No point counted twice.
-#     - Total ≤ maximum_marks.
-#     - No model answer text appears anywhere in output.
-
-
-#     ### Final Safeguards
-#     - Never output reasoning outside the JSON.
-#     - Never include model answer text.
-#     - Always prefer 0 when uncertain.
-#     - Prioritize accuracy and leak-proofing above everything.
-
-#     ### Output Format
-#     Return **only** a single valid JSON object in the following structure (no extra text, no markdown, no explanations):
-
-#     {{
-#     "grades": [
-#         {{
-#         "question_number": keep the question number as it is given,
-#         "score": Integer or float value as score that student got,
-#         "total_marks": Max marks from model answers don't include key like marks and other only integer value,
-#         "comment": "string", 
-#         "correct_lines": ["string", "string"],
-#         "correct_words": ["string", "string"]
-#         }}
-#     ]
-#     }} 
-# """
-# )
-
 
 grade_chain = grade_prompt | llm_grader
 
@@ -383,7 +305,7 @@ def grade_student(student_pdf_path, student_name, questions_path, model_answers_
    
         # student_chunks = extract_answers(student_pdf_path, question_number, student_pages)
         student_chunks = extract_assignment_pipeline(student_pdf_path, student_pages)
-        # student_chunks = r'questions_and_model_answers_json_and_scripts/assignment/assignment_extracted_2025-12-08_02-06-55.json'
+        # student_chunks = r'questions_and_model_answers_json_and_scripts/assignment/assignment_extracted_2025-12-23_13-58-44.json'
         with open(student_chunks, 'r', encoding='utf-8') as f:
             student_chunks = json.load(f)
         # save_json(student_chunks, f'{student_name}_data.json')

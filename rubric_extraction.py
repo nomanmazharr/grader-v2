@@ -3,6 +3,8 @@ import fitz
 from llm_setup import client
 import json
 from logging_config import logger
+from datetime import datetime
+from pathlib import Path
 
 def _create_pdf_subset(pdf_path: str, pages: list[int]) -> io.BytesIO:
     """
@@ -37,7 +39,7 @@ def _upload_to_openai(pdf_buffer: io.BytesIO, filename: str = "subset.pdf"):
     logger.info(f"Uploaded → file_obj: {file_obj}")
     return file_obj
 
-model_answer_schema = {
+model_answer_schema_2 = {
     "type": "object",
     "properties": {
         "question_title": {
@@ -55,7 +57,7 @@ model_answer_schema = {
         "answers": {
             "type": "array",
             "description": "Model answer if no subsections are present for this question",
-            "items": {  # top-level answer object
+            "items": {
                 "type": "object",
                 "properties": {
                     "question_number": {
@@ -67,8 +69,23 @@ model_answer_schema = {
                         "description": "Model answer content for this question_number, never include marking criteria in answer"
                     },
                     "marking_criteria": {
-                        "type": ["string", "null"],
-                        "description": "Both typed marking criteria AND handwritten annotations merged here for the questions if possible headings, don't include answer in the marking criteria"
+                        "type": ["array", "null"],
+                        "description": "List of individual markable points from printed and handwritten criteria",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "marks": {
+                                    "type": ["number", "string"],
+                                    "description": "Mark value: number (0.5, 1, 2) or string like '1 each', 'max 4', 'OF', 'tick'"
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Exact original text describing what earns the mark"
+                                }
+                            },
+                            "required": ["marks", "description"],
+                            "additionalProperties": False
+                        }
                     },
                     "total_marks_available": {
                         "type": ["string", "null"],
@@ -81,18 +98,47 @@ model_answer_schema = {
                     "sub_answers": {
                         "type": ["array", "null"],
                         "description": "Nested subdivisions (e.g. (a), (b), (i), etc.)",
-                        "items": {  # recursive inline definition
+                        "items": {
                             "type": "object",
                             "properties": {
-                                "question_number": {"type": "string", "description": "Sub-subquestion number, don't include heading if question number explicitly present for sub answer"},
-                                "answer": {"type": ["string", "null"], "description": "Model answer content, don't include marking criteria in answers "},
-                                "marking_criteria": {"type": ["string", "null"], "description": "Merged marking criteria + handwritten notes, no answer in marking criteria"},
-                                "total_marks_available": {"type": ["string", "null"], "description": "Marks available"},
-                                "maximum_marks": {"type": ["string", "null"], "description": "Maximum marks"},
-                                "sub_answers": {  # can be nested further
+                                "question_number": {
+                                    "type": "string",
+                                    "description": "Sub-subquestion number, don't include heading if question number explicitly present for sub answer"
+                                },
+                                "answer": {
+                                    "type": ["string", "null"],
+                                    "description": "Model answer content, don't include marking criteria in answers"
+                                },
+                                "marking_criteria": {
+                                    "type": ["array", "null"],
+                                    "description": "List of individual markable points",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "marks": {"type": ["number", "string"]},
+                                            "description": {"type": "string"}
+                                        },
+                                        "required": ["marks", "description"],
+                                        "additionalProperties": False
+                                    }
+                                },
+                                "total_marks_available": {
+                                    "type": ["string", "null"],
+                                    "description": "Marks available"
+                                },
+                                "maximum_marks": {
+                                    "type": ["string", "null"],
+                                    "description": "Maximum marks"
+                                },
+                                "sub_answers": {
                                     "type": ["array", "null"],
                                     "description": "Further nested subdivisions",
-                                    "items": { "type": "object", "properties": {}, "required": [], "additionalProperties": False }
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {},
+                                        "required": [],
+                                        "additionalProperties": False
+                                    }
                                 }
                             },
                             "required": ["question_number", "answer", "marking_criteria", "total_marks_available", "maximum_marks", "sub_answers"],
@@ -108,7 +154,6 @@ model_answer_schema = {
     "required": ["question_title", "answers", "description", "total_marks"],
     "additionalProperties": False
 }
-
 
 def _extract_rubric_with_vision(file_obj):
     response = client.responses.create(
@@ -135,7 +180,7 @@ IMPORTANT GLOBAL RULES:
 - Preserve wording EXACTLY as written. No rewriting, rephrasing, summarizing, or adding interpretations.
 - NEVER omit marking criteria for any subsection if marking criteria text or annotations exist anywhere in the PDF.
 - ALWAYS extract marking criteria for the main question AND for each subsection separately if present.
-- Handwritten annotations (red ink) must be merged directly into the `marking_criteria` string of the corresponding question or subsection.
+- Handwritten annotations (red ink) must be merged directly into the `marking_criteria` array as separate objects.
 - If marking criteria or annotations apply to multiple subsections or the entire main question, you MUST replicate the entire block across all relevant parts.
 - If unsure where a criteria block or annotation belongs → assign it to the main question AND to all subsections to avoid any loss.
 
@@ -168,37 +213,56 @@ Use `sub_answers` only when real nesting exists.
 - Extract maximum_marks from phrases like "Maximum marks", "Maximum full marks", "Maximum", "[6]", etc.
 - Extract total_marks_available from "Total Possible Marks", "Marks Available", "Total Marks", etc.
 - Never duplicate maximum/total marks in child levels — only once at the correct parent level.
-- NEVER leave maximum_marks or total_marks_available.
-- If a subsection has nested sub-subsections, maximum marks and total available marks appear ONLY once for the parent subsection, never include them in further subsections only once in parent.
-- Always remember that sum of all the sub-section marks should never increase the maximum marks by summing them up when we allocate marks. 
+- NEVER leave maximum_marks or total_marks_available null if present — use the table or text values.
+- If a subsection has nested sub-subsections, maximum marks and total available marks appear ONLY once for the parent subsection.
+- Use high-level table marks (e.g., 26 for (a)) for total_marks_available and maximum_marks fields — NOT in marking_criteria array.
 
-5. Marking Criteria & Annotations Handling — REAL-WORLD VERSION
+5. Marking Criteria & Annotations Handling — STRUCTURED VERSION (REQUIRED)
+
 For every question and subsection:
-- Collect ALL printed marking points AND ALL handwritten red-ink marks/annotations that apply.
-- Handwritten marks are usually just numbers (½, 1, ¼, 1.5, 2, etc.) written in the margin or very close to the relevant line of text.
-- For each such mark, write it together with the exact content it is placed next to.
-- Combine everything into ONE single string, separating different awarded items with " | ".
-- Preserve original wording 100% — e.g.:
-  "½ correct definition of RAM"
-  "1 explained volatility"
-  "¼ speed mentioned"
-  "2 labelled diagram"
-  "1 each for any three advantages"
-  "tick correct unit"
-  "see over"
-- If a printed marking scheme exists (e.g., bullet points at the top), include those lines exactly as written.
-- Never add words like "Handwritten:", "Red ink:", or "Annotation:".
-- If no marking criteria or annotations apply → empty string "".
+- Identify ALL individual marking points from printed criteria and handwritten red annotations.
+- Focus on detailed red marks next to model answer lines — ignore high-level table marks (use those for total_marks_available/maximum_marks).
+- Each separate red mark (e.g., ½, 1, ¼, "1 each", "max 3", "tick") next to a line becomes ONE object.
+- Pair each mark with the EXACT nearest sentence or phrase in the model answer text.
 
-Example marking_criteria strings:
-"1 mark for correct definition | 2 marks for labelled diagram | ½ volatility | ½ speed | 1 each advantage"
-"½ formula | 1 substitution | ½ unit | tick answer"
-"Full marks if all points covered | see model answer"
+Create one object per point:
+{
+  "marks": <number if possible (0.5, 1, 2, 0.25) — or original string like "1 each", "max 4", "OF", "tick">,
+  "description": "<exact original wording from the model answer line the mark is next to — preserve 100%>"
+}
+
+Rules:
+- Scan every page for red marks and pair with closest text line.
+- Never merge points — one object per mark.
+- Include printed detailed criteria (e.g., bullet points) as separate items if not already covered by red marks.
+- Include general notes (e.g., "Tutorial note: ...", "Own figure rule") as separate items.
+- If criteria apply to multiple parts → duplicate array.
+- If no detailed criteria → empty array []
+
+Generic examples of correct items (from red marks next to text):
+- {"marks": 0.5, "description": "correct definition of key term"}
+- {"marks": 1, "description": "explained process with example"}
+- {"marks": 0.25, "description": "mentioned relevant factor"}
+- {"marks": 2, "description": "fully labelled diagram provided"}
+- {"marks": "1 each", "description": "for any valid point (max 3)"}
+- {"marks": 0.5, "description": "correct formula stated"}
+- {"marks": 0.5, "description": "unit included in answer"}
+- {"marks": "tick", "description": "correct final calculation"}
+- {"marks": "OF", "description": "own figure rule applies"}
+
+Example full array:
+[
+  {"marks": 1, "description": "correct identification of main concept"},
+  {"marks": 0.5, "description": "relevant principle applied"},
+  {"marks": "1 each", "description": "for each valid example (max 2)"},
+  {"marks": 2, "description": "accurate calculation shown"}
+]
 
 ---
 
 Return only valid JSON — no markdown, no commentary, no preamble.
-"""}
+"""
+}
                 ]
             }
         ],
@@ -207,7 +271,7 @@ Return only valid JSON — no markdown, no commentary, no preamble.
                 "type": "json_schema",
                 "name": "universal_exam_rubric",
                 "strict": True,
-                "schema": model_answer_schema  # this is your updated flexible schema
+                "schema": model_answer_schema_2  # this is your updated flexible schema
             }
         }
     )
@@ -224,8 +288,6 @@ Return only valid JSON — no markdown, no commentary, no preamble.
         logger.debug(f"Raw output: {raw_json[:500]}...")
         raise
 
-from datetime import datetime
-from pathlib import Path
 def extract_pdf_annotations_pipeline(pdf_path: str, pages: list[int], output_dir= "questions_and_model_answers_json_and_scripts"):
     """
     Full end-to-end pipeline:

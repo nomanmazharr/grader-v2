@@ -80,7 +80,7 @@ def grade_and_annotate_student(
             question_number=question_num,
             student_pages=student_pages
         )
-        # grades_csv_path = "Nov_25_testing/student_assignment/grades/amber_g_grades_20251213_115322.csv"
+        # grades_csv_path = "student_assignment/grades/jack_atwood_grades_20251223_135719.csv"
         if not grades_csv_path or not os.path.isfile(grades_csv_path):
             logger.error(f"Grading failed for {student_name} (Q{question_num})")
             return False, "Grading failed", None
@@ -131,6 +131,8 @@ def process_exam(
     rubric_ok, model_answers_path = extract_marking_rubric(model_answer_pdf_path, answer_pages)
     if not rubric_ok:
         model_answers_path = None  # Let grader fall back to text-based marking
+    # questions_path = "questions_and_model_answers_json_and_scripts/question/question_extracted_2026-01-06_13-07-13.json"
+    # model_answers_path = "questions_and_model_answers_json_and_scripts/rubric/rubric_extracted_2026-01-06_15-19-05.json"
 
     # Step 3: Grade + Annotate
     success, message, output_pdf = grade_and_annotate_student(
@@ -153,13 +155,13 @@ def process_exam(
 #     logger.info("Exam Grading Pipeline")
 
 #     process_exam(
-#         question_pdf_path='Nov_25_testing/dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf',
+#         question_pdf_path='dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf',
 #         question_pages=[2,3,4],
 #         question_num='1',
-#         model_answer_pdf_path='Nov_25_testing/dataset/Bauhaus prepped answer.pdf',
+#         model_answer_pdf_path='dataset/Bauhaus prepped answer.pdf',
 #         answer_pages=[9,10,11,12,13,14,15],
-#         student_pdf_path='Nov_25_testing/dataset/Amber Greaves_612194_assignsubmission_file_Amber Greaves CR Tuition Exam.pdf',
-#         student_pages=[1,2,3,4,5,6,7,8],
-#         student_name='amber_greeves',
-#         output_dir='annotation_nov25'
+#         student_pdf_path='dataset/Christian Easson_564541_assignsubmission_file_CR_TC_CHRISTIAN_EASSON.pdf',
+#         student_pages=[1,2],
+#         student_name='christian_easson',
+#         output_dir='annotations'
 #     )

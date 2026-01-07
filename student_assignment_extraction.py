@@ -80,30 +80,29 @@ def _extract_assignment_with_vision(file_obj):
                 "role": "user",
                 "content": [
                     {"type": "input_file", "file_id": file_obj.id},
-                    {"type": "input_text", "text": """You are an expert at extracting and structuring handwritten or typed student answers from exam answer sheet PDFs.
+                    {"type": "input_text", "text": """You are an expert at extracting and structuring handwritten or typed student answers from PDFs.
 
 CRITICAL RULES:
 - Extract ONLY the complete answer of the main question visible on the page.
 - NEVER merge or pull content from any overlapping/neighbouring question.
 - Identify the main question number from the first clear label (e.g., Q1, Q.1, 1., Question 1, etc.).
 
-SUB-SECTION DETECTION (in priority order):
-1. If the student explicitly wrote numbered or lettered sub-parts such as:
-   1.1, 1.2, 1(a), 1(b), a), b), c), (i), (ii), (A), (B), A., B., etc.
-   → treat each as a separate sub_part with that exact id.
+SUB-SECTION DETECTION (strict priority order – apply ONLY the first that matches):
+1. If the student has explicitly written numbered or lettered sub-parts such as:
+   1.1, 1.2, 1(a), 1(b), a), b), c), (i), (ii), (A), (B), A., B., (i), (ii), i), ii), etc.
+   → treat each as a separate sub_part with that exact identifier as question_number.
 
-2. If there are NO such numbered/lettered labels, but the student used clear **headings** (usually bold, underlined, capitalized, or on a new line) such as:
-   Advantages, Disadvantages, Definition, Types of ROM, Working, Conclusion, etc.
-   → treat each heading as a separate sub_part and use the heading text as the id.
-
-3. If neither (1) nor (2) exists (plain continuous text, bullet points, or numbered list that is part of explanation)
-   → treat the entire answer as ONE single sub_part with id equal to the main question number.
+2. OTHERWISE – even if the student uses bold headings, topic titles, underlined phrases, or descriptive section names – treat the entire answer as ONE single question.
+   → Output exactly ONE sub_part.
+   → Use the main question identifier (e.g., "Question 1" or "1") as the question_number.
+   → Concatenate all content in order, preserving paragraphs and line breaks.
 
 Additional rules:
 - Preserve original line breaks with \n\n between paragraphs.
-- Keep bullet points, numbering, diagrams descriptions exactly as written.
-- Ignore page headers like “Word Processing”, “Continued…”, watermarks, etc.
-- Do NOT invent headings or sub-parts that are not visibly separated by the student.
+- Keep bullet points, numbering, tables, and diagram descriptions exactly as written.
+- Ignore page headers, footers, “Continued…”, watermarks, candidate numbers, etc.
+- NEVER invent or create sub-parts based on content headings or topic names.
+- Do NOT treat descriptive headings as sub-question identifiers.
 
 ---
 
@@ -171,7 +170,7 @@ def extract_assignment_pipeline(pdf_path: str, pages: list[int], output_dir= "qu
         logger.debug(f"Traceback: {e}", exc_info=True)
         return None
 
-if __name__ == "__main__":
-    pdf_path = "Nov_25_testing/dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf"
-    pages = [2,3,4]
-    extract_assignment_pipeline(pdf_path, pages)
+# if __name__ == "__main__":
+#     pdf_path = "Nov_25_testing/dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf"
+#     pages = [2,3,4]
+#     extract_assignment_pipeline(pdf_path, pages)

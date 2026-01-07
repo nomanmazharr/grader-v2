@@ -6,3 +6,5 @@ logs/
 questions_and_model_answers_json_and_scripts/
 student_assignments/
 test_assignments_and_mappings/
+dataset/
+student_assignment/
