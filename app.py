@@ -20,7 +20,7 @@ def parse_pages(page_str):
 
 def main():
     st.set_page_config(page_title="Exam Grader", page_icon="📚", layout="wide")
-    st.title("📚 Automated Exam Grader")
+    st.title("📚 Automated Exam Grader - Numerical")
     
     # Temp directory for uploaded files
     temp_dir = tempfile.mkdtemp(prefix="exam_grader_")
