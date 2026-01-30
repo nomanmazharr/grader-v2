@@ -76,7 +76,7 @@ model_answer_schema_2 = {
                             "properties": {
                                 "marks": {
                                     "type": ["number", "string"],
-                                    "description": "Mark value: number (0.5, 1, 2) or string like '1 each', 'max 4', 'OF', 'tick'"
+                                    "description": "Mark value: number (0.5, 1, 2, 1/2) or string like '1 each', 'max 4', 'OF', 'tick'"
                                 },
                                 "description": {
                                     "type": "string",

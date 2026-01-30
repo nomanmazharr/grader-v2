@@ -197,7 +197,7 @@ grade_parser = PydanticOutputParser(pydantic_object=GradingList)
 
 grade_prompt = ChatPromptTemplate.from_template(
     """
-    You are a strict, objective examiner. You award marks only when the student's answer explicitly and fully conveys the exact meaning required by the model answer and marking criteria. When in doubt, always award 0. Never be lenient.
+    You are a strict but fair objective examiner. Award marks when the student's answer clearly conveys the required meaning from the model answer and marking criteria, even if partial understanding is evident.
 
 ### Input
 - Questions: {questions}
@@ -206,223 +206,309 @@ grade_prompt = ChatPromptTemplate.from_template(
 - Student answers: {chunks}
 
 ### Core Grading Principles
-  - Award marks when the student clearly conveys the required meaning, even if wording differs from the model answer.
-  - Rephrased answers are fully acceptable if they express identical or equivalent technical meaning.
-  - Credit should be given for correct application of concepts, accurate calculations, and logical structure.
-  - Do not require exact reproduction of model answer phrasing.
-  - Keywords alone are insufficient, but correct use within proper context can contribute.
-  - Only withhold marks if meaning is incomplete, incorrect, or absent.
-  - When significantly uncertain whether a point is fully met, default to 0 — but lean toward credit where understanding is evident.
+  - Award marks when the student conveys the required meaning, even if wording differs.
+  - Rephrased answers are acceptable if they express identical or equivalent technical meaning.
+  - Credit correct application of concepts, accurate calculations, logical structure.
+  - Do not require exact model answer phrasing.
+  - Keywords alone are insufficient — must be in correct context.
+  - Withhold full marks if meaning is incomplete or incorrect, but award partial if substantial understanding is shown.
+  - When uncertain, default to partial credit if evidence indicates some grasp.
 
 ### Scoring Precision
-- All scores in increments of 0.5 only (0, 0.5, 1, 1.5, etc.).
-- Never exceed the maximum_marks.
-- If maximum marks are not specified for individual questions or sub-questions, use the total marks stated in the question text not in the model answer but in the question and in that case treat all the questions as one.
-- At all times, ensure that the total awarded marks do not exceed the total marks defined for the question.
+- Use **exactly** the 'marks' values from each marking_criteria item.
+- Never invent or force increments - follow the scale defined in model_data (0.25, 0.5, 1, etc.).
+- Never exceed maximum_marks or any per-item 'marks' value.
+- Prefer explicit 'total_marks', 'maximum_marks' or 'total_marks_available' from model_data if present.
+- If absent, use total marks from question JSON and treat as one holistic question.
+- Total awarded marks must never exceed the defined total.
 
-### Structured Criteria Handling (Preferred Format)
- - If marking_criteria is an array of objects (each with 'marks' and 'description'):
-   → Evaluate each item independently.
-   → Award the specified marks if the student's answer clearly satisfies the description.
-   → For "1 each" or "max X" items: count valid instances up to the limit.
-   → Sum awarded marks at the end.
+### Structured Criteria Handling
+- marking_criteria is an array of objects (each with 'marks' and 'description').
+  → Evaluate **each individual item separately** — never combine, merge, or group multiple criteria items into one evaluation or one breakdown entry under any circumstances.
+  → Award **exactly** the numeric 'marks' value from that specific item when fully satisfied.
+  → If 'marks' is non-numeric ("N/A", "1 each", "½ each", "max X"):
+     - "1 each" → award 1 per valid instance (up to any stated max)
+     - "½ each" → award 0.5 per valid instance
+     - "max X" → count up to X, award per-instance value
+  → Keep every awarded point as a separate breakdown entry — do NOT reduce granularity.
+  → Sum all awarded marks precisely.
 
-### Step-by-Step Grading Process (Follow This Order)
- 1. Review all marking criteria items (array) or parse pipe-separated string if present.
- 2. For each criterion, search the full student answer for evidence.
- 3. Quote relevant student phrases that match the required meaning.
- 4. Decide if the point is fully met, partially met (only if explicitly allowed), or not met.
- 5. Award marks accordingly.
- 6. Only after evaluating all points, calculate total score.
- 7. Then generate feedback and JSON.
+### Step-by-Step Grading Process
+1. Review marking_criteria array in model_data.
+2. For each criterion, search full student answer for evidence.
+3. Quote exact student phrases that match.
+4. Decide: fully met → full marks from that item; partially met → half or quarter of that item's marks if criterion has sub-parts or student shows partial understanding; otherwise 0 or full.
+5. Award marks strictly per criterion, following its 'marks' value.
+6. After all criteria, calculate total score (sum of awarded).
+7. Generate feedback and JSON.
 
 ### Question Structure Rules (CRITICAL)
 - Examine the "questions" input first to determine if the question is single or has formal sub-questions.
 - If "questions" contains only one question object with no "sub_questions" array (or sub_questions is null) AND the total_marks applies to the whole question → this is a SINGLE holistic question.
-- In this case: Output EXACTLY ONE object in the "grades" array.
-  → Use "question_number" from the top-level "question" field in student answers that is chunks (e.g., "Question 1" or "1").
+  → Output EXACTLY ONE object in the "grades" array.
+  → Use "question_number" from the top-level "question" field in student answers that is chunks (e.g., "Question 1" or "1" or "Required").
   → Grade the entire student answer (all sub_parts concatenated if present) against the full model answer and criteria.
-  → total_marks = the overall marks for the question (28 in this case).
+  → total_marks = the overall marks for the question (from question JSON or model_data top-level).
 - Only output multiple objects in "grades" if questions explicitly defines separate sub-questions with their own maximum marks.
-
-- Never split the grades array based solely on descriptive headings in the student's answer.
+- Never split the grades array based solely on descriptive headings in the student's answer or internal model_data "answers" array.
+- Do not create separate grade objects for internal sub-parts like "(a)", "(b)", "(c)" even if present in model_data — treat everything under the single top-level question.
 
 ### Evidence (only when marks > 0)
-- correct_words: List of verbatim phrases taken directly from the student's answer that directly and fully justified the awarded marks.
-  • Each phrase must be an exact substring from the student (no rephrasing).
-  • Length: 3-12 words per phrase.
-  • Include every critical phrase that contributed to the score.
-  • These will be highlighted for the student to show exactly what earned marks.
-  • Order roughly as they appear in the answer.
+- correct_words: verbatim phrases from student that justified awarded marks.
+  • Exact substring (no rephrasing).
+  • 3–15 words per phrase.
+  • Include every critical phrase.
+  • Avoid duplicating same phrase across items.
+  • Order roughly as they appear.
+  • Never include any main headings in the evidence only those phrases for which marks were awarded.
 
-### Feedback (only when score < maximum_marks)
-- comments: An array of strings.
-  • Provide one separate comment for each major sub-topic, issue, or error area.
-  • Every comment must strictly follow this exact generic format (no exceptions):
-    "<5-10-word verbatim quote from student> → <error description>. <actionable advice>."
-  • The quote at the beginning must be copied character-for-character from the student's answer (unique but should be searchable in the pdf) so the marker instantly knows where to place the comment in the PDF.
-  • After "→" write exactly two short sentences:
-      - First sentence: Precisely state what is missing, incomplete, or incorrect.
-      - Second sentence: One clear, concise, actionable piece of advice.
-  • Never use bullet points, numbering, or extra text inside the comment string.
-  • Never reveal any part of the model answer.
+### Detailed Breakdown (only for awarded points)
+Include "breakdown" array only when score > 0.
+
+Each object corresponds to **one single marking_criteria item** that was awarded marks > 0.
+
+Rules:
+- For every marking_criteria item where you award marks > 0, create **exactly one** breakdown entry.
+- It is forbidden to combine two or more marking_criteria items into one breakdown entry under any circumstances.
+- Use the **exact 'description'** from that marking_criteria item (or very close paraphrase) as the "criterion" title.
+- "max_possible" must be **exactly** the numeric 'marks' value from that item.
+- "marks_awarded" must not exceed the 'max_possible' for that specific item.
+- SUM of all marks_awarded across the breakdown MUST EQUAL the "score".
+- If score = 0.0 → omit "breakdown" or use empty array [].
+- "evidence": array of 1-3 **exact verbatim substrings** from student answer that directly justified the awarded marks. Use the exact content as it appears in the student answer (including numbers with commas, £/$, %, proper nouns), even if spellings are wrong. Do not add ... or any other special symbols; use only words and numbers that appear as is. If no words are present, use the number alone if unique. Keep phrases short (4-10 words) and unique to identify the location for placement using fitz search (which looks for exact substrings in the PDF text layer). Note: This evidence will be used with fitz to search the PDF text layer for exact matches, so make it literal, unique, and findable.
+
+### Feedback Output Requirements
+comments: An array of strings.
+
+Each string must represent one feedback comment and must follow all rules below without exception.
+
+Content rules
+
+- Provide one separate comment for each major sub-topic, issue, or error area.
+- In addition to major issues, include comments where the student’s answer is incorrect or incomplete and could receive more marks.
+- Do not include praise-only comments.
+
+Mandatory format (strict)
+Each comment string must follow this exact format:
+
+"<5–10 word verbatim quote from student> → <error description>. <actionable advice>."
+
+Quote rules:
+- The quote must be copied character-for-character from the student’s answer.
+- The quote must be unique, precise, and searchable in the PDF (used with fitz).
+- Do not paraphrase, summarize, or modify the quote in any way.
+- The quoted text must appear exactly as written in the student’s PDF.
+
+Text after the arrow (→)
+
+Write exactly two short sentences:
+- Sentence 1: Clearly state what is missing, incorrect, or incomplete.
+- Sentence 2: Provide one clear, concise, actionable improvement.
+
+Do not include examples, explanations, or model-answer content.
+
+Strict prohibitions
+- Do not use bullet points, numbering, line breaks, or extra text inside a comment string.
+- Do not reveal or reference any part of the model answer.
+- Do not add introductions, conclusions, or explanations outside the array.
+- Do not deviate from the required format under any circumstances.
 
 ### Special Cases
 - No relevant content → score 0.0, correct_words empty, comments: ["No relevant content provided."]
 
-### Output Format (ONLY this valid JSON, nothing else)
+### Output Format (ONLY this valid JSON)
 {{
   "grades": [
     {{
-      "question_number": "Exact value of the 'question' field if single question, or the sub-question identifier from questions if multiple.",
-      "score": Integer or float value as score that student got,
-      "total_marks": maximum marks available for the question, extract it if maximum marks given in the model answer against each question or sub question, else use total marks for that question from the question itself, don't include any keywords like marks,
-      "comments": [
-        "Exact student answer words. Sub-topic/error 1: Description of error. What was missing/incorrect. Actionable advice.",
-        "Exact student answer words. Sub-topic/error 2: Description of error. What was missing/incorrect. Actionable advice.",
-        "..."
-      ],
-      "correct_words": [
-        "exact phrase from student that earned marks 1",
-        "exact phrase from student that earned marks 2",
-        "..."
+      "question_number": "...",
+      "score": number,
+      "total_marks": number,
+      "comments": ["quote → description. Advice.", "..."],
+      "correct_words": ["phrase1", "..."],
+      "breakdown": [
+        {{"criterion": "exact description from criteria", "marks_awarded": 0.5, "max_possible": 0.5, "evidence": ["..."], "reason": "Fully correct"}},
+        ...
       ]
     }}
   ]
 }}
-### Critical Output Rule
-- You MUST output ONLY the JSON object.
-- Do not include ```json markers.
-- Do not add any explanation, preamble, or trailing text.
-- Do not use trailing commas in arrays.
-- Ensure all strings are properly closed
 
-### Final Safeguards
-- Never output anything except the exact JSON.
-- Never reveal or paraphrase model answer content.
-- Prioritize strictness and accuracy above all.
+### Critical Output Rules
+- Output ONLY the JSON — no text, no ```json, no explanations.
+- No trailing commas.
+- All strings properly closed.
+- Prioritize accuracy, granularity of marking_criteria, balanced feedback, and single holistic output for combined questions.
     """
 )
-
 grade_chain = grade_prompt | llm_grader
 
 def grade_student(student_pdf_path, student_name, questions_path, model_answers_path, question_number, student_pages):
-    """Grade a student's PDF and save results to CSV."""
+    """Grade a student's PDF and save results to CSV with detailed breakdown."""
     try:
-        # student_pdf_path = os.path.join(input_dir, f"{student_name}.pdf")
         if not os.path.exists(student_pdf_path):
             logger.error(f"Student PDF not found: {student_pdf_path}")
             return None
 
-        # Ensure grades directory exists
         grades_dir = os.path.join("student_assignment", "grades")
         os.makedirs(grades_dir, exist_ok=True)
 
-        # Generate output CSV path with timestamp
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_csv = os.path.join(grades_dir, f"{student_name}_grades_{timestamp}.csv")
 
         questions, model_data = load_json_data(questions_path, model_answers_path)
-   
-        # student_chunks = extract_answers(student_pdf_path, question_number, student_pages)
-        student_chunks = extract_assignment_pipeline(student_pdf_path, student_pages)
-        # student_chunks = r'questions_and_model_answers_json_and_scripts/assignment/assignment_extracted_2025-12-23_13-58-44.json'
-        with open(student_chunks, 'r', encoding='utf-8') as f:
+
+        # Log model_data structure for debugging
+        logger.info(f"model_data type: {type(model_data)}")
+        if isinstance(model_data, dict):
+            logger.info(f"model_data keys: {list(model_data.keys())}")
+        elif isinstance(model_data, list):
+            logger.info(f"model_data length: {len(model_data)}, first item type: {type(model_data[0]) if model_data else 'empty'}")
+
+        student_chunks_path = extract_assignment_pipeline(student_pdf_path, student_pages)
+        with open(student_chunks_path, 'r', encoding='utf-8') as f:
             student_chunks = json.load(f)
-        # save_json(student_chunks, f'{student_name}_data.json')
+
         logger.info(f"Loaded student assignment data for question number: {question_number}")
-        logger.info(f"Student's Assignment: {student_chunks}")
 
         if not student_chunks:
             logger.error(f"No answers could be extracted for {student_name}. Skipping grading.")
             return None
 
-        # Map to questions
+        # Mapping step
         map_output = map_chain.invoke({
             "chunks": student_chunks,
             "questions": json.dumps(questions)
         })
-        
-        print(map_output)
-        parsed_output = json.loads(map_output.content)
-        save_json(parsed_output, f'{student_name}_mappings.json')
-        logger.info(f"Mapped question number to the student assignments: {parsed_output}")
-        # Now you can access the "mappings" list
-        mappings = parsed_output["mappings"]
-        
-        logger.info(f"Starting grading for {student_name} for question number {question_number}")
+        parsed_mapping = json.loads(map_output.content)
+        mappings = parsed_mapping["mappings"]
+        save_json(parsed_mapping, f'{student_name}_mappings.json')
+        logger.info(f"Mapped question number to the student assignments")
+
+        # Grading step
         grade_output = grade_chain.invoke({
             "mappings": mappings,
             "model_data": json.dumps(model_data),
             "chunks": student_chunks,
             "questions": json.dumps(questions)
         })
-        logger.info(f"Grading done saving data into csv for: {student_name}")
-        # print(grade_output)
-        raw_content = grade_output.content
-        cleaned_json_str = re.sub(r"^```json\n|```$", "", raw_content.strip())
-        parsed_output = json.loads(cleaned_json_str)
-    
+        logger.info(f"Grading done for: {student_name}")
+
+        # Robust JSON cleaning
+        raw_content = grade_output.content.strip()
+        # Remove markdown fences and extra whitespace
+        cleaned = re.sub(r'^\s*(```(?:json)?\s*\n?)?', '', raw_content)
+        cleaned = re.sub(r'\s*(```)?\s*$', '', cleaned).strip()
+
+        # Find actual JSON start/end
+        start_idx = min(
+            cleaned.find('{') if '{' in cleaned else len(cleaned),
+            cleaned.find('[') if '[' in cleaned else len(cleaned)
+        )
+        if start_idx < len(cleaned):
+            cleaned = cleaned[start_idx:]
+
+        end_idx = max(
+            cleaned.rfind('}') if '}' in cleaned else -1,
+            cleaned.rfind(']') if ']' in cleaned else -1
+        )
+        if end_idx >= 0:
+            cleaned = cleaned[:end_idx + 1]
+
+        try:
+            parsed_output = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing failed: {e}")
+            logger.debug(f"Cleaned JSON preview (first 500 chars): {cleaned[:500]}...")
+            # Optional: save failed output for manual check
+            with open(f"debug_{student_name}_failed.json", "w", encoding="utf-8") as f:
+                f.write(cleaned)
+            raise
+
         results = []
 
+        for grade in parsed_output.get('grades', []):
+            q_num = grade.get("question_number", "Unknown")
+            total_score = grade.get("score", 0.0)
+            total_marks = grade.get("total_marks")  # fallback to common value
 
-        all_questions = []
-        for q in model_data:
-            # for q in model_data:
-            if not isinstance(q, dict):
-                continue
-            
-            all_questions.append({
-                "question_number": q["question_number"],
-                "maximum_marks": q.get("maximum_marks", "0")
-            })
-        # Process graded results
-        for g in parsed_output['grades']:
+            # Student answer snippet
+            student_answer_snippet = "No answer provided"
+            for part in student_chunks.get("sub_parts", []):
+                if part.get("question_number") == q_num:
+                    ans = part.get("answer", "").strip()
+                    if ans:
+                        student_answer_snippet = ans.split("\n")[0][:60] + "..." if len(ans.split("\n")[0]) > 60 else ans.split("\n")[0]
+                    break
 
-            question_number = g["question_number"]
-            student_chunks_dict = {
-                sp["question_number"]: sp for sp in student_chunks.get("sub_parts", [])
-            }
-
-            # Then you can safely do:
-            chunk_text = student_chunks_dict.get(question_number)
-            snippet = (
-                chunk_text["answer"].split("\n")[0][:30]
-                if chunk_text and chunk_text.get("answer")
-                else "No answer provided"
-            )
+            # Add TOTAL SCORE row
             results.append({
                 "student_id": student_name,
-                "question_number": g["question_number"],
-                "score": g["score"],
-                "total_marks": g["total_marks"],
-                "comment": g["comments"],
-                # "correct_lines": g["correct_lines"],
-                "correct_words": g["correct_words"],
-                "student_answer_snippet": snippet
+                "question_number": q_num,
+                "criterion": "TOTAL SCORE",
+                "marks_awarded": total_score,
+                "max_possible": total_marks,
+                "evidence": "",
+                "reason": f"Overall awarded {total_score}/{total_marks}",
+                "comments_summary": "; ".join(grade.get("comments", [])) if grade.get("comments") else "",
+                "student_answer_snippet": student_answer_snippet
             })
 
-        # Ensure all questions are covered
-        graded_questions = {r["question_number"] for r in results}
-        for q in all_questions:
-            q_num = q["question_number"]
-            if q_num not in graded_questions:
+            # Detailed breakdown rows
+            breakdown = grade.get("breakdown", [])
+            for item in breakdown:
                 results.append({
                     "student_id": student_name,
                     "question_number": q_num,
-                    "score": "0",
-                    "total_marks": q["maximum_marks"],
-                    "comment": "No answer provided",
-                    # "correct_lines": [],
-                    "correct_words": [],
+                    "criterion": item.get("criterion", "Unknown criterion"),
+                    "marks_awarded": item.get("marks_awarded", 0),
+                    "max_possible": item.get("max_possible", 0),
+                    "evidence": "; ".join(item.get("evidence", [])) if item.get("evidence") else "",
+                    "reason": item.get("reason", ""),
+                    "comments_summary": "",
+                    "student_answer_snippet": ""
+                })
+
+        # Handle missing questions (safe access to model_data structure)
+        graded_q_nums = {r["question_number"] for r in results if r["criterion"] == "TOTAL SCORE"}
+
+        question_list = []
+        if isinstance(model_data, dict):
+            question_list = model_data.get("answers", []) or model_data.get("answers_list", []) or []
+        elif isinstance(model_data, list):
+            question_list = model_data
+
+        for q in question_list:
+            if not isinstance(q, dict):
+                continue
+            qn = q.get("question_number")
+            if qn and qn not in graded_q_nums:
+                max_m = q.get("maximum_marks") or q.get("total_marks_available") or q.get("total_marks") or 28
+                results.append({
+                    "student_id": student_name,
+                    "question_number": qn,
+                    "criterion": "TOTAL SCORE",
+                    "marks_awarded": 0,
+                    "max_possible": max_m,
+                    "evidence": "",
+                    "reason": "No answer or no grading output",
+                    "comments_summary": "No relevant content provided.",
                     "student_answer_snippet": "No answer provided"
                 })
 
-        # Export to CSV
+        # Build DataFrame
         df = pd.DataFrame(results)
-        df.to_csv(output_csv, index=False)
-        logger.info(f"Grading complete! CSV saved to {output_csv}")
+        column_order = [
+            "student_id", "question_number", "criterion", "marks_awarded",
+            "max_possible", "reason", "evidence", "comments_summary",
+            "student_answer_snippet"
+        ]
+        df = df[[c for c in column_order if c in df.columns]]
+
+        df.to_csv(output_csv, index=False, encoding='utf-8')
+        logger.info(f"Grading complete! Detailed CSV saved to {output_csv}")
+
         return output_csv
+
     except Exception as e:
-        logger.error(f"Error during grading for {student_name}: {e}")
+        logger.error(f"Error during grading for {student_name}: {e}", exc_info=True)
         return None

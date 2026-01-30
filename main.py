@@ -76,11 +76,11 @@ def grade_and_annotate_student(
             student_pdf_path=student_pdf_path,
             student_name=student_name,
             questions_path=questions_path,
-            model_answers_path=model_answers_path,   # Can be None → your grader handles it
+            model_answers_path=model_answers_path,   
             question_number=question_num,
             student_pages=student_pages
         )
-        # grades_csv_path = "student_assignment/grades/jack_atwood_grades_20251223_135719.csv"
+        # grades_csv_path = "student_assignment/grades/christian_easson_grades_20260128_135342.csv"
         if not grades_csv_path or not os.path.isfile(grades_csv_path):
             logger.error(f"Grading failed for {student_name} (Q{question_num})")
             return False, "Grading failed", None
@@ -90,7 +90,6 @@ def grade_and_annotate_student(
         # === 2. Annotation ===
         logger.info(f"Creating annotated PDF for {student_name}...")
         annotation_ok, annotated_pdf = annotate_pdf(student_pdf_path, output_dir, student_name, grades_csv_path, student_pages)
-
 
         if annotation_ok:
             # logger.info(f"Annotated PDF ready → {os.path.basename(annotated_pdf)}")
@@ -131,8 +130,7 @@ def process_exam(
     rubric_ok, model_answers_path = extract_marking_rubric(model_answer_pdf_path, answer_pages)
     if not rubric_ok:
         model_answers_path = None  # Let grader fall back to text-based marking
-    # questions_path = "questions_and_model_answers_json_and_scripts/question/question_extracted_2026-01-06_13-07-13.json"
-    # model_answers_path = "questions_and_model_answers_json_and_scripts/rubric/rubric_extracted_2026-01-06_15-19-05.json"
+
 
     # Step 3: Grade + Annotate
     success, message, output_pdf = grade_and_annotate_student(
@@ -160,8 +158,8 @@ def process_exam(
 #         question_num='1',
 #         model_answer_pdf_path='dataset/Bauhaus prepped answer.pdf',
 #         answer_pages=[9,10,11,12,13,14,15],
-#         student_pdf_path='dataset/Christian Easson_564541_assignsubmission_file_CR_TC_CHRISTIAN_EASSON.pdf',
-#         student_pages=[1,2],
-#         student_name='christian_easson',
+#         student_pdf_path='dataset/Jack Attwood_609860_assignsubmission_file_CR_TCE_JACK_ATTWOOD.pdf',
+#         student_pages=[1,2,3,4,5,6],
+#         student_name='Jack_Attwood',
 #         output_dir='annotations'
 #     )

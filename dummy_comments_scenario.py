@@ -7,204 +7,194 @@ from datetime import datetime
 
 # ==================== CONFIG ====================
 CONFIG = {
-    'score_offset_x': 30,
-    'score_offset_y': 4,
-    'score_fontsize': 12,
-    'score_color': (0, 0, 1),
+    'main_score_offset_x': 20,
+    'main_score_offset_y': -8,  # increased upward offset to avoid overlap
+    'main_score_fontsize': 14,
+    'main_score_color': (0, 0, 1),
+
+    'criterion_score_offset_x': -15,
+    'criterion_score_offset_y': 2,
+    'criterion_score_fontsize': 10,
+    'criterion_score_color': (0, 0.3, 0),
+
     'underline_color': (0, 0.7, 0),
     'comment_color': (1, 0, 0),
+    'comment_offset': 30,
+    'y_tolerance': 2,
 }
 
-# ==================== HELPERS (WITH DEBUG PRINTS ONLY) ====================
+# ==================== HELPERS ====================
 
-def extract_number_after_equal(phrase: str):
-    match = re.search(r'=([^=]+?)(?:\s|$)', phrase)
-    if match:
-        return match.group(1).strip()
-    nums = re.findall(r'\d{1,3}(?:,\d{3})*(?:\.\d+)?', phrase.replace(' ', ''))
-    return nums[-1] if nums else None
-
-def clean_anchor(comment_line: str):
-    if '→' not in comment_line:
+def clean_anchor_text(text: str, max_words=4):
+    if not text or pd.isna(text):
         return None
-    text = comment_line.split('→')[0].strip().strip('"\'')
-    num = extract_number_after_equal(text)
-    return num if num else " ".join(text.split()[:8])
+    text = re.sub(r'\[\.\.\.\]', ' ', text).strip()
+    text = re.sub(r'\s+', ' ', text)
+    words = text.split()
+    if len(words) < 3:
+        return text if words else None
+    best_chunk, best_score = None, 0
+    for i in range(len(words) - max_words + 1):
+        chunk = " ".join(words[i:i+max_words])
+        score = (
+            chunk.count(',') + chunk.count('£') + chunk.count('$') + chunk.count('%')
+            + sum(1 for w in chunk.split() if w.isdigit() or w[0].isupper())
+        )
+        if score > best_score:
+            best_score, best_chunk = score, chunk
+    return best_chunk or " ".join(words[:max_words])
 
-# Global sets to track completed items across the entire PDF
-UNDERLINED_GLOBAL = set()  # Tracks unique correct phrases (keys)
-SCORED_HEADINGS = set()    # Tracks unique headings scored
-PLACED_FEEDBACK_GLOBAL = set()  # Tracks unique anchors for feedback
+def find_text_rects_partial(page, search_text, full_match=False):
+    if not search_text:
+        return []
+    if full_match:
+        return page.search_for(search_text) or []
+    search_lower = search_text.lower()
+    matches = []
+    for w in page.get_text("words"):
+        word = w[4].lower()
+        if search_lower in word or word in search_lower:
+            matches.append(fitz.Rect(w[:4]))
+    return matches
 
-def add_popup_near_text(doc, anchor_text, comment):
-    if not anchor_text or len(anchor_text) < 2:
-        print(f"Skipping empty anchor")
+def extract_number_from_text(text: str):
+    m = re.search(r'([£$]?[\d,]+\.?\d*)', text)
+    return m.group(0).replace('£', '').replace('$', '').strip() if m else None
+
+def is_on_same_line(r1, r2):
+    return abs(r1.y0 - r2.y0) <= CONFIG['y_tolerance']
+
+# ==================== SHARED ANCHOR RESOLVER ====================
+
+def resolve_anchor_rect(doc, anchor_text, allowed_pages):
+    anchor_text = clean_anchor_text(anchor_text)
+    if not anchor_text:
+        return None, None
+
+    best_rect, best_page = None, -1
+
+    for page_num in allowed_pages:
+        page = doc[page_num - 1]
+
+        # full match
+        inst = page.search_for(anchor_text)
+        if inst:
+            return inst[0], page_num
+
+        # words on same line
+        words = anchor_text.split()[:4]
+        rects = []
+        for w in words:
+            hits = find_text_rects_partial(page, w)
+            if hits:
+                rects.append(hits[0])
+
+        if len(rects) == len(words) and all(is_on_same_line(rects[0], r) for r in rects):
+            combined = rects[0]
+            for r in rects[1:]:
+                combined |= r
+            best_rect, best_page = combined, page_num
+
+        # number fallback
+        num = extract_number_from_text(anchor_text)
+        if num:
+            hits = find_text_rects_partial(page, num)
+            if hits:
+                best_rect, best_page = hits[0], page_num
+
+    return best_rect, best_page if best_page != -1 else (None, None)
+
+# ==================== MODIFIED FUNCTIONS ====================
+
+def add_popup_for_comment(doc, comment, allowed_pages):
+    if '→' not in comment:
         return False
-    
+
+    # Skip total score popup
+    if 'TOTAL SCORE' in comment.upper() or re.search(r'\d+\.\d+/\d+', comment):
+        return False
+
+    anchor_part = comment.split('→')[0].strip().strip('"\'')
+    rect, page_num = resolve_anchor_rect(doc, anchor_part, allowed_pages)
+    if not rect:
+        print(f"  Anchor NOT found: '{anchor_part}'")
+        return False
+
+    page = doc[page_num - 1]
+    x = page.rect.width - CONFIG['comment_offset']
+    y = rect.y0 + CONFIG['criterion_score_offset_y']
+    annot = page.add_text_annot((x, y), "", icon="Note")
+    annot.set_colors(stroke=CONFIG['comment_color'])
+    annot.set_opacity(0.85)
+    annot.set_info(content=comment.strip(), title="Feedback")
+    annot.update()
+    return True
+
+def place_score_near_anchor(doc, anchor_text, score_text, allowed_pages, placed_lines_per_page):
+    # Clean evidence to part before "..."
+    evidence_clean = re.sub(r'\.\.\..*', '', anchor_text).strip()
+
+    rect, page_num = resolve_anchor_rect(doc, evidence_clean, allowed_pages)
+    if not rect:
+        print(f"  No location found for evidence: '{evidence_clean[:50]}...' - marks {score_text} not placed")
+        return False
+
+    page_idx = page_num - 1
+    line_y = rect.y0
+    if page_idx in placed_lines_per_page and any(abs(line_y - p) <= CONFIG['y_tolerance'] for p in placed_lines_per_page[page_idx]):
+        print(f"  Skipped duplicate on line y={line_y:.1f} page {page_num} for marks {score_text}")
+        return False
+
+    # Underline the matched evidence
+    page = doc[page_num - 1]
+    page.draw_line(
+        (rect.x0, rect.y1 + 2),
+        (rect.x1, rect.y1 + 2),
+        color=CONFIG['underline_color'],
+        width=1.5
+    )
+
+    # Place score
+    page.insert_text(
+        (rect.x0 + CONFIG['criterion_score_offset_x'],
+         rect.y0 + CONFIG['criterion_score_offset_y']),
+        score_text,
+        fontsize=CONFIG['criterion_score_fontsize'],
+        color=CONFIG['criterion_score_color']
+    )
+
+    # Logging
+    print(f"  Awarded {score_text} near evidence '{evidence_clean[:50]}...' on page {page_num} (y={line_y:.1f})")
+
+    placed_lines_per_page.setdefault(page_idx, set()).add(line_y)
+    return True
+
+def add_main_score(doc, q_num, score_text, allowed_pages):
     placed = False
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        instances = page.search_for(anchor_text)
+    for page_num in allowed_pages:
+        page = doc[page_num - 1]
+        instances = page.search_for(q_num)  # exact heading match
         if instances:
-            rect = instances[0]  # First instance only
-            point = fitz.Point(rect.x1 + 6, rect.y0 + 2)
-            annot = page.add_text_annot(point, "", icon="Note")
-            annot.set_colors(stroke=CONFIG['comment_color'])
-            annot.set_opacity(0.9)
-            annot.set_info(content=comment.strip(), title="Feedback")
-            annot.update()
-            print(f"Feedback placed near → '{anchor_text}' on page {page_num + 1}")
-            placed = True
-            break  # Stop after placing on first found page
-    
-    if not placed:
-        print(f"Anchor NOT found anywhere → '{anchor_text}' → comment NOT placed")
-    
-    return placed
-
-def underline_correct_phrase(doc, phrase):
-    global UNDERLINED_GLOBAL
-    
-    key = re.sub(r'[^\w]', '', phrase.lower())
-    if key in UNDERLINED_GLOBAL:
-        print(f"Already underlined → '{phrase}' → skipping")
-        return False
-    
-    found_and_underlined = False
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        words = page.get_text("words")  # For token matching and coords
-        
-        target_rect = None
-        underline_only_number = False
-        
-        # Step 1: Try full phrase match
-        instances = page.search_for(phrase)
-        if instances:
-            target_rect = instances[0]
-            print(f"       Underlined full phrase → '{phrase}' on page {page_num + 1}")
-        
-        # Step 2: If not found, split into text and numeric parts
-        if not target_rect:
-            num = extract_number_after_equal(phrase)
-            if num:
-                text_part = phrase.replace(num, '').strip()  # Remove number to get text
-                if text_part:  # If there's text before number
-                    # Search for text_part and num separately
-                    text_instances = page.search_for(text_part)
-                    num_instances = page.search_for(num)
-                    
-                    if text_instances and num_instances:
-                        text_rect = text_instances[0]
-                        num_rect = num_instances[0]
-                        
-                        # Check if on same line (similar y coordinates, allow ~5pt tolerance)
-                        if abs(text_rect.y1 - num_rect.y1) <= 5:
-                            target_rect = num_rect
-                            underline_only_number = True
-                            print(f"       Underlined number '{num}' (same line as text '{text_part}') on page {page_num + 1}")
-                        else:
-                            print(f"       Text and number found but not on same line for '{phrase}' on page {page_num + 1}")
-                
-                # Step 3: If still no target from split, or no num, try text_part only (or full if no num)
-                if not target_rect:
-                    search_text = text_part if 'text_part' in locals() else phrase
-                    text_instances = page.search_for(search_text)
-                    if text_instances:
-                        target_rect = text_instances[0]
-                        print(f"       Underlined text only → '{search_text}' from '{phrase}' on page {page_num + 1}")
-        
-        # Step 4: Fallback token matching for whole phrase if still not found
-        if not target_rect:
-            tokens = re.split(r'\s+', phrase)
-            if len(tokens) >= 2:
-                for i in range(len(words) - len(tokens) + 1):
-                    match = True
-                    rects = []
-                    y1 = None
-                    for j, token in enumerate(tokens):
-                        word_text = words[i+j][4]
-                        if not re.search(re.escape(token), word_text, re.I):
-                            match = False
-                            break
-                        rects.append(fitz.Rect(words[i+j][:4]))
-                        if y1 is None:
-                            y1 = words[i+j][3]
-                        elif abs(y1 - words[i+j][3]) > 5:
-                            match = False
-                            break
-                    if match and rects:
-                        # Combine all rects
-                        combined = rects[0]
-                        for r in rects[1:]:
-                            combined = combined.include_rect(r)
-                        target_rect = combined
-                        print(f"       Underlined via token matching → '{phrase}' on page {page_num + 1}")
-                        break
-        
-        # Final: Underline if found on this page
-        if target_rect:
-            # Try to find and underline ONLY the number within the matched area if applicable
-            number_rect = None
-            num = extract_number_after_equal(phrase)
-            if num and not underline_only_number:
-                num_in_region = page.search_for(num, clip=target_rect)
-                if num_in_region:
-                    number_rect = num_in_region[0]
-                    print(f"       Underlined CORRECT NUMBER → '{num}' (proof of correct work) on page {page_num + 1}")
-            
-            underline_this = number_rect or target_rect
-            
-            page.draw_line(
-                (underline_this.x0, underline_this.y1 + 2),
-                (underline_this.x1, underline_this.y1 + 2),
-                color=CONFIG['underline_color'],
-                width=2.5
+            rect = instances[0]
+            # Place above the heading with reliable offset
+            x = rect.x0 - CONFIG['main_score_offset_x']
+            y = rect.y0 + CONFIG['main_score_offset_y'] - 20  # extra upward to avoid overlap
+            page.insert_text(
+                (x, y),
+                score_text,
+                fontsize=CONFIG['main_score_fontsize'],
+                color=CONFIG['main_score_color']
             )
-            
-            UNDERLINED_GLOBAL.add(key)
-            found_and_underlined = True
-            break  # Stop after underlining on first found page
-    
-    if not found_and_underlined:
-        print(f"       NOT found anywhere → '{phrase}'")
-    
-    return found_and_underlined
-
-def add_score_next_to_heading(doc, heading: str, score_text: str):
-    global SCORED_HEADINGS
-    
-    search_text = heading.strip().rstrip(':').strip()
-    if search_text in SCORED_HEADINGS:
-        print(f"       Score already placed for '{search_text}' → skipping")
-        return False
-    
-    placed = False
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        instances = page.search_for(search_text)
-        if instances:
-            rect = instances[0]  # First instance
-            x = rect.x0 - CONFIG['score_offset_x']
-            y = rect.y0 + CONFIG['score_offset_y']
-            if x + 100 > page.rect.width:
-                x = page.rect.width - 100
-            
-            page.insert_text((x, y), score_text,
-                             fontsize=CONFIG['score_fontsize'],
-                             color=CONFIG['score_color'])
-            
-            SCORED_HEADINGS.add(search_text)
-            print(f"       Score placed → '{search_text}' : {score_text} on page {page_num + 1}")
+            print(f"  Main score '{score_text}' placed near '{q_num}' on page {page_num} (y={rect.y0 + CONFIG['main_score_offset_y'] - 20:.1f})")
             placed = True
-            break  # Stop after placing on first found page
-    
+            break
+
     if not placed:
-        print(f"       Heading NOT found anywhere → '{search_text}' → score NOT placed")
-    
+        print(f"  Main heading NOT found on student pages: '{q_num}' - main score not placed")
+
     return placed
 
-# ==================== MAIN FUNCTION (OPTIMIZED FLOW: ITEM-BY-ITEM ACROSS ALL PAGES) ====================
+# ==================== MAIN FUNCTION ====================
 
 def annotate_pdf(input_pdf_path, output_dir, student_name, grades_csv_path, student_pages=None):
     student_key = student_name.lower().replace(" ", "_")
@@ -212,88 +202,36 @@ def annotate_pdf(input_pdf_path, output_dir, student_name, grades_csv_path, stud
     output_pdf = os.path.join(output_dir, student_key, f"{student_key}_annotated_{timestamp}.pdf")
     os.makedirs(os.path.dirname(output_pdf), exist_ok=True)
 
-    print("\n" + "█" * 80)
-    print(f"  STARTING ANNOTATION — {student_name.upper()}")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("█" * 80)
-
     df = pd.read_csv(grades_csv_path)
-    print(f"  Loaded {len(df)} question(s) from CSV")
-
-    score_dict = {
-        str(row['question_number']): f"{row['score']}/{row['total_marks']}"
-        for _, row in df.iterrows()
-    }
-
-    # Collect all unique phrases and comments once
-    correct_words_entries = df['correct_words'].dropna().tolist()
-    all_phrases = []
-    for entry in correct_words_entries:
-        try:
-            phrases = ast.literal_eval(entry)
-            if isinstance(phrases, list):
-                all_phrases.extend([p.strip() for p in phrases if p.strip()])
-        except: pass
-    all_phrases = list(set(all_phrases))  # Dedupe
-
-    comment_entries = df['comment'].dropna().tolist()
-    all_comments = []
-    for entry in comment_entries:
-        try:
-            comments = ast.literal_eval(entry)
-            if isinstance(comments, list):
-                all_comments.extend(comments)
-        except: pass
-
-    print(f"  Scores to place     : {len(score_dict)}")
-    print(f"  Unique correct phrases: {len(all_phrases)}")
-    print(f"  Feedback comments   : {len(all_comments)}")
-
     doc = fitz.open(input_pdf_path)
-    # If student_pages specified, limit to those (1-indexed to 0-indexed)
-    if student_pages:
-        print(f"\n  Limiting to student pages: {', '.join(map(str, student_pages))}\n")
-    else:
-        print(f"\n  Processing all pages\n")
 
-    # Process scores item-by-item across pages
-    scores_placed = 0
-    for heading, score in score_dict.items():
-        if add_score_next_to_heading(doc, heading, score):
-            scores_placed += 1
+    allowed_pages = student_pages or list(range(1, len(doc) + 1))
 
-    # Process underlines item-by-item across pages
-    underlines_placed = 0
-    for phrase in all_phrases:
-        if underline_correct_phrase(doc, phrase):
-            underlines_placed += 1
+    # TOTAL SCORE - only place main score text (no popup)
+    main = df[df['criterion'] == 'TOTAL SCORE'].iloc[0]
+    main_score_text = f"{main['marks_awarded']}/{main['max_possible']}"
+    add_main_score(doc, main['question_number'], main_score_text, allowed_pages)
 
-    # Process feedback comments item-by-item across pages
-    feedbacks_placed = 0
-    for line in all_comments:
-        if '→' not in line: continue
-        anchor = clean_anchor(line)
-        if not anchor:
-            print(f"       Skipping comment with no valid anchor: {line}")
+    # PER CRITERION
+    placed_lines_per_page = {i - 1: set() for i in allowed_pages}
+    for _, row in df.iterrows():
+        if row['criterion'] == 'TOTAL SCORE' or pd.isna(row['evidence']):
             continue
-        if anchor in PLACED_FEEDBACK_GLOBAL:
-            print(f"       Feedback already placed for anchor '{anchor}' → skipping")
-            continue
-        feedback = line.split('→', 1)[1].strip()
-        if add_popup_near_text(doc, anchor, feedback):
-            PLACED_FEEDBACK_GLOBAL.add(anchor)
-            feedbacks_placed += 1
+        if row['marks_awarded'] > 0:
+            place_score_near_anchor(
+                doc,
+                row['evidence'],
+                str(row['marks_awarded']),
+                allowed_pages,
+                placed_lines_per_page
+            )
+
+    # COMMENTS
+    comments = re.split(r';\s*(?=[^"]*(?:[^"]*")*[^"]*$)', str(main.get('comments_summary', '')))
+    for c in comments:
+        if '→' in c:
+            add_popup_for_comment(doc, c.strip().strip('"'), allowed_pages)
 
     doc.save(output_pdf, garbage=4, deflate=True, clean=True)
     doc.close()
-
-    print("█" * 80)
-    print(f"  SUCCESS! Saved:")
-    print(f"  → {output_pdf}")
-    print(f"  Scores placed: {scores_placed}")
-    print(f"  Underlines placed: {underlines_placed}")
-    print(f"  Feedbacks placed: {feedbacks_placed}")
-    print(f"  Finished: {datetime.now().strftime('%H:%M:%S')}")
-    print("█" * 80 + "\n")
-
     return True, output_pdf

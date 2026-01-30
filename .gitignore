@@ -8,3 +8,5 @@ student_assignments/
 test_assignments_and_mappings/
 dataset/
 student_assignment/
+dummy.py
+.vscode/
