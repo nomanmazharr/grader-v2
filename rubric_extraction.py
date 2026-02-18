@@ -1,170 +1,43 @@
 import io
-import fitz
-from llm_setup import client
-import json
-from logging_config import logger
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
+import json
+import fitz
+from bson import ObjectId
+from pymongo.collection import Collection
 
-def _create_pdf_subset(pdf_path: str, pages: list[int]) -> io.BytesIO:
-    """
-    Extract specified pages from a PDF and return as in-memory BytesIO PDF.
-    Ensures the buffer behaves like a real PDF file.
-    """
-    doc = fitz.open(pdf_path)
-    new_doc = fitz.open()
+from database.mongodb import get_collection  
+from llm_setup import client
+from logging_config import logger
+from schemas.model_answers import OPENAI_MODEL_ANSWER_SCHEMA, ModelAnswerDocument
+from utils.db_utils import add_metadata, validate_and_prepare, save_to_mongodb
+from utils.pdf_openai_utils import create_pdf_subset, upload_to_openai
 
-    for p in pages:
-        if 1 <= p <= len(doc):
-            new_doc.insert_pdf(doc, from_page=p-1, to_page=p-1)
 
-    # convert to proper PDF bytes
-    pdf_bytes = new_doc.tobytes()
-    buf = io.BytesIO(pdf_bytes)
-    buf.name = "subset.pdf"   # this is critical for OpenAI to detect it's a PDF
-    buf.seek(0)
+class ModelAnswerExtractionError(Exception):
+    pass
 
-    doc.close()
-    new_doc.close()
-    return buf
 
-def _upload_to_openai(pdf_buffer: io.BytesIO, filename: str = "subset.pdf"):
-    """
-    Upload an in-memory PDF to OpenAI and return file object.
-    """
-    file_obj = client.files.create(
-        file=pdf_buffer,
-        purpose="user_data"
-    )
-    logger.info(f"Uploaded → file_obj: {file_obj}")
-    return file_obj
+class ModelAnswerExtractor:
 
-model_answer_schema_2 = {
-    "type": "object",
-    "properties": {
-        "question_title": {
-            "type": "string",
-            "description": "Main question title, e.g., 'Question 4'"
-        },
-        "description": {
-            "type": ["string", "null"],
-            "description": "Introductory paragraph or assumptions if present"
-        },
-        "total_marks": {
-            "type": ["string", "null"],
-            "description": "Total marks for the main question"
-        },
-        "answers": {
-            "type": "array",
-            "description": "Model answer if no subsections are present for this question",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "question_number": {
-                        "type": "string",
-                        "description": "Subquestion number such as '4.1', '4.1(a)', etc. if question number explicitly present don't include heading into question number else if subsections are on base of heading only use heading in that case"
-                    },
-                    "answer": {
-                        "type": ["string", "null"],
-                        "description": "Model answer content for this question_number, never include marking criteria in answer"
-                    },
-                    "marking_criteria": {
-                        "type": ["array", "null"],
-                        "description": "List of individual markable points from printed and handwritten criteria",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "marks": {
-                                    "type": ["number", "string"],
-                                    "description": "Mark value: number (0.5, 1, 2, 1/2) or string like '1 each', 'max 4', 'OF', 'tick'"
-                                },
-                                "description": {
-                                    "type": "string",
-                                    "description": "Exact original text describing what earns the mark"
-                                }
-                            },
-                            "required": ["marks", "description"],
-                            "additionalProperties": False
-                        }
-                    },
-                    "total_marks_available": {
-                        "type": ["string", "null"],
-                        "description": "Marks available for this specific part"
-                    },
-                    "maximum_marks": {
-                        "type": ["string", "null"],
-                        "description": "Maximum marks if explicitly mentioned"
-                    },
-                    "sub_answers": {
-                        "type": ["array", "null"],
-                        "description": "Nested subdivisions (e.g. (a), (b), (i), etc.)",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question_number": {
-                                    "type": "string",
-                                    "description": "Sub-subquestion number, don't include heading if question number explicitly present for sub answer"
-                                },
-                                "answer": {
-                                    "type": ["string", "null"],
-                                    "description": "Model answer content, don't include marking criteria in answers"
-                                },
-                                "marking_criteria": {
-                                    "type": ["array", "null"],
-                                    "description": "List of individual markable points",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "marks": {"type": ["number", "string"]},
-                                            "description": {"type": "string"}
-                                        },
-                                        "required": ["marks", "description"],
-                                        "additionalProperties": False
-                                    }
-                                },
-                                "total_marks_available": {
-                                    "type": ["string", "null"],
-                                    "description": "Marks available"
-                                },
-                                "maximum_marks": {
-                                    "type": ["string", "null"],
-                                    "description": "Maximum marks"
-                                },
-                                "sub_answers": {
-                                    "type": ["array", "null"],
-                                    "description": "Further nested subdivisions",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {},
-                                        "required": [],
-                                        "additionalProperties": False
-                                    }
-                                }
-                            },
-                            "required": ["question_number", "answer", "marking_criteria", "total_marks_available", "maximum_marks", "sub_answers"],
-                            "additionalProperties": False
-                        }
-                    }
-                },
-                "required": ["question_number", "answer", "marking_criteria", "total_marks_available", "maximum_marks", "sub_answers"],
-                "additionalProperties": False
-            }
-        }
-    },
-    "required": ["question_title", "answers", "description", "total_marks"],
-    "additionalProperties": False
-}
+    def __init__(self, pdf_path: str, pages: List[int]):
+        self.pdf_path = pdf_path
+        self.pages = pages
+        self.collection: Collection = get_collection("model_answers")
 
-def _extract_rubric_with_vision(file_obj):
-    response = client.responses.create(
-        model="gpt-5-mini-2025-08-07",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_file", "file_id": file_obj.id},
-                    {"type": "input_text", "text": """
-You are an expert in extracting and structuring model answers and marking criteria from exam marking guides, including any handwritten annotations visible in the PDF.
+    def _extract_with_vision(self, file_id: str) -> dict:
+        try:
+            response = client.responses.create(
+                model="gpt-5-mini-2025-08-07",
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_id": file_id},
+                            {
+                                "type": "input_text",
+                                "text": """You are an expert in extracting and structuring model answers and marking criteria from exam marking guides, including any handwritten annotations visible in the PDF.
 
 Focus strictly on the Question that is present as a whole and extract all of its model answers, printed marking criteria, and handwritten annotations.
 
@@ -262,65 +135,52 @@ Example full array:
 
 Return only valid JSON — no markdown, no commentary, no preamble.
 """
-}
-                ]
-            }
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "universal_exam_rubric",
-                "strict": True,
-                "schema": model_answer_schema_2  # this is your updated flexible schema
-            }
-        }
-    )
+                            }
+                        ]
+                    }
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "universal_exam_rubric",
+                        "strict": True,
+                        "schema": OPENAI_MODEL_ANSWER_SCHEMA
+                    }
+                }
+            )
 
-    try:
-        raw_json = response.output_text.strip()
-        if raw_json.startswith("```json"):
-            raw_json = raw_json[7:-3].strip()
-        data = json.loads(raw_json)
-        logger.info("Rubric successfully parsed from vision model")
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON from model response: {e}")
-        logger.debug(f"Raw output: {raw_json[:500]}...")
-        raise
+            raw_json = response.output_text.strip()
+            if raw_json.startswith("```json"):
+                raw_json = raw_json[7:-3].strip()
 
-def extract_pdf_annotations_pipeline(pdf_path: str, pages: list[int], output_dir= "questions_and_model_answers_json_and_scripts"):
-    """
-    Full end-to-end pipeline:
-      1. Extract subset of pages (in memory)
-      2. Upload to OpenAI
-      3. Get annotations JSON
-    """
-    try:
-        logger.info(f"Starting rubric extraction from pages {pages}")
+            data = json.loads(raw_json)
+            logger.info("Model answer + rubric successfully parsed")
+            return data
+        except Exception as e:
+            logger.error(f"Model answer extraction failed: {e}", exc_info=True)
+            raise ModelAnswerExtractionError("Failed to extract model answers") from e
 
-        # 1. Create subset
-        pdf_buffer = _create_pdf_subset(pdf_path, pages)
+    def run(self) -> Optional[str]:
+        try:
+            logger.info(f"Extracting model answers from {Path(self.pdf_path).name} pages {self.pages}")
 
-        # 2. Upload
-        file_id = _upload_to_openai(pdf_buffer)
+            pdf_buffer = create_pdf_subset(self.pdf_path, self.pages)
+            file_id = upload_to_openai(pdf_buffer)
+            raw_data = self._extract_with_vision(file_id)
+            
+            data_with_meta = add_metadata(raw_data, self.pdf_path, self.pages)
+            to_save = validate_and_prepare(data_with_meta, ModelAnswerDocument)
+            doc_id = save_to_mongodb(self.collection, to_save, entity_type="model answer")
 
-        # 3. Extract with vision LLM
-        rubric_data = _extract_rubric_with_vision(file_id)
+            return doc_id
+        except ModelAnswerExtractionError as me:
+            logger.error(f"Model answer extraction pipeline failed: {me}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error in model answer extraction: {e}", exc_info=True)
+            return None
 
-        # 4. Save to disk
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        rubric_dir = Path(output_dir) / "rubric"
-        rubric_dir.mkdir(parents=True, exist_ok=True)
 
-        output_path = rubric_dir / f"rubric_extracted_{timestamp}.json"
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(rubric_data, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Rubric saved → {output_path}")
-        return str(output_path)
-
-    except Exception as e:
-        logger.error(f"Rubric extraction pipeline failed: {e}")
-        logger.debug(f"Traceback: {e}", exc_info=True)
-        return None
+def extract_pdf_annotations_pipeline(pdf_path: str, pages: List[int]) -> Optional[str]:
+    extractor = ModelAnswerExtractor(pdf_path, pages)
+    return extractor.run()

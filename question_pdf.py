@@ -1,109 +1,40 @@
-import io
-import fitz
-from llm_setup import client
 import json
-from logging_config import logger
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
+
+from pymongo.collection import Collection
+
+from database.mongodb import get_questions_collection
+from llm_setup import client
+from logging_config import logger
+from schemas.question import OPENAI_QUESTION_SCHEMA, QuestionDocument
+from utils.pdf_openai_utils import create_pdf_subset, upload_to_openai
+from utils.db_utils import add_metadata, validate_and_prepare, save_to_mongodb
 
 
-def _create_pdf_subset(pdf_path: str, pages: list[int]) -> io.BytesIO:
-    """
-    Extract specified pages from a PDF and return as in-memory BytesIO PDF.
-    Ensures the buffer behaves like a real PDF file.
-    """
-    doc = fitz.open(pdf_path)
-    new_doc = fitz.open()
-
-    for p in pages:
-        if 1 <= p <= len(doc):
-            new_doc.insert_pdf(doc, from_page=p-1, to_page=p-1)
-
-    # convert to proper PDF bytes
-    pdf_bytes = new_doc.tobytes()
-    buf = io.BytesIO(pdf_bytes)
-    buf.name = "subset.pdf"   # this is critical for OpenAI to detect it's a PDF
-    buf.seek(0)
-
-    doc.close()
-    new_doc.close()
-    return buf
-
-def _upload_to_openai(pdf_buffer: io.BytesIO, filename: str = "subset.pdf"):
-    """
-    Upload an in-memory PDF to OpenAI and return file object.
-    """
-    file_obj = client.files.create(
-        file=pdf_buffer,
-        purpose="user_data"
-    )
-    logger.info(f"Uploaded → file_obj: {file_obj}")
-    return file_obj
-
-question_schema = {
-
-  "type": "object",
-  "properties": {
-    "question_title": {
-      "type": "string",
-      "description": "Main question title, e.g., 'Question 4'"
-    },
-    "description": {
-      "type": ["string", "null"],
-      "description": "Any introductory text, scenario, or description before the subquestions"
-    },
-    "total_marks": {
-      "type": ["string", "null"],
-      "description": "Total marks for the entire question if stated, captured exactly as written"
-    },
-    "questions": {
-      "type": "array",
-      "description": "List of subquestions (or single main question if no subs)",
-      "items": {
-        "type": "object",
-        "properties": {
-          "question_number": {
-            "type": "string",
-            "description": "Subquestion identifier like '1.1', 'a)', or heading if no explicit number"
-          },
-          "content": {
-            "type": "string",
-            "description": "Full original text of the subquestion, preserving exact wording, line breaks, bullet points, and formatting"
-          },
-          "marks": {
-            "type": ["string", "null"],
-            "description": "Marks allocation if mentioned, captured exactly as written, e.g., '5 marks' or '(6)'"
-          },
-          "sub_questions": {
-            "type": ["array", "null"],
-            "description": "Nested subquestions if present (e.g., (i), (ii))",
-            "items": {
-              "type": "object",
-              "properties": {},
-              "required": [],
-              "additionalProperties": False
-            }
-          }
-        },
-        "required": ["question_number", "content", "marks", "sub_questions"],
-        "additionalProperties": False
-      }
-    }
-  },
-  "required": ["question_title", "description", "total_marks", "questions"],
-  "additionalProperties": False
-}
+class QuestionExtractionError(Exception):
+    pass
 
 
-def _extract_question_with_vision(file_obj):
-    response = client.responses.create(
-        model="gpt-5-mini-2025-08-07",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_file", "file_id": file_obj.id},
-                    {"type": "input_text", "text": """You are an expert at extracting exam questions from PDF question papers.
+class QuestionExtractor:
+    def __init__(self, pdf_path: str, pages: List[int]):
+        self.pdf_path = pdf_path
+        self.pages = pages
+        self.collection: Collection = get_questions_collection()
+
+    def _extract_with_vision(self, file_id: str) -> dict:
+        try:
+            response = client.responses.create(
+                model="gpt-5-mini-2025-08-07",
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_id": file_id},
+                            {
+                                "type": "input_text",
+                                "text": """You are an expert at extracting exam questions from PDF question papers.
 
 Focus strictly on Question that is present as a whole and extact all of its question content ,
 
@@ -117,72 +48,56 @@ Rules:
 ---
 
 Return only valid JSON — no markdown, no commentary, no preamble.
+"""
+                            }
+                        ]
+                    }
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "universal_exam_question",
+                        "strict": True,
+                        "schema": OPENAI_QUESTION_SCHEMA
+                    }
+                }
+            )
 
-"""}
-                ]
-            }
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "universal_exam_question",
-                "strict": True,
-                "schema": question_schema  # this is your updated flexible schema
-            }
-        }
-        # service_tier="priority"
-    )
+            raw_json = response.output_text.strip()
+            if raw_json.startswith("```json"):
+                raw_json = raw_json[7:-3].strip()
 
-    try:
-        raw_json = response.output_text.strip()
-        if raw_json.startswith("```json"):
-            raw_json = raw_json[7:-3].strip()
-        data = json.loads(raw_json)
-        logger.info("question successfully parsed from vision model")
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON from model response: {e}")
-        logger.debug(f"Raw output: {raw_json[:500]}...")
-        raise
+            data = json.loads(raw_json)
+            logger.info("Question successfully parsed from vision model")
+            return data
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse failed from OpenAI response: {e}", exc_info=True)
+            raise QuestionExtractionError("Failed to parse JSON from OpenAI response") from e
+        except Exception as e:
+            logger.error(f"OpenAI extraction failed: {e}", exc_info=True)
+            raise QuestionExtractionError("Failed to extract question with OpenAI vision") from e
 
-def extract_questions_pipeline(pdf_path: str, pages: list[int], output_dir= "questions_and_model_answers_json_and_scripts"):
-    """
-    Full end-to-end pipeline:
-      1. Extract subset of pages (in memory)
-      2. Upload to OpenAI
-      3. Get annotations JSON
-    """
-    try:
-        logger.info(f"Starting question extraction from pages {pages}")
+    def run(self) -> Optional[str]:
+        try:
+            logger.info(f"Extracting question from {Path(self.pdf_path).name} pages {self.pages}")
 
-        # 1. Create subset
-        pdf_buffer = _create_pdf_subset(pdf_path, pages)
+            pdf_buffer = create_pdf_subset(self.pdf_path, self.pages)
+            file_id = upload_to_openai(pdf_buffer)
+            question_data = self._extract_with_vision(file_id)
+            
+            question_data = add_metadata(question_data, self.pdf_path, self.pages)
+            to_save = validate_and_prepare(question_data, QuestionDocument)
+            doc_id = save_to_mongodb(self.collection, to_save, entity_type="question")
 
-        # 2. Upload
-        file_id = _upload_to_openai(pdf_buffer)
+            return doc_id
+        except QuestionExtractionError as qe:
+            logger.error(f"Question extraction pipeline failed: {qe}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error in pipeline: {e}", exc_info=True)
+            return None
 
-        # 3. Extract with vision LLM
-        question_data = _extract_question_with_vision(file_id)
 
-        # 4. Save to disk
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        question_dir = Path(output_dir) / "question"
-        question_dir.mkdir(parents=True, exist_ok=True)
-
-        output_path = question_dir / f"question_extracted_{timestamp}.json"
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(question_data, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Question saved → {output_path}")
-        return str(output_path)
-
-    except Exception as e:
-        logger.error(f"Question extraction pipeline failed: {e}")
-        logger.debug(f"Traceback: {e}", exc_info=True)
-        return None
-
-if __name__ == "__main__":
-    pdf_path = "Nov_25_testing/dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf"
-    pages = [2,3,4]
-    extract_questions_pipeline(pdf_path, pages)
+def extract_questions_pipeline(pdf_path: str, pages: List[int]) -> Optional[str]:
+    extractor = QuestionExtractor(pdf_path, pages)
+    return extractor.run()

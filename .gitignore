@@ -10,3 +10,7 @@ dataset/
 student_assignment/
 dummy.py
 .vscode/
+scripts/
+*.log
+*.pdf
+reqi.txt
