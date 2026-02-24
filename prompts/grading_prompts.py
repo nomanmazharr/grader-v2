@@ -2,14 +2,13 @@ from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 
 MAP_PROMPT_TEMPLATE = """Student chunks: {chunks}\n
 Questions: {questions}\n
-
 Instructions:
 - Map each student chunk to the question it most likely answers based on semantic meaning.
 - Focus on the **intent** and **content** of the student chunk and question, not just exact wording.
 - Each chunk must map to exactly one question number.
 - If a chunk does not answer any question, assign it to '0'.
 - Do NOT output explanations, schemas, or markdown. 
-- Return ONLY valid JSON in the following format:
+Return ONLY valid JSON in the following format:
 
 {{
   "mappings": [
@@ -23,8 +22,8 @@ Now produce the mappings:
 """
 
 
-GRADE_PROMPT_TEMPLATE = """
-    You are a STRICT, CONSISTENT examiner. **DETERMINISTIC**: Identical inputs MUST produce identical outputs/marks. Award marks ONLY for CLEAR, SUBSTANTIAL evidence. Default to 0 unless unambiguously met. Total ≤80% max_marks unless full major criteria coverage.
+GRADE_PROMPT_TEMPLATE ="""
+You are a strict but fair objective examiner. Award marks when the student's answer clearly conveys the required meaning from the model answer and marking criteria, even if partial understanding is evident.
 
 ### Input
 - Questions: {questions}
@@ -32,67 +31,28 @@ GRADE_PROMPT_TEMPLATE = """
 - Mappings: {mappings}
 - Student answers: {chunks}
 
-### STRICT GRADING RULES (APPLY FIRST)
-1. Use ONLY the exact 'marks' values from marking_criteria. No intermediates.
-2. Award ONLY if student shows CLEAR calculation logic OR IFRS principle application.
-3. NO marks for: mentioning terms without explanation, isolated numbers, rephrasing without substance.
-4. Total awarded ≤ maximum_marks. If sum >80% without full major criteria coverage, reduce proportionally.
-5. For zero-attempt answers: score=0.0, breakdown=[], comments explaining absence.
+### Core Grading Principles
+  - Award marks when the student conveys the required meaning, even if wording differs.
+  - Rephrased answers are acceptable if they express identical or equivalent technical meaning.
+  - Credit correct application of concepts, accurate calculations, logical structure.
+  - Do not require exact model answer phrasing.
+  - Keywords alone are insufficient — must be in correct context.
+  - Withhold full marks if meaning is incomplete or incorrect, but award partial if substantial understanding is shown.
+  - When uncertain, default to partial credit if evidence indicates some grasp.
+  - Treat the full student answer as one unified document — credit evidence from any page or chunk without favoring early content or losing context on later pages.
 
-### SEARCH RULES (CONCISE)
-Search full unstructured student text for criterion evidence. Award ONLY for:
-- Exact matches OR clear semantic equivalents WITH supporting logic/calculation
-- NO marks for terms mentioned without explanation or isolated fragments
-- Examples of rejection: "Goodwill £11m" (no derivation), "consolidated" (no method shown)
-- Cap totals: If >80% max_marks, verify comprehensive major criteria coverage first
-
-#### Financial Calculation Evidence Patterns
-Student may show working in condensed, abbreviated, reordered, or conceptually-equivalent forms:
-- Different presentation order showing same calculation steps still demonstrates understanding
-- Pro-rated amounts shown via formula (9/12) OR shown via result (75% or resulting value) both indicate understanding of the logic
-- Reference to components of a calculation (even if not all steps shown) indicates grasping the method
-- Award marks if the formula structure and conceptual approach are sound, even with input variations
-
-#### Treatment & Principle Evidence Patterns
-IFRS treatments and principles may be explained without complete precise figures or formal journal entries:
-- Student may describe a treatment concept without exact numbers and still show understanding (e.g., explaining equity method application without working the full financial impact)
-- Student may reference timing/rate/percentage logic without showing final calculated amounts (e.g., "using the closing rate for assets")
-- Student may use shorthand or compressed explanation that captures the essential principle
-- Award full marks if student's explanation reveals correct understanding of the IFRS requirement, even if abbreviated or differently structured
-
-#### What Does NOT Count as Semantic Equivalence
-These contradict, not align, with intended meaning:
-- Opposite/contradictory meaning: opposite treatment, conflicting principles (e.g., asset vs. liability treatment of same item)
-- Fundamentally different IFRS method: wrong consolidation approach, wrong rate selection, wrong expense/capitalize choice
-- No evidence of reasoning: merely referencing a number without indication of where it came from or why
-- Conceptually incomplete: mentions a term but shows no grasp of the underlying principle
-
-#### Search Strategy for Unstructured Text
-Because content may appear anywhere in the answer:
-- Do NOT assume sections follow marking criteria order
-- Search for content relating to each criterion across the full answer text
-- Related criteria (e.g., components of one calculation, parts of one principle) may appear together in one paragraph
-- Multi-step concepts may be explained in condensed form and scattered; piece together evidence from multiple locations
-- Always evaluate each criterion independently for its specific requirement, even if logically connected to others
-
-### Scoring Precision (IMPORTANT – READ CAREFULLY)
-- Use **exactly and only** the 'marks' values that appear in model_data marking_criteria (0.25, 0.5, 1, etc.). **Never award intermediate values** such as 0.3, 0.4, 0.75 etc. under any circumstances.
-- For marking criteria that represent **individual components or steps** within a larger calculation, working, disclosure, or accounting treatment (common for 0.25 and many 0.5 items — e.g. a single figure, a pro-rated amount, a translated value, a depreciation charge, an NCI share, a fair value, a journal line, or a rate application), award the **full marks value** of that criterion if the student demonstrates:
-  • the correct formula, structure, logic, pro-rating, addition, multiplication, or rate application,
-  • the correct IFRS principle, accounting treatment, or presentation requirement,
-  even when there is a minor input error, one incorrect component value, rounding difference, or incorrect final aggregate/total — as long as the step itself is conceptually and methodologically sound.
-- Do not withhold marks for an individual step merely because a downstream figure, overall total, or final outcome (e.g. profit on disposal, total exchange gain, revised profit, EPS) is incorrect due to accumulation of errors or other mistakes.
-- Award marks **step-by-step** and **independently** for each criterion where the specific requirement is satisfied, rather than requiring the entire chain or final result to be perfect.
-- For criteria describing an **accounting treatment, principle, presentation, or implication** (e.g. equity accounting for associates, translation at average/closing rates, allocation to NCI or OCI, elimination of revaluation surplus before P&L charge, equity-settled share-based payment expense recognition, implications for diluted EPS), award full marks if the student's wording or explanation conveys **equivalent technical meaning** or the same IFRS requirement, even if phrased differently, reworded, or without exact journal entries/numbers.
-- Only withhold marks (give 0) if the step/treatment is conceptually wrong, completely missing, or the error fundamentally changes the IFRS treatment.
-- For composite / multi-part criteria (rare), partial may be half or quarter of the item's marks — but only if the description clearly has separable sub-parts.
+### Scoring Precision
+- Use **exactly** the 'marks' values from each marking_criteria item.
+- Never invent or force increments — follow the scale defined in model_data (0.25, 0.5, 1, etc.).
 - Never exceed maximum_marks or any per-item 'marks' value.
+- Prefer explicit 'total_marks', 'maximum_marks' or 'total_marks_available' from model_data if present.
+- If absent, use total marks from question JSON and treat as one holistic question.
 - Total awarded marks must never exceed the defined total.
 
 ### Structured Criteria Handling
 - marking_criteria is an array of objects (each with 'marks' and 'description').
   → Evaluate **each individual item separately** — never combine, merge, or group multiple criteria items into one evaluation or one breakdown entry under any circumstances.
-  → Award **exactly** the numeric 'marks' value from that specific item when the criterion is fully or substantially satisfied (see Scoring Precision above).
+  → Award **exactly** the numeric 'marks' value from that specific item when fully satisfied.
   → If 'marks' is non-numeric ("N/A", "1 each", "½ each", "max X"):
      - "1 each" → award 1 per valid instance (up to any stated max)
      - "½ each" → award 0.5 per valid instance
@@ -101,66 +61,17 @@ Because content may appear anywhere in the answer:
   → Sum all awarded marks precisely.
 
 ### Step-by-Step Grading Process
-1. Review marking_criteria array in model_data carefully.
-
-2. For each criterion in marking_criteria:
-   a. Identify the CORE CONCEPT (calculation type, principle, treatment, or requirement the criterion describes)
-   b. Search the full student answer for evidence of this concept using SEMANTIC MATCHING (per rules above)
-      - Look for equivalent terminology, synonyms, different phrasings of the same idea
-      - Look for calculations shown via formula, intermediate results, or abbreviated forms
-      - Look for explanations that convey the principle even if different words are used
-      - Do NOT rely on exact keyword or phrase matching alone
-   c. Collect exact student phrases/passages that demonstrate the concept
-   
-3. For each criterion, decide:
-   - **Fully met**: Concept clearly shown, correct logic/formula/treatment evident → award full 'marks' value
-   - **Substantially equivalent**: Student shows understanding via different approach/wording but conceptually correct → award full 'marks' value
-   - **Partial/incomplete**: Only minor elements present or method unclear → 0 marks (unless criterion explicitly multi-part, then consider half/quarter)
-   - **Not met**: Conceptually wrong, completely missing, or fundamentally different treatment → 0 marks
-
-4. Sum awarded marks precisely.
-
-5. Validate total does not exceed maximum_marks.
-
-### Check-and-Balance Rules (PREVENT OVERAWARDING)
-These rules act as validation gates. Even if semantic matching suggests a criterion is met, WITHHOLD marks if ANY of these apply:
-
-#### Gate 1: No Supporting Evidence Trap
-**WITHHOLD marks** if:
-- Student uses the TERM/CONCEPT but provides NO evidence of understanding the mechanism or logic
-  • Example REJECT: Student writes "consolidated at acquisition" but shows no consolidation working, no goodwill calculation, no indication they know what consolidation entails
-  • What TO ACCEPT: Student writes "consolidated" AND shows related calculation or explanation of timing/method
-- Student references a number WITHOUT showing or implying where it comes from
-  • Example REJECT: "Goodwill is £11.725 million" (no calculation, no derivation shown)
-  • What TO ACCEPT: "Goodwill calculated as cost minus net assets" OR showing the calculation OR explaining the logic
-
-####STRICT VALIDATION GATES (MANDATORY CHECKS)
-BEFORE awarding ANY marks, verify NONE of these apply (reject if ANY do):
-- Term/concept mentioned but NO logic/calculation shown
-- Number stated without derivation or context
-- Rephrasing criterion without independent application
-- Single step shown for multi-step criterion
-- Correct concept but opposite/wrong IFRS treatment applied
-**DEFAULT: 0 marks unless ALL gates passed**
-  • Expensing when should capitalize, or vice versa
-  • Using wrong rate (cost rate instead of closing rate, vice versa)
-  • Allocating to wrong party (Bauhaus instead of NCI, or vice versa)
-- These are CORE IFRS requirements — opposite treatment is fundamentally wrong, not "substantially equivalent"
-
-#### Gate 5: Zero Content in Whole Answer Trap
-**ALWAYS AWARD SCORE 0** if:
-- The entire student answer is blank, contains only unrelated content, or has no attempt at the required question
-- Output a "grades" object with:
-  • "score": 0.0
-  • "total_marks": [from model_data]
-  • "breakdown": [] (empty array)
-  • "comments": ["No relevant content provided."]
-- NEVER skip outputting a score for an attempted question — always include a score (even if 0.0) in the JSON
-
-#### Application: When in Doubt
-- If semantic matching passes but ANY check-and-balance gate triggers: **STOP** and award 0
-- Be STRICT about Gates 1-4 (no supporting evidence, isolated fragments, wrong treatment)
-- Be LENIENT only about Gate 1 when evidence exists elsewhere in the answer AND can be clearly connected to this criterion
+1. Concatenate all student chunks into one complete, continuous answer text (treat as a single holistic document across all pages).
+2. Read and fully analyze the entire student answer once — identify every demonstrated concept, calculation, table/working (W1/W2/etc.), journal entry, pro-rating/time apportionment, IFRS treatment, adjustment, and any other relevant technical content shown anywhere in the answer.
+3. For each individual item in model_data.marking_criteria:
+   - Check whether the student's overall demonstrated content substantively covers or conveys the meaning required by that specific criterion.
+   - Accept equivalent wording, minor arithmetic/rounding/transcription differences, different presentation styles (table vs prose, different labels), and evidence from any part/page/chunk of the answer.
+   - Award **exactly** the 'marks' value from that criterion if the core meaning/principle/logic is clearly present in substance.
+   - If the criterion is explicitly separable (e.g. 0.25 per input), award the listed fraction only for parts clearly shown.
+   - Do not require verbatim match or repetition — focus on whether the student has conveyed the required technical meaning anywhere in their work.
+4. For each awarded criterion, quote 1–3 exact verbatim phrases from the student answer that justify the award (from any chunk/page).
+5. After evaluating all criteria, calculate total score as the sum of awarded marks.
+6. Generate comments and output JSON.
 
 ### Question Structure Rules (CRITICAL)
 - Examine the "questions" input first to determine if the question is single or has formal sub-questions.
@@ -190,12 +101,12 @@ Each object corresponds to **one single marking_criteria item** that was awarded
 Rules:
 - For every marking_criteria item where you award marks > 0, create **exactly one** breakdown entry.
 - It is forbidden to combine two or more marking_criteria items into one breakdown entry under any circumstances.
-- Use the **exact 'description'** from that marking_criteria item (or very close paraphrase if needed for clarity) as the "criterion" title.
+- Use the **exact 'description'** from that marking_criteria item (or very close paraphrase) as the "criterion" title.
 - "max_possible" must be **exactly** the numeric 'marks' value from that item.
-- "marks_awarded" must be exactly one of the defined values (full or — only when allowed — half/quarter of that item).
+- "marks_awarded" must not exceed the 'max_possible' for that specific item.
 - SUM of all marks_awarded across the breakdown MUST EQUAL the "score".
 - If score = 0.0 → omit "breakdown" or use empty array [].
-- "evidence": array of 1-3 **exact verbatim substrings** from student answer that directly justified the awarded marks. Keep phrases short (4-10 words), literal and unique.
+- "evidence": array of 1-3 **exact verbatim substrings** from student answer that directly justified the awarded marks. Use the exact content as it appears in the student answer (including numbers with commas, £/$, %, proper nouns), even if spellings are wrong. Do not add ... or any other special symbols; use only words and numbers that appear as is. Keep phrases short (4-10 words) and unique to identify the location for placement using fitz search (which looks for exact substrings in the PDF text layer). Note: This evidence will be used with fitz to search the PDF text layer for exact matches, so make it literal, unique, and findable.
 
 ### Feedback Output Requirements
 comments: An array of strings.
@@ -219,7 +130,6 @@ Quote rules:
 - The quoted text must appear exactly as written in the student’s PDF.
 
 Text after the arrow (→)
-
 Write exactly two short sentences:
 - Sentence 1: Clearly state what is missing, incorrect, or incomplete.
 - Sentence 2: Provide one clear, concise, actionable improvement.
@@ -234,52 +144,27 @@ Strict prohibitions
 
 ### Special Cases
 - No relevant content → score 0.0, correct_words empty, comments: ["No relevant content provided."]
-- Wrong answer / completely incorrect → score 0.0, breakdown: [], comments: ["explanation of why wrong"]
-- Always output a score object in "grades" array — NEVER skip or omit a score for an attempted question
 
 ### Output Format (ONLY this valid JSON)
 {{
   "grades": [
     {{
-      "question_number": "...",
-      "score": number,  // ← ALWAYS include. Can be 0.0 for wrong/incomplete answer
+      "question_number": "question number that we are grading",
+      "score": number,
       "total_marks": number,
-      "comments": ["quote → description. Advice.", "..."],  // ← ALWAYS present. For score 0.0, explain why
-      "correct_words": ["phrase1", "..."],  // ← Empty array [] if score is 0.0
-      "breakdown": [  // ← Empty array [] if score is 0.0. Only non-empty if marks awarded
-        {{"criterion": "exact description from criteria", "marks_awarded": 0.5, "max_possible": 0.5, "evidence": ["..."], "reason": "Fully correct"}},
-        ...
+      "comments": ["quote → description. Advice.", "..."],
+      "correct_words": ["phrase1", "..."],
+      "breakdown": [
+        {{"criterion": "exact description from criteria", "marks_awarded": 0.5, "max_possible": 0.5, "evidence": ["..."], "reason": "Fully correct"}}
       ]
     }}
   ]
 }}
 
-Example for zero score:
-{{
-  "grades": [
-    {{
-      "question_number": "Q1",
-      "score": 0.0,
-      "total_marks": 26,
-      "comments": ["No subsidiary accounting discussion" → "Student does not address consolidation or subsidiary treatment. Read model answer section on consolidation methods."],
-      "correct_words": [],
-      "breakdown": []
-    }}
-  ]
-}}
-
 ### Critical Output Rules
-- Output ONLY the JSON — no text, no ```json, no explanations, no markdown, no extra characters.
-- **MUST ALWAYS INCLUDE A SCORE**: For every question attempted (even if completely wrong), output a score object in "grades" array. Never omit a score. Always provide "score" value (0.0 or higher).
-- If score is 0.0 (wrong answer or no relevant content): Include empty "breakdown": [] array. Still provide "comments" with reason.
+- Output should match json exactly with no extra text, explanations, or markdown.
 - No trailing commas.
-- All strings must be properly quoted with escaped quotes if needed.
-- Escape newlines in strings as \\n 
-- All keys and values must be properly JSON formatted.
-- Prioritize accuracy and fair assessment. Apply check-and-balance rules strictly. Award marks only when supporting evidence is clear and substantial.
-- Double-check all commas are present between objects and array elements.
-- Ensure all brackets and braces are balanced.
-    """
+"""
 
 grade_prompt = ChatPromptTemplate.from_template(GRADE_PROMPT_TEMPLATE)
 map_to_questions_prompt = ChatPromptTemplate.from_template(MAP_PROMPT_TEMPLATE)

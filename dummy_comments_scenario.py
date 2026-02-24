@@ -159,11 +159,6 @@ def is_on_same_line(r1, r2):
 
 
 def find_number_rect_in_text(page, text_rect, number_str):
-    """
-    Try to find the rect of the specific number within found text.
-    When text rect finds \"Consideration (375,000*32):\" at x=80, 
-    this finds the number \"12,000,000\" at x=301 on the same line.
-    """
     if not page or not text_rect or not number_str:
         return text_rect
     
@@ -198,10 +193,41 @@ def resolve_anchor_rect(doc, anchor_text, allowed_pages, placed_marks=None, skip
     evidence_preview = anchor_text[:50] if len(anchor_text) > 50 else anchor_text
     best_rect, best_page = None, -1
     
+    num = extract_number_from_text(anchor_text)
+    if num:
+        logger.debug(f"    → Number-first approach: searching for '{num}' (extracted from evidence)")
+        
+        for page_num in allowed_pages:
+            page = doc[page_num - 1]
+            context_words = [
+                w for w in anchor_text.split() 
+                if len(w) > 2 and not re.match(r'^[\d,().=-]+$', w) and len(w) < 15
+            ]
+            context_words = list(dict.fromkeys(context_words))[:5]
+            
+            # Try HYBRID first: Number + Context (most reliable)
+            logger.debug(f"    [number-first] Trying hybrid: num={num}, context={context_words[:3]}")
+            hybrid_rect = find_number_with_context(page, num, context_words)
+            if hybrid_rect:
+                mark_key = (page_num, round(hybrid_rect.y0))
+                if not (skip_duplicates and mark_key in placed_marks):
+                    logger.debug(f"    [number-first-hybrid] ✓ Found number with context on page {page_num}")
+                    return hybrid_rect, page_num
+            
+            # Fallback to number alone (if hybrid doesn't work)
+            num_hits = page.search_for(num)
+            if num_hits:
+                for rect in num_hits:
+                    mark_key = (page_num, round(rect.y0))
+                    if skip_duplicates and mark_key in placed_marks:
+                        logger.debug(f"    [number-first-skip] Rect at y={rect.y0:.1f} already marked, trying next...")
+                        continue
+                    logger.debug(f"    [number-first] ✓ Found number '{num}' on page {page_num}")
+                    return rect, page_num
+    
+    # Strategy 1: Try exact phrase match (now secondary)
     for page_num in allowed_pages:
         page = doc[page_num - 1]
-        
-        # Strategy 1: Try exact phrase match
         exact_hits = page.search_for(anchor_text)
         if exact_hits:
             # Check for duplicates - skip if already marked
@@ -212,7 +238,6 @@ def resolve_anchor_rect(doc, anchor_text, allowed_pages, placed_marks=None, skip
                     continue
                 
                 # If this is numeric evidence, refocus rect on the number itself
-                num = extract_number_from_text(anchor_text)
                 if num:
                     refined_rect = find_number_rect_in_text(page, rect, num)
                     if refined_rect and refined_rect.x0 > rect.x0 + 5:
@@ -234,7 +259,6 @@ def resolve_anchor_rect(doc, anchor_text, allowed_pages, placed_marks=None, skip
                         logger.debug(f"    [clean-skip] Rect at y={rect.y0:.1f} already marked, trying next...")
                         continue
                     # If this is numeric evidence, refocus rect on the number itself
-                    num = extract_number_from_text(anchor_text)
                     if num:
                         refined_rect = find_number_rect_in_text(page, rect, num)
                         if refined_rect:
@@ -242,8 +266,7 @@ def resolve_anchor_rect(doc, anchor_text, allowed_pages, placed_marks=None, skip
                     logger.debug(f"    [clean] '{evidence_preview}' → CLEAN PHRASE on page {page_num}")
                     return rect, page_num
         
-        # Strategy 3: HYBRID - Number + Context words together
-        num = extract_number_from_text(anchor_text)
+        # Strategy 3: HYBRID - Number + Context words together (fallback position)
         if num:
             # Extract key content words (skip small words, numbers, special chars)
             context_words = [
@@ -324,7 +347,6 @@ def resolve_anchor_rect(doc, anchor_text, allowed_pages, placed_marks=None, skip
 
 
 def add_popup_for_comment(doc, comment, allowed_pages, placed_marks=None):
-    """Add comment popup at anchor location with deduplication support."""
     if not comment or '→' not in comment:
         logger.debug(f"  No arrow in comment: '{comment[:40]}...'")
         return False
@@ -450,10 +472,33 @@ def add_main_score(doc, q_num, score_text, allowed_pages):
         for search_text, strategy_name in strategies:
             instances = page.search_for(search_text)
             if instances:
-                rect = instances[0]
-                # Place to the left and above the heading
-                x = rect.x0 - CONFIG['main_score_offset_x']
-                y = rect.y0 + CONFIG['main_score_offset_y'] - 10
+                heading_rect = instances[0]
+                
+                # ✓ NEW: Validate that there's substantive content BELOW the heading
+                # Check for text/numbers in the region below heading (y > heading.y1)
+                has_substantive_content = False
+                min_y_below = heading_rect.y1 + 5
+                max_y_below = min(heading_rect.y1 + 80, page.rect.height - 20)
+                
+                for word_obj in page.get_text("words"):
+                    word_text = word_obj[4].strip()
+                    word_y = word_obj[1]
+                    
+                    # Text below heading, not just whitespace or single chars
+                    if (word_y >= min_y_below and word_y <= max_y_below and 
+                        len(word_text) > 1 and not word_text.isspace() and 
+                        not re.match(r'^[^a-zA-Z0-9]*$', word_text)):
+                        has_substantive_content = True
+                        logger.debug(f"      [main-score] Found substantive content below heading: '{word_text}'")
+                        break
+                
+                if not has_substantive_content:
+                    logger.debug(f"      [main-score] No substantive content below '{search_text}' heading - SKIPPING")
+                    continue
+                
+                # Place to the left and above the heading (if content validated)
+                x = heading_rect.x0 - CONFIG['main_score_offset_x']
+                y = heading_rect.y0 + CONFIG['main_score_offset_y'] - 10
                 
                 page.insert_text(
                     (x, y),
@@ -461,10 +506,10 @@ def add_main_score(doc, q_num, score_text, allowed_pages):
                     fontsize=CONFIG['main_score_fontsize'],
                     color=CONFIG['main_score_color']
                 )
-                logger.info(f"✓ Main score '{score_text}' placed (strategy: {strategy_name}) on page {page_num}")
+                logger.info(f"✓ Main score '{score_text}' placed (strategy: {strategy_name}) on page {page_num} - content validated")
                 return True
     
-    logger.warning(f"✗ Main score not placed - Q{q_str} heading not found")
+    logger.warning(f"✗ Main score not placed - Q{q_str} heading not found or no substantive content")
     return False
 
 

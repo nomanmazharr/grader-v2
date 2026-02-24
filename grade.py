@@ -73,7 +73,7 @@ class StudentGrader:
         return q_clean, m_clean, s_clean
 
     def _run_mapping(self, student_data: dict, questions_data: dict) -> dict:
-        """Execute mapping chain with clean content."""
+        """Execute mapping chain with clean content (chunks → question mapping only)."""
         try:
             output = self.map_chain.invoke({
                 "chunks": student_data,
@@ -130,7 +130,7 @@ class StudentGrader:
             logger.error("Grading chain failed", exc_info=True)
             raise GradingError("Grading step failed") from e
 
-    def _build_grade_doc(self, parsed_grades: dict) -> dict:
+    def _build_grade_doc(self, parsed_grades: dict, questions_data: dict) -> dict:
         now_iso = datetime.utcnow().isoformat()
 
         grades = parsed_grades.get("grades", [])
@@ -138,44 +138,103 @@ class StudentGrader:
             raise GradingError("No grades returned from LLM")
 
         main_grade = grades[0]  # assuming single main grade object
+        all_comments = main_grade.get("comments", []) if isinstance(main_grade.get("comments", []), list) else []
 
-        # Round total to nearest 0.5 (17.75 → 18.0)
-        raw_total = float(main_grade.get("score", 0))
-        rounded_total = round(raw_total * 2) / 2
+        normalized_breakdown = []
+        evidence_warnings = []
+        sum_awarded_calc = 0.0  # debug only
 
-        # Extract comments from LLM output
-        all_comments = main_grade.get("comments", [])  # list of strings
+        for item in main_grade.get("breakdown", []) or []:
+            criterion = item.get("criterion", "Unknown")
+            marks_awarded = float(item.get("marks_awarded", 0))
+            max_possible = float(item.get("max_possible", 0)) if item.get("max_possible") is not None else 0.0
+
+            raw_evidence = item.get("evidence", [])
+            evid_list = []
+
+            # Super-robust parsing
+            if isinstance(raw_evidence, str):
+                cleaned = raw_evidence.replace('\\n', '\n').replace('\\r', '').replace('\\t', ' ').strip()
+                if cleaned:
+                    evid_list = [s.strip() for s in re.split(r'\n|;|\|', cleaned) if s.strip()]
+            elif isinstance(raw_evidence, list):
+                for ev in raw_evidence:
+                    if ev is None:
+                        continue
+                    if isinstance(ev, str):
+                        cleaned_ev = ev.replace('\\n', '\n').strip()
+                        if cleaned_ev:
+                            evid_list.append(cleaned_ev)
+                    else:
+                        cleaned_ev = str(ev).strip()
+                        if cleaned_ev:
+                            evid_list.append(cleaned_ev)
+            else:
+                # fallback for odd types
+                cleaned = str(raw_evidence).strip()
+                if cleaned:
+                    evid_list = [cleaned]
+
+            # No revocation - keep marks if LLM awarded them
+            if marks_awarded > 0 and not evid_list:
+                evid_list = ["[LLM awarded marks - evidence not parsed, check raw output]"]
+                evidence_warnings.append(f"Evidence parsing issue but marks kept: {criterion}")
+
+            sum_awarded_calc += marks_awarded
+
+            normalized_breakdown.append({
+                "criterion": criterion,
+                "marks_awarded": marks_awarded,
+                "max_possible": max_possible,
+                "reason": item.get("reason", ""),
+                "evidence": "; ".join(evid_list) if evid_list else "[no parsed evidence]",
+                "comments_summary": item.get("comments_summary", "")
+            })
+
+        # Total max possible
+        total_max = 0.0
+        q_total_raw = questions_data.get("total_marks") if isinstance(questions_data, dict) else None
+        if q_total_raw:
+            m = re.search(r"(\d+)", str(q_total_raw))
+            if m:
+                total_max = float(m.group(1))
+
+        if total_max == 0.0:
+            try:
+                total_max = float(main_grade.get("total_marks", 0))
+            except Exception:
+                total_max = 0.0
+
+        # Trust LLM score
+        llm_score = float(main_grade.get("score", sum_awarded_calc))
+        rounded_total = round(llm_score * 2) / 2
+
+        # Debug logs
+        logger.info(f"Raw LLM breakdown count: {len(main_grade.get('breakdown', []))}")
+        logger.info(f"Saved breakdown count: {len(normalized_breakdown)}")
+        logger.info(f"LLM score: {llm_score}")
+        logger.info(f"Calc sum (debug): {sum_awarded_calc}")
+        logger.info(f"Final saved total: {rounded_total}")
 
         doc = {
             "student_id": self.student_name,
             "question_number": self.question_number,
             "total_marks_awarded": rounded_total,
-            "total_max_possible": float(main_grade.get("total_marks", 0)),
+            "total_max_possible": total_max,
             "overall_reason": main_grade.get("reason", "Graded automatically"),
-            "breakdown": [
-                {
-                    "criterion": item.get("criterion", "Unknown"),
-                    "marks_awarded": float(item.get("marks_awarded", 0)),
-                    "max_possible": float(item.get("max_possible", 0)),
-                    "reason": item.get("reason", ""),
-                    "evidence": "; ".join(item.get("evidence", [])) if item.get("evidence") else "",
-                    "comments_summary": item.get("comments_summary", "")
-                }
-                for item in main_grade.get("breakdown", [])
-            ],
-            "comments": all_comments,  # ← only this field now
+            "breakdown": normalized_breakdown,
+            "comments": list(all_comments) + evidence_warnings,
             "extracted_at": now_iso,
             "question_id": self.questions_id,
             "model_answer_id": self.model_answers_id,
             "student_answer_id": self.student_answers_id,
         }
 
-        # Validate with updated Pydantic schema
         try:
             validated = StudentGradeDocument(**doc)
             return validated.model_dump(exclude_none=True)
         except Exception as ve:
-            logger.warning(f"Grade validation failed – saving raw: {ve}")
+            logger.warning(f"Pydantic validation failed - saving raw: {ve}")
             return doc
 
     def _save(self, doc: dict) -> str:
@@ -195,7 +254,7 @@ class StudentGrader:
             q_clean, m_clean, s_clean = self._load_clean_data()
             mapping = self._run_mapping(s_clean, q_clean)
             grades_parsed = self._run_grading(mapping, s_clean, m_clean, q_clean)
-            grade_doc = self._build_grade_doc(grades_parsed)
+            grade_doc = self._build_grade_doc(grades_parsed, q_clean)
             doc_id = self._save(grade_doc)
 
             return doc_id
@@ -216,10 +275,6 @@ def grade_student(
     model_answers_id: Optional[str],
     student_answers_id: str,
 ) -> Optional[str]:
-    """
-    Grade student using MongoDB IDs.
-    Returns _id of saved grading document in 'student_grades' collection.
-    """
     grader = StudentGrader(
         student_name=student_name,
         question_number=question_number,
