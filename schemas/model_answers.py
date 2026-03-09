@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import List, Optional, Union
 from pydantic import BaseModel, Field
 
@@ -5,6 +7,13 @@ from pydantic import BaseModel, Field
 class MarkingPoint(BaseModel):
     marks: Union[float, str, None] = Field(..., description="Mark value (number or string like '1 each', 'max 4', 'tick')")
     description: str = Field(..., description="Exact original text describing what earns the mark")
+    sub_criteria: Optional[List["MarkingPoint"]] = Field(
+        None,
+        description=(
+            "Optional nested criteria for this point. Use when the marking guide has a broad criterion (e.g. 4 marks) "
+            "that is broken into multiple smaller markable sub-points."
+        ),
+    )
 
 
 class AnswerItem(BaseModel):
@@ -70,6 +79,19 @@ OPENAI_MODEL_ANSWER_SCHEMA = {
                                 "description": {
                                     "type": "string",
                                     "description": "Exact original text describing what earns the mark"
+                                },
+                                "sub_criteria": {
+                                    "type": ["array", "null"],
+                                    "description": "Optional nested sub-criteria for this criterion",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "marks": {"type": ["number", "string"]},
+                                            "description": {"type": "string"}
+                                        },
+                                        "required": ["marks", "description"],
+                                        "additionalProperties": False
+                                    }
                                 }
                             },
                             "required": ["marks", "description"],
@@ -105,7 +127,19 @@ OPENAI_MODEL_ANSWER_SCHEMA = {
                                         "type": "object",
                                         "properties": {
                                             "marks": {"type": ["number", "string"]},
-                                            "description": {"type": "string"}
+                                            "description": {"type": "string"},
+                                            "sub_criteria": {
+                                                "type": ["array", "null"],
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "marks": {"type": ["number", "string"]},
+                                                        "description": {"type": "string"}
+                                                    },
+                                                    "required": ["marks", "description"],
+                                                    "additionalProperties": False
+                                                }
+                                            }
                                         },
                                         "required": ["marks", "description"],
                                         "additionalProperties": False

@@ -130,9 +130,10 @@ def grade_student_wrapper(
 def annotate_student_wrapper(
     student_pdf_path: str,
     student_name: str,
-    grades_id: str,
     student_pages: List[int],
-    output_dir: str
+    output_dir: str,
+    grades_id: Optional[str] = None,
+    grades_doc: Optional[dict] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     try:
         logger.info(f"Starting annotation for {student_name}")
@@ -141,6 +142,7 @@ def annotate_student_wrapper(
             output_dir=output_dir,
             student_name=student_name,
             grades_id=grades_id,
+            grades_doc=grades_doc,
             student_pages=student_pages
         )
 
@@ -202,6 +204,9 @@ async def process_exam_async(
     if not s_ok:
         logger.error(f"Pipeline stopped: Student extraction failed for {student_name}")
         return False, "Student extraction failed", None, None
+    # question_id = "69a6b25f23aeb755f2cfb7da"
+    # model_answers_id = "69a6b2b923aeb755f2cfb7dc"
+    # student_answers_id = "69a6b2a023aeb755f2cfb7db"
     g_ok, g_message, grades_id = grade_student_wrapper(
         student_name=student_name,
         question_num=question_num,
@@ -213,6 +218,8 @@ async def process_exam_async(
     if not g_ok:
         logger.error(f"Grading failed → {g_message}")
         return False, g_message, None, None
+
+    # grades_id = "69aa27084d65ac63f788066f"
     a_ok, a_message, annotated_pdf = annotate_student_wrapper(
         student_pdf_path=student_pdf_path,
         student_name=student_name,
@@ -266,8 +273,8 @@ def process_exam(
 #         question_num='1',
 #         model_answer_pdf_path='dataset/Bauhaus prepped answer.pdf',
 #         answer_pages=[9, 10, 11, 12, 13, 14, 15],
-#         student_pdf_path='dataset/Arend Schuiteman_612183_assignsubmission_file_CR_TuitionExam_Arend_Schuiteman.pdf',
-#         student_pages=[1, 2, 3, 4, 5],
-#         student_name='Arend_Schuiteman',
+#         student_pdf_path='dataset/Bethany Paddon_564589_assignsubmission_file_AA_MOCK1_BETH_PADDON.pdf',
+#         student_pages=[1, 2, 3, 4],
+#         student_name='Bethany_Paddon',
 #         output_dir='annotations'
 #     )
