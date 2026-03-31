@@ -6,12 +6,10 @@ from typing import Any, Dict, List, Tuple, Type
 import fitz
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-from langchain_xai import ChatXAI
 from langchain_core.messages import HumanMessage
 
 from logging_config import logger
+from llm_setup import _build_chat_model
 
 load_dotenv()
 
@@ -61,31 +59,12 @@ class PDFExtractor:
         self.llm = self._get_llm()
         
     def _get_llm(self):
-        provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+        if not provider or provider == "auto":
+            provider = "openai"
         try:
-            if provider == "openai":
-                logger.info(f"Using OpenAI provider via LangChain (model={self.model_name}, dpi={self.render_dpi})")
-                return ChatOpenAI(
-                    model=self.model_name,
-                    temperature=0,
-                )
-            elif provider in ["anthropic", "claude"]:
-                logger.info(f"Using Anthropic provider via LangChain (model={self.model_name}, dpi={self.render_dpi})")
-                return ChatAnthropic(
-                    model=self.model_name,
-                    temperature=0,
-                )
-            elif provider in ["xai", "grok"]:
-                logger.info(f"Using XAI/Grok provider via LangChain (model={self.model_name}, dpi={self.render_dpi})")
-                return ChatXAI(
-                    model=self.model_name,
-                    temperature=0,
-                )
-            else:
-                raise PDFExtractionError(
-                    f"Unsupported LLM_PROVIDER '{provider}'. "
-                    "Supported: openai, anthropic, xai"
-                )
+            logger.info(f"Using {provider} provider via LangChain (model={self.model_name}, dpi={self.render_dpi})")
+            return _build_chat_model(provider, self.model_name, temperature=0)
         except Exception as e:
             logger.error(f"Failed to initialize LLM: {e}", exc_info=True)
             raise PDFExtractionError(f"LLM initialization failed: {e}") from e

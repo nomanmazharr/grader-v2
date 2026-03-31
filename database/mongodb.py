@@ -150,5 +150,6 @@ class MongoDBConnection:
 # Convenience exports
 get_db = MongoDBConnection.get_db
 get_collection = MongoDBConnection.get_collection
-get_questions_collection = lambda: MongoDBConnection.get_collection("pac_questions")
+def get_questions_collection():
+    return MongoDBConnection.get_collection("pac_questions")
 close = MongoDBConnection.close

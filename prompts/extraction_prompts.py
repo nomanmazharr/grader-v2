@@ -27,6 +27,7 @@ TABLE EXTRACTION RULES:
 - Keep ALL numerical values, units, currency symbols, and column headings exactly as written.
 - Maintain correct alignment of numbers with their labels.
 - If a calculation table has multiple columns (description | amount), preserve that structure.
+- NEVER omit a table. If any table cell/row is hard to read, include your best-effort extraction and add "[unclear]" in-place rather than dropping the row/table.
 
 SUB-SECTION DETECTION (strict priority order – apply ONLY the first that matches):
 1. If the student has explicitly written numbered or lettered sub-parts such as:
@@ -44,6 +45,13 @@ FORMATTING RULES:
 - Use clear spacing to separate sections.
 - NEVER invent or create sub-parts based on content headings or topic names.
 - Do NOT treat descriptive headings as sub-question identifiers.
+
+OPTIONAL PAGE TEXTS (IMPORTANT FOR ANNOTATION):
+- If you can, also populate a field `page_texts` as an array with one entry per provided page:
+    - `page`: the 1-based page number as given in the input
+    - `text`: the extracted text for that page only
+- `page_texts` should reflect the same extracted content as the combined answer, but split by page.
+- Do not invent pages; include ONLY the provided pages.
 
 Return ONLY valid JSON with clean text — no markdown, no commentary, no preamble.
 """

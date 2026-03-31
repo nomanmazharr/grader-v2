@@ -10,7 +10,7 @@ from question_pdf import extract_questions_pipeline
 from rubric_extraction import extract_pdf_annotations_pipeline
 from student_assignment_extraction import extract_assignment_pipeline
 from grade import grade_student
-from dummy_comments_scenario import annotate_pdf
+from pdf_annotation.annotator import annotate_pdf
 
 
 # ── Async Extraction Wrappers ────────────────────────────────────────────────
@@ -95,22 +95,26 @@ async def extract_student_answers_async(
         logger.error(f"[Student {student_name}] Failed: {str(e)}", exc_info=True)
         return False, None
 
-def grade_student_wrapper(
+async def grade_student_wrapper(
     student_name: str,
     question_num: str,
     questions_id: str,
     model_answers_id: Optional[str],
     student_answers_id: str
 ) -> Tuple[bool, str, Optional[str]]:
+    loop = asyncio.get_running_loop()
     try:
         logger.info(f"Starting grading for {student_name} - Q{question_num}")
 
-        grades_id = grade_student(
-            student_name=student_name,
-            question_number=question_num,
-            questions_id=questions_id,
-            model_answers_id=model_answers_id,
-            student_answers_id=student_answers_id
+        grades_id = await loop.run_in_executor(
+            None,
+            lambda: grade_student(
+                student_name=student_name,
+                question_number=question_num,
+                questions_id=questions_id,
+                model_answers_id=model_answers_id,
+                student_answers_id=student_answers_id,
+            )
         )
 
         if not grades_id:
@@ -174,40 +178,27 @@ async def process_exam_async(
     logger.info(f"ASYNC PIPELINE START → {student_name} | Q{question_num}")
     logger.info("=" * 70)
 
-    # Parallel extractions
+    # Parallel extractions (each wrapper already catches exceptions and returns (False, None))
     q_task = extract_question_text_async(question_pdf_path, question_pages, question_num)
     r_task = extract_rubric_async(model_answer_pdf_path, answer_pages)
     s_task = extract_student_answers_async(student_pdf_path, student_pages, student_name)
 
     (q_ok, question_id), (r_ok, model_answers_id), (s_ok, student_answers_id) = await asyncio.gather(
-        q_task, r_task, s_task, return_exceptions=True
+        q_task, r_task, s_task
     )
 
-    # Handle any exceptions from parallel tasks
-    if isinstance(q_ok, Exception):
-        logger.error(f"Question extraction crashed: {q_ok}")
-        q_ok, question_id = False, None
-    if isinstance(r_ok, Exception):
-        logger.error(f"Rubric extraction crashed: {r_ok}")
-        r_ok, model_answers_id = False, None
-    if isinstance(s_ok, Exception):
-        logger.error(f"Student extraction crashed: {s_ok}")
-        s_ok, student_answers_id = False, None
-
-    if not q_ok:
+    if not q_ok or not question_id:
         logger.error("Pipeline stopped: Question extraction failed")
         return False, "Question extraction failed", None, None
 
+    # Model answers are optional (pipeline supports grading without them).
     if not r_ok:
         model_answers_id = None
 
-    if not s_ok:
+    if not s_ok or not student_answers_id:
         logger.error(f"Pipeline stopped: Student extraction failed for {student_name}")
         return False, "Student extraction failed", None, None
-    # question_id = "69a6b25f23aeb755f2cfb7da"
-    # model_answers_id = "69a6b2b923aeb755f2cfb7dc"
-    # student_answers_id = "69a6b2a023aeb755f2cfb7db"
-    g_ok, g_message, grades_id = grade_student_wrapper(
+    g_ok, g_message, grades_id = await grade_student_wrapper(
         student_name=student_name,
         question_num=question_num,
         questions_id=question_id,
@@ -219,7 +210,6 @@ async def process_exam_async(
         logger.error(f"Grading failed → {g_message}")
         return False, g_message, None, None
 
-    # grades_id = "69aa27084d65ac63f788066f"
     a_ok, a_message, annotated_pdf = annotate_student_wrapper(
         student_pdf_path=student_pdf_path,
         student_name=student_name,
@@ -264,17 +254,17 @@ def process_exam(
     )
 
 
-# if __name__ == "__main__":
-#     logger.info("Async Exam Grading Pipeline")
+if __name__ == "__main__":
+    logger.info("Async Exam Grading Pipeline")
 
-#     process_exam(
-#         question_pdf_path='dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf',
-#         question_pages=[2, 3, 4],
-#         question_num='1',
-#         model_answer_pdf_path='dataset/Bauhaus prepped answer.pdf',
-#         answer_pages=[9, 10, 11, 12, 13, 14, 15],
-#         student_pdf_path='dataset/Bethany Paddon_564589_assignsubmission_file_AA_MOCK1_BETH_PADDON.pdf',
-#         student_pages=[1, 2, 3, 4],
-#         student_name='Bethany_Paddon',
-#         output_dir='annotations'
-#     )
+    process_exam(
+        question_pdf_path='dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf',
+        question_pages=[2, 3, 4],
+        question_num='1',
+        model_answer_pdf_path='dataset/Bauhaus prepped answer.pdf',
+        answer_pages=[9, 10, 11, 12, 13, 14, 15],
+        student_pdf_path='dataset/Katrina Headings_612211_assignsubmission_file_CR_TCE_Katrina_Headings.pdf',
+        student_pages=[1, 2],
+        student_name='Cameron_Cowan',
+        output_dir='annotations'
+    )

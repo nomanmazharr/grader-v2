@@ -7,9 +7,20 @@ class SubPart(BaseModel):
     answer: str = Field(..., description="Student's full answer content for this part")
 
 
+class PageText(BaseModel):
+    page: int = Field(..., description="1-based page number from the source PDF")
+    text: str = Field(..., description="Extracted text content for that page")
+
+
 class StudentAssignmentDocument(BaseModel):
     question: str = Field(..., description="Main question number/label")
     sub_parts: List[SubPart] = Field(..., description="Student answers per sub-part or single entry")
+
+    # Optional per-page extraction (helps downstream annotation on scanned PDFs)
+    page_texts: Optional[List[PageText]] = Field(
+        default=None,
+        description="Optional list of extracted text per page (1-based page numbers)"
+    )
 
     # Metadata
     pages: List[int] = Field(..., description="Extracted pages")
@@ -41,6 +52,19 @@ OPENAI_STUDENT_SCHEMA = {
                     }
                 },
                 "required": ["question_number", "answer"],
+                "additionalProperties": False
+            }
+        },
+        "page_texts": {
+            "type": ["array", "null"],
+            "description": "Optional list of extracted text per page to support downstream annotation",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "number", "description": "1-based page number"},
+                    "text": {"type": "string", "description": "Extracted text for that page"}
+                },
+                "required": ["page", "text"],
                 "additionalProperties": False
             }
         }

@@ -13,17 +13,28 @@ def save_uploaded_file(uploaded_file, temp_dir):
     return file_path
 
 def parse_pages(page_str):
-    """Parse comma-separated page numbers."""
+    """Parse comma-separated page numbers or ranges like 1-3."""
     if not page_str:
         return []
-    return [int(p.strip()) for p in page_str.split(',') if p.strip().isdigit()]
+    pages = []
+    for part in page_str.split(','):
+        part = part.strip()
+        if '-' in part:
+            bounds = part.split('-', 1)
+            if bounds[0].strip().isdigit() and bounds[1].strip().isdigit():
+                pages.extend(range(int(bounds[0]), int(bounds[1]) + 1))
+        elif part.isdigit():
+            pages.append(int(part))
+    return pages
 
 def main():
     st.set_page_config(page_title="Exam Grader", page_icon="📚", layout="wide")
     st.title("📚 Automated Exam Grader - Numerical")
     
-    # Temp directory for uploaded files
-    temp_dir = tempfile.mkdtemp(prefix="exam_grader_")
+    # Temp directory for uploaded files — persisted across rerenders to avoid leaking dirs
+    if "temp_dir" not in st.session_state:
+        st.session_state.temp_dir = tempfile.mkdtemp(prefix="exam_grader_")
+    temp_dir = st.session_state.temp_dir
     
     # File uploads
     st.header(" Upload PDFs")
@@ -79,10 +90,8 @@ def main():
             st.error("Specify valid page numbers!")
             st.stop()
         
-        # Progress container
         progress_container = st.container()
-        status_container = st.container()
-        
+
         try:
             with progress_container:
                 progress_bar = st.progress(0)
@@ -154,8 +163,6 @@ def main():
             st.error(f"Unexpected error: {str(e)}")
             st.error("Full traceback:")
             st.code(traceback.format_exc())
-            
-        finally:
             progress_bar.empty()
             status_text.empty()
 
