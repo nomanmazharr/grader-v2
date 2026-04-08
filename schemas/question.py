@@ -13,6 +13,7 @@ class QuestionItem(BaseModel):
     question_number: str = Field(...)
     content: str = Field(...)
     marks: Optional[str] = Field(None)
+    total_marks: Optional[float] = Field(None, description="Total marks for this question (sum of sub-parts if not explicitly stated)")
     sub_questions: Optional[List[SubQuestion]] = Field(None)
 
 
@@ -63,6 +64,10 @@ OPENAI_QUESTION_SCHEMA = {
                         "type": ["string", "null"],
                         "description": "Marks allocation if mentioned, captured exactly as written, e.g., '5 marks' or '(6)'"
                     },
+                    "total_marks": {
+                        "type": ["number", "null"],
+                        "description": "Total numeric marks for this question. If explicitly stated use that value. If only sub-parts have individual marks (e.g. (a)=8, (b)=10), sum them (e.g. 18). Never leave null when marks are present anywhere in the question."
+                    },
                     "sub_questions": {
                         "type": ["array", "null"],
                         "description": "Nested subquestions if present (e.g., (i), (ii))",
@@ -74,7 +79,7 @@ OPENAI_QUESTION_SCHEMA = {
                         }
                     }
                 },
-                "required": ["question_number", "content", "marks", "sub_questions"],
+                "required": ["question_number", "content", "marks", "total_marks", "sub_questions"],
                 "additionalProperties": False
             }
         }

@@ -26,10 +26,10 @@ class AnswerItem(BaseModel):
 
 
 class ModelAnswerDocument(BaseModel):
-    question_title: str = Field(..., description="Main question title")
+    question_title: str = Field(..., description="The question label only, e.g. 'Ans.5' or 'Question 5'. Do NOT include sub-section or topic names here.")
     description: Optional[str] = Field(None, description="Introductory context / assumptions")
-    total_marks: Optional[str] = Field(None, description="Total marks for the question")
-    answers: List[AnswerItem] = Field(..., description="Model answers and criteria hierarchy")
+    total_marks: Optional[str] = Field(None, description="Total marks for the entire question (sum of all sub-sections)")
+    answers: List[AnswerItem] = Field(..., description="One entry per sub-section or topic heading with marks. If the question has multiple sub-sections (e.g. topic A (5 Marks), topic B (5 Marks)), each becomes a separate entry. Never merge sub-sections into one entry.")
 
     # Metadata
     pages: List[int] = Field(..., description="Extracted pages")
@@ -42,7 +42,7 @@ OPENAI_MODEL_ANSWER_SCHEMA = {
     "properties": {
         "question_title": {
             "type": "string",
-            "description": "Main question title, e.g., 'Question 4'"
+            "description": "The question identifier only, e.g. 'Ans.5' or 'Question 5'. Do NOT embed sub-section or topic names here — those belong in the answers array."
         },
         "description": {
             "type": ["string", "null"],
@@ -54,7 +54,7 @@ OPENAI_MODEL_ANSWER_SCHEMA = {
         },
         "answers": {
             "type": "array",
-            "description": "Model answer if no subsections are present for this question",
+            "description": "One entry per sub-section or topic heading with marks. If the question has sub-sections (e.g. 'Topic A (5 Marks)', 'Topic B (5 Marks)'), each is a separate entry. Always check ALL provided pages before finalising this array.",
             "items": {
                 "type": "object",
                 "properties": {

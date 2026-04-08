@@ -7,7 +7,7 @@ from pymongo.collection import Collection
 from database.mongodb import get_collection  
 from logging_config import logger
 from providers.langchain_pdf_extractor import PDFExtractor, PDFExtractionError
-from prompts.extraction_prompts import MODEL_ANSWER_EXTRACTION_PROMPT
+from prompts.extraction_prompts import get_model_answer_extraction_prompt
 from schemas.model_answers import ModelAnswerDocument
 from utils.db_utils import add_metadata, validate_and_prepare, save_to_mongodb
 
@@ -17,9 +17,10 @@ class ModelAnswerExtractionError(Exception):
 
 class ModelAnswerExtractor:
 
-    def __init__(self, pdf_path: str, pages: List[int]):
+    def __init__(self, pdf_path: str, pages: List[int], question_number: str = None):
         self.pdf_path = pdf_path
         self.pages = pages
+        self.question_number = question_number
         self.collection: Collection = get_collection("model_answers")
 
     def _extract_with_vision(self) -> dict:
@@ -30,11 +31,12 @@ class ModelAnswerExtractor:
                 model_name=llm_setup.LLM_EXTRACTION_MODEL,
                 render_dpi=llm_setup.LLM_PDF_RENDER_DPI,
             )
+            prompt = get_model_answer_extraction_prompt(self.question_number)
             data = extractor.extract(
-                instruction_prompt=MODEL_ANSWER_EXTRACTION_PROMPT,
+                instruction_prompt=prompt,
                 output_schema=ModelAnswerDocument
             )
-            logger.info("Model answer + rubric successfully extracted via LangChain")
+            logger.info(f"Model answer + rubric extracted via LangChain (Q{self.question_number or 'all'})")
             return data
         except PDFExtractionError as e:
             logger.error(f"Provider extraction failed: {e}", exc_info=True)
@@ -42,10 +44,10 @@ class ModelAnswerExtractor:
 
     def run(self) -> Optional[str]:
         try:
-            logger.info(f"Extracting model answers from {Path(self.pdf_path).name} pages {self.pages}")
+            logger.info(f"Extracting model answers from {Path(self.pdf_path).name} pages {self.pages} (Q{self.question_number or 'all'})")
 
             raw_data = self._extract_with_vision()
-            
+
             data_with_meta = add_metadata(raw_data, self.pdf_path, self.pages)
             to_save = validate_and_prepare(data_with_meta, ModelAnswerDocument)
             doc_id = save_to_mongodb(self.collection, to_save, entity_type="model answer")
@@ -59,6 +61,6 @@ class ModelAnswerExtractor:
             return None
 
 
-def extract_pdf_annotations_pipeline(pdf_path: str, pages: List[int]) -> Optional[str]:
-    extractor = ModelAnswerExtractor(pdf_path, pages)
+def extract_pdf_annotations_pipeline(pdf_path: str, pages: List[int], question_number: str = None) -> Optional[str]:
+    extractor = ModelAnswerExtractor(pdf_path, pages, question_number=question_number)
     return extractor.run()

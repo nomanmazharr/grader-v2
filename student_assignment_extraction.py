@@ -8,7 +8,7 @@ from pymongo.collection import Collection
 from database.mongodb import get_collection
 from logging_config import logger
 from providers.langchain_pdf_extractor import PDFExtractor, PDFExtractionError
-from prompts.extraction_prompts import STUDENT_ASSIGNMENT_EXTRACTION_PROMPT
+from prompts.extraction_prompts import get_student_extraction_prompt
 from schemas.student_assignment import StudentAssignmentDocument
 from utils.db_utils import add_metadata, validate_and_prepare, save_to_mongodb
 
@@ -19,14 +19,17 @@ class StudentAssignmentExtractionError(Exception):
 class StudentAssignmentExtractor:
     COLLECTION_NAME = "student_assignments"
 
-    def __init__(self, pdf_path: str, pages: List[int], student_name: Optional[str] = None):
+    def __init__(self, pdf_path: str, pages: List[int], student_name: Optional[str] = None,
+                 question_number: Optional[str] = None):
         self.pdf_path = pdf_path
         self.pages = pages
         self.student_name = student_name
+        self.question_number = question_number
         self.collection: Collection = get_collection(self.COLLECTION_NAME)
 
     def _extract_with_vision(self) -> dict:
         try:
+            prompt = get_student_extraction_prompt(self.question_number)
             extractor = PDFExtractor(
                 self.pdf_path,
                 self.pages,
@@ -34,7 +37,7 @@ class StudentAssignmentExtractor:
                 render_dpi=llm_setup.LLM_PDF_RENDER_DPI,
             )
             data = extractor.extract(
-                instruction_prompt=STUDENT_ASSIGNMENT_EXTRACTION_PROMPT,
+                instruction_prompt=prompt,
                 output_schema=StudentAssignmentDocument,
             )
             logger.info("Student assignment successfully extracted via LangChain")
@@ -66,7 +69,8 @@ class StudentAssignmentExtractor:
 def extract_assignment_pipeline(
     pdf_path: str,
     pages: List[int],
-    student_name: Optional[str] = None
+    student_name: Optional[str] = None,
+    question_number: Optional[str] = None
 ) -> Optional[str]:
-    extractor = StudentAssignmentExtractor(pdf_path, pages, student_name)
+    extractor = StudentAssignmentExtractor(pdf_path, pages, student_name, question_number)
     return extractor.run()

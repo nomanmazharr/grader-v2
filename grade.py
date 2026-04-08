@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional, Any, Tuple
 from bson import ObjectId
 from pydantic import BaseModel, Field
-from prompts.grading_prompts import grade_prompt
+from prompts.grading_prompts import grade_prompt, holistic_grade_prompt
 from llm_setup import llm_grader
 from logging_config import logger
 from schemas.student_grades import StudentGradeDocument
@@ -41,6 +41,31 @@ class LLMGradingResponse(BaseModel):
     grades: list[LLMGradingItem] = Field(..., min_length=1, description="Grades array")
 
 
+# ── Holistic grading models (no-criteria theoretical questions) ──
+
+class CorrectPoint(BaseModel):
+    text: str = Field(..., description="Verbatim line/sentence from student that earned marks")
+    marks: float = Field(..., ge=0, description="Marks this specific point earned (0.5 increments)")
+    key_phrase: str = Field("", description="2-5 word core concept within text where tick mark is placed")
+
+
+class HolisticSubQuestionGrade(BaseModel):
+    sub_question: str = Field(..., description="Sub-question identifier from model answer, e.g. 'a', '1.1', '(i)'")
+    student_label: str = Field("", description="How the student labeled this part, e.g. 'Q1(a)', 'a)', 'Part a'")
+    marks_awarded: float = Field(..., ge=0, description="Marks awarded for this sub-question")
+    max_marks: float = Field(..., ge=0, description="Maximum marks for this sub-question")
+    reason: str = Field("", description="Brief explanation of why marks were awarded/not awarded")
+    correct_points: list[CorrectPoint] = Field(default_factory=list, description="Correct points with per-point marks")
+
+
+class HolisticGradingResponse(BaseModel):
+    question_number: str = Field(..., description="Main question number")
+    score: float = Field(..., ge=0, description="Total marks awarded")
+    total_marks: float = Field(..., ge=0, description="Maximum marks for the entire question")
+    sub_grades: list[HolisticSubQuestionGrade] = Field(default_factory=list, description="Per-sub-question grades")
+    comments: list[str] = Field(default_factory=list, description="Feedback comments")
+
+
 class StudentGrader:
 
     COLLECTION_NAME = "student_grades"
@@ -52,12 +77,25 @@ class StudentGrader:
         questions_id: Optional[str],
         model_answers_id: Optional[str],
         student_answers_id: str,
+        question_type: str = "numerical",
     ):
         self.student_name = student_name
         self.question_number = question_number
         self.questions_id = questions_id
         self.model_answers_id = model_answers_id
         self.student_answers_id = student_answers_id
+        self.question_type = question_type  # "numerical" or "theoretical"
+
+        # Flag: True when marking criteria were synthesized from answer text
+        # (no formal rubric provided). Used to relax strict guardrails.
+        self._criteria_were_synthesized: bool = False
+
+        # Flag: True when no marking criteria exist and we use holistic grading
+        # (compare full answers) instead of per-criterion grading.
+        self._holistic_grading: bool = False
+        # Cached holistic sub-question structure for the grading prompt.
+        # Each entry: {"sub_question": str, "answer": str, "max_marks": float}
+        self._holistic_sub_questions: list[dict] = []
 
         # Cache of the exact student text passed to the grader in the most recent run.
         # Used for post-grading guardrails (e.g., verify evidence quotes actually exist).
@@ -95,6 +133,15 @@ class StudentGrader:
             self.grade_chain_structured = None
 
         self.grade_chain_text = grade_prompt | llm_grader
+
+        # Holistic grading chains (used when no marking criteria exist).
+        self.holistic_chain_structured = None
+        try:
+            holistic_structured = llm_grader.with_structured_output(HolisticGradingResponse)
+            self.holistic_chain_structured = holistic_grade_prompt | holistic_structured
+        except Exception:
+            self.holistic_chain_structured = None
+        self.holistic_chain_text = holistic_grade_prompt | llm_grader
 
     @staticmethod
     def _extract_structured_args_from_message(output: Any) -> Optional[dict]:
@@ -171,15 +218,16 @@ class StudentGrader:
         return cleaned[start:end].strip()
 
     def _extract_question_max_marks(self, questions_data: dict, main_grade: Optional[dict] = None) -> float:
-        """Extract the total maximum marks for the question.
+        """Extract the total maximum marks for the question being graded.
 
         Priority:
-        1. Explicit total_marks at document level (e.g. the QuestionDocument.total_marks field)
-        2. The LLM grader's own total_marks report in main_grade
-        3. Sum of individual sub-question marks as a last resort
-
-        Using min() across all candidates mixed together caused sub-question marks (e.g. 1, 2)
-        to beat the document-level total (e.g. 26), so the approach is now priority-based.
+        1. Matching sub-question marks — find the question matching self.question_number
+           and use its marks (from the "marks" field, or from trailing "(N)" in content).
+           This handles papers where total_marks is the whole-paper total (e.g. 54)
+           but each question has its own marks (e.g. 12).
+        2. Document-level total_marks — only if there's a single question or no sub-questions.
+        3. The LLM grader's own total_marks report in main_grade.
+        4. Sum of individual sub-question marks as a last resort.
         """
         def _parse_nums(text: Any) -> list[float]:
             if text is None:
@@ -190,12 +238,109 @@ class StudentGrader:
             pos = [n for n in nums if n > 0]
             return max(pos) if pos else None
 
-        # 1. Document-level total_marks — this is the authoritative total.
+        def _extract_trailing_marks(text: str) -> Optional[float]:
+            """Extract marks from the end of question content, e.g. '...(12)' or '...(12 marks)'."""
+            if not text:
+                return None
+            # Match trailing parenthesized number, optionally followed by "marks"
+            m = re.search(r"\((\d+(?:\.\d+)?)\s*(?:[Mm]arks?)?\)\s*$", text.strip())
+            if m:
+                return float(m.group(1))
+            return None
+
+        # 1. Try to find marks for the specific question being graded.
         if isinstance(questions_data, dict):
+            questions_list = questions_data.get("questions")
+            if isinstance(questions_list, list) and len(questions_list) > 0:
+                q_digit = "".join(re.findall(r"\d+", str(self.question_number)))
+
+                for q in questions_list:
+                    if not isinstance(q, dict):
+                        continue
+                    q_num = str(q.get("question_number", ""))
+                    q_num_digit = "".join(re.findall(r"\d+", q_num))
+
+                    if not q_digit or not q_num_digit:
+                        continue
+                    if q_num_digit != q_digit and not q_num_digit.startswith(q_digit) and not q_digit.startswith(q_num_digit):
+                        continue
+
+                    # Found matching question.
+                    # Priority: LLM-computed total_marks on the question item (most reliable).
+                    llm_total = q.get("total_marks")
+                    if llm_total is not None:
+                        try:
+                            v = float(llm_total)
+                            if v > 0:
+                                logger.info(f"Using LLM total_marks for Q{self.question_number}: {v}")
+                                return v
+                        except (TypeError, ValueError):
+                            pass
+
+                    # Fallback: recursively sum sub_questions marks —
+                    # handles old extractions that pre-date the total_marks field.
+                    def _sum_sq_marks(sq_list: list) -> float:
+                        """Recursively sum leaf-level marks across all sub_questions."""
+                        total = 0.0
+                        for sq in sq_list:
+                            if not isinstance(sq, dict):
+                                continue
+                            nested = sq.get("sub_questions")
+                            if nested:
+                                # Has deeper nesting — recurse instead of reading this level
+                                child_total = _sum_sq_marks(nested)
+                                if child_total > 0:
+                                    total += child_total
+                                    continue
+                            # Leaf node — read marks directly
+                            sq_v = None
+                            for key in ("marks", "maximum_marks", "max_marks", "total_marks"):
+                                raw = sq.get(key)
+                                if raw is not None:
+                                    sq_v = _best_from_nums(_parse_nums(raw))
+                                    if sq_v:
+                                        break
+                            if sq_v is None:
+                                sq_content = sq.get("content", "")
+                                if isinstance(sq_content, str):
+                                    sq_v = _extract_trailing_marks(sq_content)
+                            if sq_v:
+                                total += sq_v
+                        return total
+
+                    sub_questions = q.get("sub_questions") or []
+                    if sub_questions:
+                        sq_total = _sum_sq_marks(sub_questions)
+                        if sq_total > 0:
+                            logger.info(f"Using sum of sub-question marks for Q{self.question_number}: {sq_total}")
+                            return sq_total
+
+                    # No sub_questions — use the question-level marks field directly
+                    for key in ("marks", "maximum_marks", "max_marks", "total_marks"):
+                        raw = q.get(key)
+                        if raw is not None:
+                            v = _best_from_nums(_parse_nums(raw))
+                            if v:
+                                logger.info(f"Using sub-question marks for Q{self.question_number}: {v} (from '{key}': '{raw}')")
+                                return v
+
+                    # Fallback: extract trailing marks from the question content text
+                    content = q.get("content", "")
+                    if isinstance(content, str):
+                        v = _extract_trailing_marks(content)
+                        if v:
+                            logger.info(f"Using trailing marks from question content for Q{self.question_number}: {v}")
+                            return v
+
+        # 2. Document-level total_marks — use only when there's a single question
+        #    (otherwise it's likely the whole-paper total, not per-question).
+        if isinstance(questions_data, dict):
+            questions_list = questions_data.get("questions")
+            is_single_question = not isinstance(questions_list, list) or len(questions_list) <= 1
+
             q_total_raw = questions_data.get("total_marks")
-            if q_total_raw is not None:
+            if q_total_raw is not None and is_single_question:
                 q_text = str(q_total_raw)
-                # Honour explicit "maximum marks: N" pattern first.
                 for pattern in (
                     r"maximum\s*marks?\s*[:=]?\s*(\d+(?:\.\d+)?)",
                     r"max(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?)",
@@ -203,19 +348,18 @@ class StudentGrader:
                     m = re.search(pattern, q_text, flags=re.IGNORECASE)
                     if m:
                         return float(m.group(1))
-                # Otherwise take the largest number in the field (e.g. "26 marks").
                 v = _best_from_nums(_parse_nums(q_text))
                 if v:
                     return v
 
-        # 2. LLM-reported total from main_grade.
+        # 3. LLM-reported total from main_grade.
         if main_grade and isinstance(main_grade, dict):
             for key in ("total_marks", "maximum_marks", "total_marks_available"):
                 v = _best_from_nums(_parse_nums(main_grade.get(key)))
                 if v:
                     return v
 
-        # 3. Sum individual sub-question marks as a fallback.
+        # 4. Sum individual sub-question marks as a fallback.
         if isinstance(questions_data, dict):
             questions_list = questions_data.get("questions")
             if isinstance(questions_list, list):
@@ -223,7 +367,7 @@ class StudentGrader:
                 for q in questions_list:
                     if not isinstance(q, dict):
                         continue
-                    for key in ("maximum_marks", "max_marks", "total_marks"):
+                    for key in ("marks", "maximum_marks", "max_marks", "total_marks"):
                         nums = _parse_nums(q.get(key))
                         if nums:
                             total += max(n for n in nums if n > 0)
@@ -231,7 +375,256 @@ class StudentGrader:
                 if total > 0:
                     return total
 
+        # 5. Last resort: document-level total_marks even for multi-question papers
+        if isinstance(questions_data, dict):
+            q_total_raw = questions_data.get("total_marks")
+            if q_total_raw is not None:
+                v = _best_from_nums(_parse_nums(str(q_total_raw)))
+                if v:
+                    logger.warning(f"Using paper-level total marks as fallback: {v} (may include marks for other questions)")
+                    return v
+
         return 0.0
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Criteria synthesis — used when model answers have no marking_criteria
+    # but contain inline marks in the answer text (e.g. "SL (3 Marks)")
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_inline_section_marks(answer_text: str) -> list[tuple[str, float, str]]:
+        """Parse sections with inline marks from model answer text.
+
+        Looks for patterns like:
+          "SL (3 Marks)"  /  "Issue 1 - Peak Estate (4 Marks)"  /  "Required adjustment: (1 Marks)"
+        at the start of sections in the answer text.
+
+        Returns list of (section_title, marks, section_body) tuples.
+        """
+        if not answer_text or not isinstance(answer_text, str):
+            return []
+
+        # Pattern: a heading/label followed by (N Marks) or (N marks) or (N Mark)
+        # Also handles: "SL (3 Marks)\n..." and "Issue 1 - Peak Estate (4 Marks)\n..."
+        section_pattern = re.compile(
+            r"^(.+?)\s*\((\d+(?:\.\d+)?)\s*[Mm]arks?\)",
+            re.MULTILINE,
+        )
+
+        matches = list(section_pattern.finditer(answer_text))
+        if not matches:
+            return []
+
+        sections: list[tuple[str, float, str]] = []
+        for i, m in enumerate(matches):
+            title = m.group(1).strip().rstrip("-–—:").strip()
+            marks = float(m.group(2))
+            body_start = m.end()
+            body_end = matches[i + 1].start() if i + 1 < len(matches) else len(answer_text)
+            body = answer_text[body_start:body_end].strip()
+            if marks > 0 and body:
+                sections.append((title, marks, body))
+
+        return sections
+
+    @staticmethod
+    def _split_answer_into_points(section_body: str) -> list[str]:
+        """Split a section of model answer text into individual marking points.
+
+        Splits on:
+        - Bullet points (-, •, *)
+        - Numbered points (1., 2.), (i), (ii))
+        - Lines starting with ":" after a keyword
+        - Paragraph breaks (double newline)
+        - Sentence boundaries for long non-bulleted paragraphs
+
+        Returns list of non-empty point strings.
+        """
+        if not section_body or not isinstance(section_body, str):
+            return []
+
+        lines = section_body.strip().split("\n")
+        points: list[str] = []
+        current: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # Paragraph break — flush current
+                if current:
+                    points.append(" ".join(current))
+                    current = []
+                continue
+
+            # Detect bullet / numbered list starts
+            is_new_point = bool(re.match(
+                r"^(?:[-•*]|\d+[.):]|\([a-z]\)|\([ivx]+\))\s",
+                stripped,
+                re.IGNORECASE,
+            ))
+
+            if is_new_point and current:
+                points.append(" ".join(current))
+                current = []
+
+            # Clean bullet/number prefix
+            cleaned = re.sub(r"^(?:[-•*]|\d+[.):]|\([a-z]\)|\([ivx]+\))\s*", "", stripped).strip()
+            if cleaned:
+                current.append(cleaned)
+
+        if current:
+            points.append(" ".join(current))
+
+        # Filter out very short/meaningless points
+        points = [p for p in points if len(p) >= 10]
+
+        # Post-process: split long non-bulleted paragraphs into sentences.
+        # This handles model answers where distinct marking points are written
+        # as continuous prose rather than bullet lists.
+        expanded: list[str] = []
+        for p in points:
+            if len(p) > 150:
+                # Split on sentence boundaries (period followed by space and capital letter,
+                # or period followed by newline)
+                sentences = re.split(r"(?<=\.)\s+(?=[A-Z])", p)
+                sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) >= 10]
+                if len(sentences) > 1:
+                    expanded.extend(sentences)
+                else:
+                    expanded.append(p)
+            else:
+                expanded.append(p)
+
+        return expanded
+
+    def _synthesize_criteria_from_answer(self, answers: list[dict]) -> list[dict[str, Any]]:
+        """Generate marking criteria from model answer text when none are provided.
+
+        When the model answer has no marking_criteria but embeds section marks
+        inline (e.g. "SL (3 Marks)"), this method:
+        1. Parses out each section and its total marks
+        2. Splits each section into individual marking points
+        3. Distributes the section marks evenly across its points
+        4. Returns a list of synthesized criteria dicts
+        """
+        synthesized: list[dict[str, Any]] = []
+
+        for answer in answers:
+            if not isinstance(answer, dict):
+                continue
+            answer_text = answer.get("answer")
+            if not isinstance(answer_text, str) or not answer_text.strip():
+                continue
+
+            sections = self._parse_inline_section_marks(answer_text)
+
+            if sections:
+                for title, section_marks, body in sections:
+                    points = self._split_answer_into_points(body)
+                    if not points:
+                        # Can't split — use the whole section as one criterion
+                        synthesized.append({
+                            "marks": section_marks,
+                            "description": f"{title}: {body[:200]}",
+                        })
+                        continue
+
+                    # Distribute marks across points so the total equals section_marks.
+                    # Strategy: assign a base of 0.25 per point, then distribute remaining
+                    # marks as bonus 0.25 increments to earlier (more important) points.
+                    n = len(points)
+                    base = 0.25
+                    total_at_base = base * n
+
+                    if total_at_base >= section_marks:
+                        # More points than marks allow at 0.25 each — only keep enough points
+                        max_points = int(section_marks / base)
+                        points = points[:max_points] if max_points > 0 else points[:1]
+                        n = len(points)
+                        total_at_base = base * n
+
+                    # Remaining marks to distribute as bonus 0.25 increments
+                    remaining_marks = section_marks - total_at_base
+                    bonus_slots = int(round(remaining_marks / 0.25))
+
+                    for j, point in enumerate(points):
+                        mark = base
+                        if j < bonus_slots:
+                            mark += 0.25
+                        mark = round(mark / 0.25) * 0.25
+                        synthesized.append({
+                            "marks": mark,
+                            "description": point,
+                        })
+            else:
+                # No inline marks found — try to use question-level marks
+                # and split the entire answer into points
+                points = self._split_answer_into_points(answer_text)
+                if not points:
+                    continue
+
+                # Try to get total marks from answer text ending pattern like "(12)" or "12 marks"
+                total_marks_match = re.search(
+                    r"\((\d+(?:\.\d+)?)\s*(?:[Mm]arks?)?\)\s*$", answer_text.strip()
+                )
+                if total_marks_match:
+                    total = float(total_marks_match.group(1))
+                else:
+                    # Fallback: can't determine marks, assign equal weight placeholder
+                    # These will be scaled in _flatten_model_answers when we know total marks
+                    total = float(len(points))  # 1 mark per point as placeholder
+
+                n = len(points)
+                base = 0.25
+                total_at_base = base * n
+
+                if total_at_base >= total:
+                    max_points = int(total / base)
+                    points = points[:max_points] if max_points > 0 else points[:1]
+                    n = len(points)
+                    total_at_base = base * n
+
+                remaining_marks = total - total_at_base
+                bonus_slots = int(round(remaining_marks / 0.25))
+
+                for j, point in enumerate(points):
+                    mark = base
+                    if j < bonus_slots:
+                        mark += 0.25
+                    mark = round(mark / 0.25) * 0.25
+                    synthesized.append({
+                        "marks": mark,
+                        "description": point,
+                    })
+
+        if synthesized:
+            logger.info(
+                f"Synthesized {len(synthesized)} criteria from model answer text "
+                f"(total marks: {sum(c['marks'] for c in synthesized):.1f})"
+            )
+
+        return synthesized
+
+    @staticmethod
+    def _answer_matches_question(answer_label: str, question_number: str) -> bool:
+        """Check if a model answer's question_number matches the question being graded.
+
+        Handles varied labelling conventions: "Ans.1", "Ans 1", "A1", "(a)", "1", "Q.1", etc.
+        """
+        if not answer_label or not question_number:
+            return True  # If either is missing, don't filter
+
+        def _extract_digits(s: str) -> str:
+            return "".join(re.findall(r"\d+", s))
+
+        a_digits = _extract_digits(answer_label)
+        q_digits = _extract_digits(question_number)
+
+        if not a_digits or not q_digits:
+            return True  # Can't compare — don't filter
+
+        # Match if the leading digit(s) agree (e.g. "Ans.1" vs "Q.1" → "1" == "1")
+        return a_digits == q_digits or a_digits.startswith(q_digits) or q_digits.startswith(a_digits)
 
     def _flatten_model_answers(self, model_data: dict) -> dict:
         if not isinstance(model_data, dict):
@@ -240,6 +633,31 @@ class StudentGrader:
         answers = model_data.get("answers")
         if not isinstance(answers, list) or not answers:
             return model_data
+
+        # ── Filter answers to only those matching the question being graded ──
+        # Skip per-answer filtering when the document-level question_title already
+        # matches the target question — all answers in the doc are sub-parts of it.
+        doc_title = str(model_data.get("question_title", ""))
+        doc_matches_target = self._answer_matches_question(doc_title, self.question_number)
+
+        if len(answers) > 1 and not doc_matches_target:
+            filtered = [
+                a for a in answers
+                if isinstance(a, dict) and self._answer_matches_question(
+                    str(a.get("question_number", "")), self.question_number
+                )
+            ]
+            if filtered:
+                answers = filtered
+                logger.info(
+                    f"Filtered model answers to {len(answers)} matching Q{self.question_number} "
+                    f"(from {len(model_data['answers'])} total)"
+                )
+        else:
+            logger.info(
+                f"Filtered model answers to {len(answers)} matching Q{self.question_number} "
+                f"(from {len(model_data['answers'])} total)"
+            )
 
         combined_criteria: list[dict[str, Any]] = []
         combined_answer_parts: list[str] = []
@@ -755,6 +1173,80 @@ class StudentGrader:
         if not combined_criteria and not combined_answer_parts:
             return model_data
 
+        # ── Holistic grading: for theoretical questions OR when no criteria exist ──
+        self._criteria_were_synthesized = False
+        self._holistic_grading = False
+        use_holistic = (
+            (self.question_type == "theoretical" and combined_answer_parts)
+            or (not combined_criteria and combined_answer_parts)
+        )
+        if use_holistic:
+            reason = f"question_type='{self.question_type}'" if self.question_type == "theoretical" else "no marking_criteria found"
+            logger.info(
+                f"Switching to HOLISTIC grading mode ({reason}) — "
+                f"full answer comparison instead of per-criterion"
+            )
+            self._holistic_grading = True
+
+            # Build sub-question structure from model answer for holistic prompt.
+            # Each answer entry with a distinct question_number becomes a sub-question.
+            holistic_subs: list[dict] = []
+            for answer in answers:
+                if not isinstance(answer, dict):
+                    continue
+                sq_num = str(answer.get("question_number", "")).strip()
+                sq_answer = str(answer.get("answer", "") or "").strip()
+                # Try to get max marks from the answer entry
+                sq_marks = 0.0
+                for marks_key in ("total_marks_available", "maximum_marks", "marks"):
+                    raw = answer.get(marks_key)
+                    if raw is not None:
+                        nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", str(raw))]
+                        if nums:
+                            sq_marks = max(nums)
+                            break
+                if sq_num and sq_answer:
+                    holistic_subs.append({
+                        "sub_question": sq_num,
+                        "answer": sq_answer,
+                        "max_marks": sq_marks,
+                    })
+
+            # If only one sub-question or all share the same number, treat as single block
+            if len(holistic_subs) <= 1:
+                # Single block: use the main question number
+                full_answer = "\n\n".join(combined_answer_parts)
+                total_marks = holistic_subs[0]["max_marks"] if holistic_subs else 0.0
+                self._holistic_sub_questions = [{
+                    "sub_question": self.question_number,
+                    "answer": full_answer,
+                    "max_marks": total_marks,
+                }]
+            else:
+                self._holistic_sub_questions = holistic_subs
+
+            logger.info(
+                f"Holistic grading: {len(self._holistic_sub_questions)} sub-question(s) detected"
+            )
+
+            # For holistic mode, we still build a unified answer for the prompt
+            # but WITHOUT marking_criteria — the LLM will compare holistically.
+            unified_answer = {
+                "question_number": self.question_number,
+                "answer": "\n\n".join(combined_answer_parts),
+                "marking_criteria": [],  # Empty — holistic mode
+                "sub_questions": self._holistic_sub_questions,
+            }
+
+            flattened = dict(model_data)
+            flattened["answers"] = [unified_answer]
+            logger.info(
+                f"Holistic model data prepared → {len(self._holistic_sub_questions)} sub-questions"
+            )
+            return flattened
+
+        # ── Criteria exist: standard per-criterion path ──
+
         # Deduplicate criteria to stabilize marking and prevent repeated grading.
         combined_criteria = _dedup_criteria(combined_criteria)
 
@@ -991,13 +1483,45 @@ class StudentGrader:
         if not isinstance(student_data, dict):
             return str(student_data)
 
-        def _leading_question_digit(label: str) -> Optional[str]:
+        def _extract_question_id(label: str) -> Optional[str]:
+            """Extract the canonical question number from a sub-part label.
+
+            Handles formats like: "Q-01", "Q.1", "1", "1.1", "1-", "1)", "(a)",
+            "Issue-01 Peak State" (not a question-level label).
+            Returns the number as a string with leading zeros stripped, or None
+            if this doesn't look like a question-level label.
+            """
             if not label:
                 return None
-            m = re.search(r"\d", label)
-            return m.group(0) if m else None
+            lab = label.strip()
 
-        target_digit = _leading_question_digit(str(self.question_number))
+            # Skip sub-issue labels like "Issue-01 Peak State" — these are
+            # sub-sections within a question, not question-level identifiers.
+            if re.match(r"(?:issue|part|section|topic)\s*[-:]?\s*\d", lab, re.IGNORECASE):
+                return None
+
+            # "N-" / "N- Topic name" style labels (e.g. "1-", "2- Tech limited:")
+            # are scenario/sub-part labels within a question, NOT question IDs.
+            # Returning None lets all such sub_parts pass through the filter.
+            if re.match(r"^\d+\s*-", lab):
+                return None
+
+            # Extract question number from patterns like Q-01, Q.1, Q1, 1), 1.1)
+            m = re.match(
+                r"^(?:Q(?:uestion)?\.?\s*[-:]?\s*)?(\d+)",
+                lab,
+                re.IGNORECASE,
+            )
+            if m:
+                return str(int(m.group(1)))  # strip leading zeros: "01" -> "1"
+
+            return None
+
+        target_qid = _extract_question_id(str(self.question_number))
+        # Also try plain digit extraction as fallback for target
+        if not target_qid:
+            digits = re.findall(r"\d+", str(self.question_number))
+            target_qid = str(int(digits[0])) if digits else None
 
         parts: list[str] = []
         q = str(student_data.get("question", "")).strip()
@@ -1006,15 +1530,15 @@ class StudentGrader:
 
         sub_parts = student_data.get("sub_parts")
         if isinstance(sub_parts, list) and sub_parts:
-            # If the extractor labeled parts with question numbers (e.g. 1, 1.1, Q1),
-            # keep the block for the current question to avoid context bloat.
+            # Check if any sub_part has a question-level label matching the target
             any_matches = False
-            if target_digit:
+            if target_qid:
                 for sp in sub_parts:
                     if not isinstance(sp, dict):
                         continue
                     lab = str(sp.get("question_number", "")).strip()
-                    if _leading_question_digit(lab) == target_digit:
+                    sp_qid = _extract_question_id(lab)
+                    if sp_qid == target_qid:
                         any_matches = True
                         break
 
@@ -1024,18 +1548,22 @@ class StudentGrader:
                     continue
                 sp_no = str(sp.get("question_number", "")).strip() or q or "(unknown)"
 
-                if any_matches and target_digit:
-                    lead = _leading_question_digit(sp_no)
-                    if lead == target_digit:
+                if any_matches and target_qid:
+                    sp_qid = _extract_question_id(sp_no)
+                    if sp_qid == target_qid:
                         in_relevant_block = True
-                    elif lead is not None and lead != target_digit:
+                    elif sp_qid is not None and sp_qid != target_qid:
+                        # Different question — stop including
                         in_relevant_block = False
 
-                    # Include unlabeled sub-parts immediately following a relevant part
-                    # (often (i)/(ii) style) until we hit another numbered question.
-                    if not in_relevant_block and lead is not None:
-                        continue
-                    if not in_relevant_block and lead is None:
+                    # Sub-issue labels (Issue-01, etc.) are children of whatever
+                    # question block we're currently in. Include them only if
+                    # we're in a relevant block.
+                    if sp_qid is None:
+                        # This is a sub-issue or unlabeled part
+                        if not in_relevant_block:
+                            continue
+                    elif not in_relevant_block:
                         continue
 
                 ans = sp.get("answer")
@@ -1305,8 +1833,179 @@ class StudentGrader:
 
 
 
+    def _run_holistic_grading(self, student_data: dict, model_data: dict, questions_data: dict) -> dict:
+        """Execute holistic grading: compare full answers without per-criterion breakdown.
+
+        Returns a dict in the same shape as the standard grading response so that
+        _build_grade_doc() can process it uniformly via a conversion step.
+        """
+        student_text = self._format_student_for_prompt(student_data)
+        self._student_text_last_run = student_text or ""
+
+        compact_json_kwargs = {"ensure_ascii": False, "separators": (",", ":")}
+        try:
+            self._question_text_last_run = json.dumps(questions_data, **compact_json_kwargs)
+        except Exception:
+            self._question_text_last_run = str(questions_data)
+        try:
+            self._model_text_last_run = json.dumps(model_data, **compact_json_kwargs)
+        except Exception:
+            self._model_text_last_run = str(model_data)
+
+        payload = {
+            "model_data": json.dumps(model_data, **compact_json_kwargs),
+            "chunks": student_text,
+            "questions": json.dumps(questions_data, **compact_json_kwargs),
+        }
+
+        debug_enabled = os.getenv("DEBUG_SAVE_LLM_OUTPUT", "").strip().lower() in {"1", "true", "yes", "y"}
+
+        def _coerce_holistic(result: Any) -> dict:
+            if isinstance(result, BaseModel):
+                return result.model_dump()
+            if isinstance(result, dict):
+                return result
+            structured_args = self._extract_structured_args_from_message(result)
+            if isinstance(structured_args, dict):
+                return structured_args
+            content = getattr(result, "content", None)
+            if content is None:
+                content = str(result)
+            raw = str(content)
+            json_text = self._extract_json_from_text(raw)
+            if not json_text:
+                raise GradingError("Empty holistic grading output")
+            return json.loads(json_text)
+
+        # Attempt 1: structured output
+        holistic_parsed = None
+        try:
+            if self.holistic_chain_structured is not None:
+                output = self.holistic_chain_structured.invoke(payload)
+                holistic_parsed = _coerce_holistic(output)
+                validated = HolisticGradingResponse(**holistic_parsed)
+                holistic_parsed = validated.model_dump()
+                logger.info(f"Holistic grading complete → {self.student_name} (Q{self.question_number}) [structured]")
+        except Exception as e:
+            logger.warning(f"Holistic structured grading failed; falling back to text: {e}")
+            holistic_parsed = None
+
+        # Attempt 2: text output + parse
+        if holistic_parsed is None:
+            try:
+                output = self.holistic_chain_text.invoke(payload)
+                holistic_parsed = _coerce_holistic(output)
+                validated = HolisticGradingResponse(**holistic_parsed)
+                holistic_parsed = validated.model_dump()
+                logger.info(f"Holistic grading complete → {self.student_name} (Q{self.question_number}) [text]")
+            except Exception as e:
+                logger.warning(f"Holistic text grading failed; attempting repair: {e}")
+
+        # Attempt 3: repair
+        if holistic_parsed is None:
+            try:
+                raw_content = getattr(output, "content", None) if "output" in locals() else None
+                raw_content = raw_content if raw_content is not None else ""
+                repair_prompt = (
+                    "You MUST return ONLY valid JSON (no markdown, no commentary). "
+                    "Fix the following output to match this exact schema:\n"
+                    "{\n"
+                    "  \"question_number\": string,\n"
+                    "  \"score\": number,\n"
+                    "  \"total_marks\": number,\n"
+                    "  \"sub_grades\": [\n"
+                    "    {\n"
+                    "      \"sub_question\": string,\n"
+                    "      \"student_label\": string,\n"
+                    "      \"marks_awarded\": number,\n"
+                    "      \"max_marks\": number,\n"
+                    "      \"reason\": string,\n"
+                    "      \"correct_points\": [{\"text\": string, \"marks\": number, \"key_phrase\": string}, ...]\n"
+                    "    }\n"
+                    "  ],\n"
+                    "  \"comments\": [string, ...]\n"
+                    "}\n\n"
+                    "OUTPUT TO FIX:\n"
+                    f"{raw_content}"
+                )
+                fixed = llm_grader.invoke(repair_prompt)
+                fixed_content = getattr(fixed, "content", None) or str(fixed)
+                fixed_json = self._extract_json_from_text(str(fixed_content))
+                holistic_parsed = json.loads(fixed_json)
+                validated = HolisticGradingResponse(**holistic_parsed)
+                holistic_parsed = validated.model_dump()
+                logger.info(f"Holistic grading complete → {self.student_name} (Q{self.question_number}) [repaired]")
+            except Exception as e2:
+                logger.error("Holistic grading chain failed", exc_info=True)
+                raise GradingError("Holistic grading step failed") from e2
+
+        # Convert holistic response to standard grades format for _build_grade_doc().
+        # Each sub_grade becomes a breakdown item where:
+        #   criterion = "Sub-question <sub_question>" (or just question number for single block)
+        #   evidence_list = correct_points texts (for anchoring)
+        #   _correct_points_with_marks = full objects with per-point marks (for tick annotation)
+        #   marks_awarded / max_possible = sub-question marks
+        breakdown = []
+        for sg in holistic_parsed.get("sub_grades", []):
+            sq_label = sg.get("sub_question", "")
+            student_label = sg.get("student_label", "")
+            criterion_text = f"Sub-question {sq_label}" if len(holistic_parsed.get("sub_grades", [])) > 1 else f"Question {self.question_number}"
+
+            # correct_points is now list of {"text": str, "marks": float}
+            raw_points = sg.get("correct_points", [])
+            # Handle both formats: list of objects or list of strings (backward compat)
+            evidence_texts = []
+            points_with_marks = []
+            for pt in raw_points:
+                if isinstance(pt, dict):
+                    text = str(pt.get("text", "")).strip()
+                    pt_marks = float(pt.get("marks", 0.5) or 0.5)
+                    key_phrase = str(pt.get("key_phrase", "")).strip()
+                    if text:
+                        evidence_texts.append(text)
+                        points_with_marks.append({"text": text, "marks": pt_marks, "key_phrase": key_phrase})
+                elif isinstance(pt, str) and pt.strip():
+                    evidence_texts.append(pt.strip())
+                    points_with_marks.append({"text": pt.strip(), "marks": 0.5, "key_phrase": ""})
+
+            breakdown.append({
+                "criterion": criterion_text,
+                "marks_awarded": float(sg.get("marks_awarded", 0) or 0),
+                "max_possible": float(sg.get("max_marks", 0) or 0),
+                "reason": sg.get("reason", ""),
+                "evidence": evidence_texts,
+                "comments_summary": "",
+                # Extra fields for annotation
+                "_sub_question": sq_label,
+                "_student_label": student_label,
+                "_correct_points_with_marks": points_with_marks,
+            })
+
+        converted = {
+            "grades": [{
+                "question_number": holistic_parsed.get("question_number", self.question_number),
+                "score": holistic_parsed.get("score", 0),
+                "total_marks": holistic_parsed.get("total_marks", 0),
+                "comments": holistic_parsed.get("comments", []),
+                "correct_words": [],
+                "breakdown": breakdown,
+            }]
+        }
+
+        logger.info(
+            f"Holistic grading converted to standard format: "
+            f"{len(breakdown)} sub-question breakdown items, "
+            f"score={holistic_parsed.get('score', 0)}/{holistic_parsed.get('total_marks', 0)}"
+        )
+        return converted
+
     def _run_grading(self, student_data: dict, model_data: dict, questions_data: dict) -> dict:
         """Execute grading chain with clean content (holistic evaluation against all criteria)."""
+
+        # Route to holistic grading when no marking criteria exist.
+        if self._holistic_grading:
+            return self._run_holistic_grading(student_data, model_data, questions_data)
+
         student_text = self._format_student_for_prompt(student_data)
         self._student_text_last_run = student_text or ""
         # Use compact JSON to reduce prompt/token bloat.
@@ -2300,20 +2999,35 @@ class StudentGrader:
 
             # Strictly require that the criterion exists in the rubric we provided.
             # This prevents the LLM from inventing criteria or grading headings/commentary.
-            if not criterion or (allowed_criteria and criterion not in allowed_criteria):
+            # When criteria were synthesized from answer text, relax this check since the
+            # LLM may reasonably rephrase the auto-generated criterion descriptions.
+            # For holistic grading, skip rubric validation entirely — breakdown items are
+            # sub-questions, not rubric criteria.
+            if not criterion:
+                continue
+            if allowed_criteria and criterion not in allowed_criteria and not self._criteria_were_synthesized and not self._holistic_grading:
                 logger.debug(f"Skipping out-of-rubric criterion: '{criterion}'")
                 continue
 
-            if not self._is_valid_criterion(criterion):
+            if not self._holistic_grading and not self._is_valid_criterion(criterion):
                 logger.debug(f"Skipping invalid criterion: '{criterion}'")
                 continue
-            
+
             original_marks_awarded = float(item.get("marks_awarded", 0) or 0)
 
             # Enforce max_possible from the rubric (ignore LLM-supplied max_possible).
             # If the rubric doesn't have a numeric max for this criterion, treat it as non-scoreable.
+            # For holistic grading, trust the LLM's max_possible (from sub-question marks).
             rubric_max = rubric_max_map.get(criterion)
-            max_possible = float(rubric_max) if isinstance(rubric_max, (int, float)) else 0.0
+            if self._holistic_grading:
+                llm_max = float(item.get("max_possible", 0) or 0)
+                max_possible = llm_max if llm_max > 0 else original_marks_awarded
+            elif rubric_max is None and self._criteria_were_synthesized:
+                # For synthesized criteria, the LLM may rephrase — trust the LLM's max_possible
+                llm_max = float(item.get("max_possible", 0) or 0)
+                max_possible = llm_max if llm_max > 0 else original_marks_awarded
+            else:
+                max_possible = float(rubric_max) if isinstance(rubric_max, (int, float)) else 0.0
             # Clamp marks_awarded: never exceed max_possible and quantize to 0.25 steps.
             marks_awarded = min(original_marks_awarded, max_possible)
             marks_awarded = round(marks_awarded / 0.25) * 0.25
@@ -2376,20 +3090,25 @@ class StudentGrader:
 
             # Enforce evidence: if we can't parse evidence, we cannot justify awarding marks.
             # This prevents incorrect awards when the model "guesses".
-            if marks_awarded > 0 and not evid_list:
+            # For holistic grading, still require evidence but don't revoke — it's possible
+            # the LLM awarded marks for overall understanding without pinpointing exact lines.
+            if marks_awarded > 0 and not evid_list and not self._holistic_grading:
                 evidence_warnings.append(f"Marks revoked (missing evidence): {criterion}")
                 marks_awarded = 0.0
 
             # Stronger guardrail: evidence must actually exist in the student answer text.
             # This prevents marks being awarded when the LLM fabricates an evidence quote.
-            if marks_awarded > 0 and evid_list and student_blob_norm:
+            # SKIP for holistic grading — the LLM's holistic comparison is trusted.
+            if marks_awarded > 0 and evid_list and student_blob_norm and not self._holistic_grading:
                 if not _evidence_present(evid_list):
                     evidence_warnings.append(f"Marks revoked (evidence not found in student answer): {criterion}")
                     marks_awarded = 0.0
 
             # Strongest guardrail: do not award marks based on evidence copied from the question/rubric.
             # This prevents awarding marks from section headings that appear in the PDF but contain no student work.
-            if marks_awarded > 0 and evid_list and student_blob_norm:
+            # SKIP for synthesized criteria and holistic grading — theoretical answers naturally share
+            # terminology with the model answer.
+            if marks_awarded > 0 and evid_list and student_blob_norm and not self._criteria_were_synthesized and not self._holistic_grading:
                 if reference_blob_norm and not _evidence_has_untainted_snippet(evid_list):
                     evidence_warnings.append(f"Marks revoked (evidence appears in question/markscheme, not student work): {criterion}")
                     marks_awarded = 0.0
@@ -2397,6 +3116,7 @@ class StudentGrader:
             # Alignment guardrail: for longer narrative criteria, require evidence to actually align.
             # Prevents awarding marks for vague mentions (e.g., saying "exchange difference" but not stating the required treatment).
             # Only enforce for narrative (non-numeric) criteria; numeric/method criteria are handled by other guardrails.
+            # SKIP for synthesized criteria and holistic grading — the LLM's meaning-based grading is trusted.
             if (
                 marks_awarded > 0
                 and evid_list
@@ -2406,17 +3126,19 @@ class StudentGrader:
                 and not re.search(r"\d", criterion)
                 and not criterion.strip().lower().startswith(("dr ", "cr "))
                 and float(max_possible) < 1.0
+                and not self._criteria_were_synthesized
+                and not self._holistic_grading
             ):
                 if not _criterion_evidence_alignment_ok(str(criterion), evid_list):
                     evidence_warnings.append(f"Marks revoked (weak evidence alignment to criterion): {criterion}")
                     marks_awarded = 0.0
 
-            # Evidence recovery for numeric-calc criteria:
+            # Evidence recovery for numeric-calc criteria (SKIP for holistic grading):
             # Sometimes the LLM attaches unhelpful evidence (e.g., just "Profit after tax 7,200,000")
             # even though the student has the exact calculation elsewhere (e.g., "7200000*9/12").
             # If marks are currently 0 and we can find the calc in the student's text, use it as evidence
             # and award full marks.
-            if marks_awarded == 0 and max_possible > 0 and student_blob_norm:
+            if marks_awarded == 0 and max_possible > 0 and student_blob_norm and not self._holistic_grading:
                 expected_gbp = _extract_expected_gbp_amount(str(criterion))
                 expected_calc = self._compute_simple_calc_from_criterion(str(criterion))
                 if expected_gbp is not None and expected_calc is not None:
@@ -2431,11 +3153,11 @@ class StudentGrader:
                             add = f"Awarded by calc-evidence recovery (found '{snippet}' in student answer)."
                             item["reason"] = (f"{existing} {add}".strip() if existing else add)
 
-            # Deterministic credit for numeric-result criteria:
+            # Deterministic credit for numeric-result criteria (SKIP for holistic grading):
             # If the criterion states an expected GBP amount and the evidence contains a clear calculation
             # that evaluates to that amount, award FULL marks (even if the LLM awarded 0 or partial).
             # Kept narrow + only when evidence exists in the student answer to avoid false positives.
-            if marks_awarded < max_possible and max_possible > 0 and evid_list and student_blob_norm:
+            if marks_awarded < max_possible and max_possible > 0 and evid_list and student_blob_norm and not self._holistic_grading:
                 if _evidence_present(evid_list):
                     award, suffix = _award_if_calc_matches_expected(str(criterion), evid_list, max_possible)
                     if award:
@@ -2542,17 +3264,23 @@ class StudentGrader:
 
             sum_awarded_calc += marks_awarded
 
-            normalized_breakdown.append({
+            bd_item = {
                 "criterion": criterion,
                 "marks_awarded": marks_awarded,
                 "max_possible": max_possible,
                 "reason": saved_reason,
                 "evidence": "; ".join(evid_list) if evid_list else "",
                 "evidence_list": evid_list if evid_list else [],
-                "comments_summary": item.get("comments_summary", "")
-            })
+                "comments_summary": item.get("comments_summary", ""),
+            }
+            # For holistic grading, preserve sub-question metadata for the annotator.
+            if self._holistic_grading:
+                bd_item["_sub_question"] = item.get("_sub_question", "")
+                bd_item["_student_label"] = item.get("_student_label", "")
+                bd_item["_correct_points_with_marks"] = item.get("_correct_points_with_marks", [])
+            normalized_breakdown.append(bd_item)
 
-        # Broad-criterion gating (generic):
+        # Broad-criterion gating (generic) — SKIP for holistic grading:
         # If a high-mark narrative criterion sits next to many micro-criteria (<= 0.5 each),
         # don't award the broad marks unless the student scores well on the micro-criteria.
         # This prevents over-awarding for broad statements when the detailed workings are wrong
@@ -2560,7 +3288,7 @@ class StudentGrader:
         # that have no micro breakdown.
         try:
             pos_map = self._rubric_position_last_run or {}
-            if pos_map and normalized_breakdown:
+            if pos_map and normalized_breakdown and not self._holistic_grading:
                 # position → indices (handle duplicates conservatively)
                 pos_to_indices: dict[int, list[int]] = {}
                 for idx, bi in enumerate(normalized_breakdown):
@@ -2756,6 +3484,10 @@ class StudentGrader:
             "student_answer_id": self.student_answers_id,
         }
 
+        # Flag for the annotator: holistic grading uses sub-question level annotation.
+        if self._holistic_grading:
+            doc["holistic_grading"] = True
+
         if os.getenv("DEBUG_SAVE_LLM_OUTPUT", "").strip().lower() in {"1", "true", "yes", "y"}:
             doc["llm_debug"] = self._llm_debug_trace[-5:]
             doc["llm_grading_provider"] = os.getenv("GRADING_PROVIDER")
@@ -2763,7 +3495,7 @@ class StudentGrader:
 
         try:
             validated = StudentGradeDocument(**doc)
-            return validated.model_dump(exclude_none=True)
+            return validated.model_dump(exclude_none=True, by_alias=True)
         except Exception as ve:
             logger.warning(f"Pydantic validation failed - saving raw: {ve}")
             return doc
@@ -2804,6 +3536,7 @@ def grade_student(
     questions_id: Optional[str],
     model_answers_id: Optional[str],
     student_answers_id: str,
+    question_type: str = "numerical",
 ) -> Optional[str]:
     grader = StudentGrader(
         student_name=student_name,
@@ -2811,5 +3544,6 @@ def grade_student(
         questions_id=questions_id,
         model_answers_id=model_answers_id,
         student_answers_id=student_answers_id,
+        question_type=question_type,
     )
     return grader.grade()

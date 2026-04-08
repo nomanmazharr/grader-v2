@@ -1,5 +1,5 @@
 import asyncio
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Literal
 from datetime import datetime
 import nest_asyncio
 
@@ -11,6 +11,10 @@ from rubric_extraction import extract_pdf_annotations_pipeline
 from student_assignment_extraction import extract_assignment_pipeline
 from grade import grade_student
 from pdf_annotation.annotator import annotate_pdf
+
+
+# Valid question types
+QuestionType = Literal["numerical", "theoretical"]
 
 
 # ── Async Extraction Wrappers ────────────────────────────────────────────────
@@ -43,15 +47,16 @@ async def extract_question_text_async(
 
 async def extract_rubric_async(
     pdf_path: str,
-    pages: List[int]
+    pages: List[int],
+    question_num: str = None
 ) -> Tuple[bool, Optional[str]]:
     loop = asyncio.get_running_loop()
     try:
-        logger.info(f"[Rubric] Starting extraction (pages {pages})")
+        logger.info(f"[Rubric] Starting extraction (pages {pages}, Q{question_num})")
 
         doc_id = await loop.run_in_executor(
             None,
-            lambda: extract_pdf_annotations_pipeline(pdf_path=pdf_path, pages=pages)
+            lambda: extract_pdf_annotations_pipeline(pdf_path=pdf_path, pages=pages, question_number=question_num)
         )
 
         if not doc_id:
@@ -69,18 +74,20 @@ async def extract_rubric_async(
 async def extract_student_answers_async(
     pdf_path: str,
     pages: List[int],
-    student_name: str
+    student_name: str,
+    question_num: str = None
 ) -> Tuple[bool, Optional[str]]:
     loop = asyncio.get_running_loop()
     try:
-        logger.info(f"[Student {student_name}] Starting extraction (pages {pages})")
+        logger.info(f"[Student {student_name}] Starting extraction (pages {pages}, Q{question_num})")
 
         doc_id = await loop.run_in_executor(
             None,
             lambda: extract_assignment_pipeline(
                 pdf_path=pdf_path,
                 pages=pages,
-                student_name=student_name
+                student_name=student_name,
+                question_number=question_num
             )
         )
 
@@ -100,11 +107,12 @@ async def grade_student_wrapper(
     question_num: str,
     questions_id: str,
     model_answers_id: Optional[str],
-    student_answers_id: str
+    student_answers_id: str,
+    question_type: QuestionType = "numerical"
 ) -> Tuple[bool, str, Optional[str]]:
     loop = asyncio.get_running_loop()
     try:
-        logger.info(f"Starting grading for {student_name} - Q{question_num}")
+        logger.info(f"Starting grading for {student_name} - Q{question_num} ({question_type})")
 
         grades_id = await loop.run_in_executor(
             None,
@@ -114,6 +122,7 @@ async def grade_student_wrapper(
                 questions_id=questions_id,
                 model_answers_id=model_answers_id,
                 student_answers_id=student_answers_id,
+                question_type=question_type,
             )
         )
 
@@ -170,18 +179,19 @@ async def process_exam_async(
     student_pdf_path: str,
     student_pages: List[int],
     student_name: str,
-    output_dir: str
+    output_dir: str,
+    question_type: QuestionType = "numerical"
 ) -> Tuple[bool, str, Optional[str], Optional[str]]:
 
     start_time = datetime.now()
     logger.info("=" * 70)
-    logger.info(f"ASYNC PIPELINE START → {student_name} | Q{question_num}")
+    logger.info(f"ASYNC PIPELINE START → {student_name} | Q{question_num} | type={question_type}")
     logger.info("=" * 70)
 
     # Parallel extractions (each wrapper already catches exceptions and returns (False, None))
     q_task = extract_question_text_async(question_pdf_path, question_pages, question_num)
-    r_task = extract_rubric_async(model_answer_pdf_path, answer_pages)
-    s_task = extract_student_answers_async(student_pdf_path, student_pages, student_name)
+    r_task = extract_rubric_async(model_answer_pdf_path, answer_pages, question_num)
+    s_task = extract_student_answers_async(student_pdf_path, student_pages, student_name, question_num)
 
     (q_ok, question_id), (r_ok, model_answers_id), (s_ok, student_answers_id) = await asyncio.gather(
         q_task, r_task, s_task
@@ -198,12 +208,16 @@ async def process_exam_async(
     if not s_ok or not student_answers_id:
         logger.error(f"Pipeline stopped: Student extraction failed for {student_name}")
         return False, "Student extraction failed", None, None
+    # question_id = "69d60b602ed125dfbb5b46a2"
+    # model_answers_id = "69d602dfd5ef48760b715a58"
+    # student_answers_id = "69d60b622ed125dfbb5b46a3"
     g_ok, g_message, grades_id = await grade_student_wrapper(
         student_name=student_name,
         question_num=question_num,
         questions_id=question_id,
         model_answers_id=model_answers_id,
-        student_answers_id=student_answers_id
+        student_answers_id=student_answers_id,
+        question_type=question_type
     )
 
     if not g_ok:
@@ -236,7 +250,8 @@ def process_exam(
     student_pdf_path: str,
     student_pages: List[int],
     student_name: str,
-    output_dir: str
+    output_dir: str,
+    question_type: QuestionType = "numerical"
 ) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """Run the async pipeline synchronously."""
     return asyncio.run(
@@ -249,7 +264,8 @@ def process_exam(
             student_pdf_path=student_pdf_path,
             student_pages=student_pages,
             student_name=student_name,
-            output_dir=output_dir
+            output_dir=output_dir,
+            question_type=question_type
         )
     )
 
@@ -258,13 +274,14 @@ if __name__ == "__main__":
     logger.info("Async Exam Grading Pipeline")
 
     process_exam(
-        question_pdf_path='dataset/ICAEW_CR_Tuition_Exam_Qs_2025.pdf',
-        question_pages=[2, 3, 4],
+        question_pdf_path='dataset/theoretical/01- Final AAD TWT Sum-26.pdf',
+        question_pages=[1],
         question_num='1',
-        model_answer_pdf_path='dataset/Bauhaus prepped answer.pdf',
-        answer_pages=[9, 10, 11, 12, 13, 14, 15],
-        student_pdf_path='dataset/Katrina Headings_612211_assignsubmission_file_CR_TCE_Katrina_Headings.pdf',
-        student_pages=[1, 2],
-        student_name='Cameron_Cowan',
-        output_dir='annotations'
+        model_answer_pdf_path='dataset/theoretical/AAD Test-01 Solution Format Marking Scheme.pdf',
+        answer_pages=[1, 2],
+        student_pdf_path='dataset/theoretical/Rameesa Ayaz M. Ayaz_672959_assignsubmission_file_/Audit test 1 Rameesa Ayaz M. Ayaz_672959.pdf',
+        student_pages=[1],
+        student_name='M_Danial_Khan',
+        output_dir='annotations',
+        question_type='theoretical'
     )

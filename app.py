@@ -56,10 +56,11 @@ def main():
         answer_pages_str = st.text_input("Model Answer Pages", value="3,4,5")
         question_num = st.text_input("Question Number", value="1")
         student_pages_str = st.text_input("Student Pages", value="1,2,3")
-        
+
     with col2:
         student_name = st.text_input("Student Name", value="Student")
         output_dir = st.text_input("Output Directory", value="annotations")
+        question_type = st.selectbox("Question Type", options=["numerical", "theoretical"], index=0)
     
     # Parse pages
     question_pages = parse_pages(question_pages_str)
@@ -130,7 +131,8 @@ def main():
                 student_pdf_path=student_path,
                 student_pages=student_pages,
                 student_name=student_name,
-                output_dir=output_dir
+                output_dir=output_dir,
+                question_type=question_type
             )
             progress_bar.progress(100)
             

@@ -477,7 +477,7 @@ def _redirect_if_header_like(page, rect: fitz.Rect, expand_to_line: bool, max_do
         _is_heading_like(line_text)
         or ((short_label or wp_ref) and not row_has_values)
         or (wp_ref and (not has_digit_besides_wp) and not row_has_values)
-        or ((not has_any_digit) and not row_has_values)
+        or ((not has_any_digit) and not row_has_values and short_label)
     )
 
     if not headerish:
@@ -978,16 +978,30 @@ def resolve_anchor_rect(
     page_token_sets: Optional[dict[int, set[str]]] = None,
     use_number_first: bool = True,
     redirect_headings: bool = True,
+    min_y_per_page: Optional[dict[int, float]] = None,
+    max_y_per_page: Optional[dict[int, float]] = None,
 ):
     if not anchor_text or not isinstance(anchor_text, str):
         return None, None
-    
+
     if placed_marks is None:
         placed_marks = set()
-    
+
     evidence_preview = anchor_text[:50] if len(anchor_text) > 50 else anchor_text
     best_rect, best_page = None, -1
-    
+
+    def _outside_boundary(page_num: int, rect: fitz.Rect) -> bool:
+        """Return True if rect is outside this question's Y range on this page."""
+        if min_y_per_page:
+            boundary = min_y_per_page.get(page_num)
+            if boundary is not None and rect.y0 < boundary:
+                return True
+        if max_y_per_page:
+            boundary = max_y_per_page.get(page_num)
+            if boundary is not None and rect.y0 > boundary:
+                return True
+        return False
+
     ranked_pages = _rank_pages_for_anchor(page_token_sets or {}, list(allowed_pages), anchor_text)
 
     def _maybe_redirect(page, chosen_rect: fitz.Rect) -> Optional[fitz.Rect]:
@@ -1006,7 +1020,7 @@ def resolve_anchor_rect(
             # Try HYBRID first: Number + Context (most reliable)
             logger.debug(f"    [number-first] Trying hybrid: num={num}, context={context_words[:3]}")
             hybrid_rect = find_number_with_context(page, num, context_words)
-            if hybrid_rect:
+            if hybrid_rect and not _outside_boundary(page_num, hybrid_rect):
                 mark_key = _line_key(page_num, hybrid_rect.y0)
                 if not (skip_duplicates and mark_key in placed_marks):
                     logger.debug(f"    [number-first-hybrid] ✓ Found number with context on page {page_num}")
@@ -1019,6 +1033,7 @@ def resolve_anchor_rect(
             # Fallback to number alone ONLY when it's unique on the page.
             # This prevents anchoring to the wrong occurrence for common figures like 250,000 or 125,000.
             num_hits = _search_number_variations(page, num)
+            num_hits = [r for r in num_hits if not _outside_boundary(page_num, r)]
             if len(num_hits) == 1:
                 rect = num_hits[0]
                 mark_key = _line_key(page_num, rect.y0)
@@ -1037,6 +1052,8 @@ def resolve_anchor_rect(
         if exact_hits:
             # Check for duplicates - skip if already marked
             for rect in exact_hits:
+                if _outside_boundary(page_num, rect):
+                    continue
                 mark_key = _line_key(page_num, rect.y0)
                 if skip_duplicates and mark_key in placed_marks:
                     logger.debug(f"    [exact-skip] Rect at y={rect.y0:.1f} already marked, trying next...")
@@ -1063,6 +1080,8 @@ def resolve_anchor_rect(
             clean_hits = _page_search(page, clean_phrase)
             if clean_hits:
                 for rect in clean_hits:
+                    if _outside_boundary(page_num, rect):
+                        continue
                     mark_key = _line_key(page_num, rect.y0)
                     if skip_duplicates and mark_key in placed_marks:
                         logger.debug(f"    [clean-skip] Rect at y={rect.y0:.1f} already marked, trying next...")
@@ -1081,7 +1100,7 @@ def resolve_anchor_rect(
 
         # Strategy 3: Line-level fuzzy match (handles line breaks / punctuation differences)
         best_line = _find_best_line_match(page, anchor_text, required_number=num)
-        if best_line:
+        if best_line and not _outside_boundary(page_num, best_line):
             mark_key = _line_key(page_num, best_line.y0)
             if skip_duplicates and mark_key in placed_marks:
                 logger.debug(f"    [line-fuzzy-skip] Rect at y={best_line.y0:.1f} already marked, trying next...")
@@ -1131,7 +1150,7 @@ def resolve_anchor_rect(
                 best_rect, best_page = first_matches[0], page_num
                 logger.debug(f"    [fallback] Keeping word cluster as fallback on page {page_num}")
     
-    if best_rect and best_page != -1:
+    if best_rect and best_page != -1 and not _outside_boundary(best_page, best_rect):
         # Check fallback rect isn't already marked
         mark_key = _line_key(best_page, best_rect.y0)
         if not (skip_duplicates and mark_key in placed_marks):
@@ -1151,6 +1170,9 @@ def add_popup_for_comment(
     comment_page_y: Optional[dict[int, float]] = None,
     comment_used_y: Optional[dict[int, list[float]]] = None,
     ocr_textpages: Optional[dict[int, object]] = None,
+    placed_lines_per_page: Optional[dict] = None,
+    min_y_per_page: Optional[dict[int, float]] = None,
+    max_y_per_page: Optional[dict[int, float]] = None,
 ):
     parsed = _split_comment_arrow(comment)
     if not parsed:
@@ -1179,8 +1201,20 @@ def add_popup_for_comment(
     ranked_pages = ranked_pages if ranked_pages else list(allowed_pages)
 
     def _place_note_on_page(page, page_num: int, target_rect: Optional[fitz.Rect] = None) -> bool:
+        # Compute per-page Y boundaries for this question
+        q_min_y = float((min_y_per_page or {}).get(page_num, 0))
+        q_max_y = float((max_y_per_page or {}).get(page_num, page.rect.height - 20))
+
         # Compute initial placement point.
         if target_rect is not None:
+            # If the anchor itself is outside this question's territory, reject it.
+            # Better to drop the comment than place it on the wrong question.
+            if q_min_y > 0 and target_rect.y0 < q_min_y:
+                logger.debug(f"  [comment] ✗ target_rect above min_y ({target_rect.y0:.0f} < {q_min_y:.0f}), dropped")
+                return False
+            if q_max_y < page.rect.height - 20 and target_rect.y0 > q_max_y:
+                logger.debug(f"  [comment] ✗ target_rect below max_y ({target_rect.y0:.0f} > {q_max_y:.0f}), dropped")
+                return False
             x = min(target_rect.x1 + 6, page.rect.width - 20)
             x = max(x, 10)
             y = max(min(target_rect.y0 - 1, page.rect.height - 20), 20)
@@ -1191,10 +1225,31 @@ def add_popup_for_comment(
         else:
             # Stack notes in the right margin to avoid overlap.
             # Start lower than the very top to avoid the "all comments at the top" failure mode.
-            default_start = max(120.0, float(page.rect.height) * 0.25)
-            y = float(comment_page_y.get(page_num, default_start))
+            effective_start = max(120.0, float(page.rect.height) * 0.25, q_min_y + 10)
+            y = float(comment_page_y.get(page_num, effective_start))
             x = max(page.rect.width - 24, 10)
             y = max(min(y, page.rect.height - 20), 120)
+            # Clamp margin-stacked comments within question territory
+            if q_min_y > 0:
+                y = max(y, q_min_y + 5)
+            if q_max_y - 5 > q_min_y + 5:
+                y = min(y, q_max_y - 5)
+
+        # Avoid collisions with score labels already placed on this page.
+        # The comment icon is ~16x16; shift horizontally (left/right) by 5pt
+        # to avoid overlapping score marks on the same line.
+        if placed_lines_per_page:
+            page_idx = page_num - 1  # placed_lines_per_page uses 0-based index
+            score_boxes = placed_lines_per_page.get(page_idx, [])
+            comment_box = fitz.Rect(x, y - 8, x + 16, y + 8)
+            if any(comment_box.intersects(sb) for sb in score_boxes):
+                # Try shifting right first, then left
+                for shift_x in [20, -20, 35, -35]:
+                    nx = max(10, min(x + shift_x, page.rect.width - 20))
+                    shifted_box = fitz.Rect(nx, y - 8, nx + 16, y + 8)
+                    if not any(shifted_box.intersects(sb) for sb in score_boxes):
+                        x = nx
+                        break
 
         # Avoid collisions with existing notes near the same y.
         used = comment_used_y.setdefault(page_num, [])
@@ -1233,6 +1288,8 @@ def add_popup_for_comment(
             use_number_first=True,
             redirect_headings=True,
             expand_to_line=True,
+            min_y_per_page=min_y_per_page,
+            max_y_per_page=max_y_per_page,
         )
         if rect and page_num != -1:
             break
@@ -1269,7 +1326,15 @@ def add_popup_for_comment(
 
         best_r = None
         best_s = 0.0
+        page_num = page.number + 1  # fitz is 0-based, our dicts are 1-based
+        q_min = float((min_y_per_page or {}).get(page_num, 0))
+        q_max = float((max_y_per_page or {}).get(page_num, float('inf')))
         for lt, lr in _iter_lines_from_dict(td):
+            # Skip lines outside this question's Y territory
+            if q_min > 0 and lr.y0 < q_min:
+                continue
+            if q_max < float('inf') and lr.y0 > q_max:
+                continue
             lt_norm = _normalize_text_for_match(lt)
             lt_tokens = set(_tokenize(lt))
             overlap = len(anchor_tokens & lt_tokens)
@@ -1315,15 +1380,110 @@ def add_popup_for_comment(
         if best_rect is not None:
             return _place_note_on_page(page, pnum, target_rect=best_rect)
 
-    # Final fallback: margin stacking on the best-ranked page.
-    page_num = ranked_pages[0] if ranked_pages else (allowed_pages[0] if allowed_pages else 1)
+    # Attempt C: sliding sub-phrase search.
+    # When the anchor spans a line break, no single search finds it.
+    # Try every 3-4 word window across the anchor — at least one window
+    # will land entirely within one PDF line.
+    words = anchor_part.split()
+    sub_anchors: list[str] = []
+    seen_subs: set[str] = set()
+    for window in (4, 3):
+        for i in range(len(words) - window + 1):
+            phrase = " ".join(words[i:i + window])
+            if phrase not in seen_subs:
+                seen_subs.add(phrase)
+                sub_anchors.append(phrase)
+    if not sub_anchors and len(words) >= 2:
+        sub_anchors.append(" ".join(words[:2]))
 
+    for sub in sub_anchors:
+        for candidate in _build_anchor_variations(sub):
+            rect, page_num = resolve_anchor_rect(
+                doc,
+                candidate,
+                ranked_pages,
+                placed_marks=placed_marks,
+                skip_duplicates=False,
+                page_token_sets=page_token_sets,
+                use_number_first=False,
+                redirect_headings=False,
+                expand_to_line=True,
+                min_y_per_page=min_y_per_page,
+                max_y_per_page=max_y_per_page,
+            )
+            if rect and page_num != -1:
+                try:
+                    page = doc[page_num - 1]
+                except Exception:
+                    page = None
+                if page is not None:
+                    logger.debug(f"  [comment] Sub-phrase anchor matched: '{sub}'")
+                    return _place_note_on_page(page, page_num, target_rect=rect)
+
+    # No anchor found — fall back to margin-stacking but constrained to this question's
+    # Y territory so it cannot bleed into adjacent questions on the same page.
+    page_num = ranked_pages[0] if ranked_pages else (allowed_pages[0] if allowed_pages else 1)
     try:
         page = doc[page_num - 1]
     except Exception:
-        logger.debug(f"  [comment] ✗ Invalid page for comment placement: {page_num}")
+        logger.debug(f"  [comment] ✗ Invalid page for fallback placement: {page_num}")
         return False
+
+    q_min = float((min_y_per_page or {}).get(page_num, 0))
+    q_max = float((max_y_per_page or {}).get(page_num, page.rect.height - 20))
+    # Only use fallback if there is a valid bounded territory for this question on this page
+    if q_max <= q_min + 20:
+        logger.debug(f"  [comment] ✗ No usable territory on page {page_num}, comment dropped")
+        return False
+
+    logger.debug(f"  [comment] Fallback margin-stack within Q territory y=[{q_min:.0f},{q_max:.0f}] page {page_num}")
     return _place_note_on_page(page, page_num, target_rect=None)
+
+
+def _safe_float(value) -> float:
+    """Parse a float from a value that may be a fraction string like '1.5/3'."""
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        s = str(value).strip()
+        if '/' in s:
+            try:
+                num, den = s.split('/', 1)
+                return float(num.strip()) / float(den.strip())
+            except Exception:
+                pass
+        return 0.0
+
+
+def _detect_fontsize_at_rect(page, rect: fitz.Rect, default: float = 11.0) -> float:
+    """Return the font size of the text closest to rect on this page.
+
+    Falls back to `default` if nothing is found.  Used to scale score labels
+    so they stay proportional regardless of the student's chosen font size.
+    """
+    if not rect:
+        return default
+    try:
+        data = _page_dict(page)
+        best_size = default
+        best_overlap = 0.0
+        for block in data.get("blocks", []) or []:
+            for line in block.get("lines", []) or []:
+                for span in line.get("spans", []) or []:
+                    bbox = span.get("bbox")
+                    size = span.get("size") or 0
+                    if not bbox or size <= 0:
+                        continue
+                    sr = fitz.Rect(bbox)
+                    if not sr.intersects(rect):
+                        continue
+                    overlap = (sr & rect).get_area()
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_size = float(size)
+        return best_size if best_overlap > 0 else default
+    except Exception:
+        return default
 
 
 def _fmt_mark_value(value: float) -> str:
@@ -1338,7 +1498,10 @@ def _fmt_mark_value(value: float) -> str:
 
 def _place_score_label(page, rect: fitz.Rect, page_idx: int, placed_lines_per_page: dict, score_text: str) -> None:
     """Place one red score label near the matched rect, avoiding collisions."""
-    score_font = CONFIG['criterion_score_fontsize']
+    # Scale font size to match the local text so it looks proportional on any student formatting.
+    # Clamp between 7 and 14 pt to stay readable.
+    local_fs = _detect_fontsize_at_rect(page, rect, default=float(CONFIG['criterion_score_fontsize']))
+    score_font = max(7.0, min(14.0, local_fs))
 
     # Place score text baseline near bottom of the matched value.
     score_y = max(min(rect.y1 - 2, page.rect.height - 10), 10)
@@ -1388,7 +1551,7 @@ def _place_score_label(page, rect: fitz.Rect, page_idx: int, placed_lines_per_pa
     page.insert_text(
         (max(score_x, 50), score_y),
         score_text,
-        fontsize=CONFIG['criterion_score_fontsize'],
+        fontsize=score_font,
         color=CONFIG['criterion_score_color'],
     )
 
@@ -1405,6 +1568,8 @@ def place_score_near_anchor(
     unplaced_items,
     page_token_sets: Optional[dict[int, set[str]]] = None,
     line_score_accumulator: Optional[dict] = None,
+    min_y_per_page: Optional[dict[int, float]] = None,
+    max_y_per_page: Optional[dict[int, float]] = None,
 ):
     # Keep content after ellipses: many evidence strings use "..." as a visual separator,
     # and truncating would drop the actual numeric target.
@@ -1450,6 +1615,8 @@ def place_score_near_anchor(
                 # a section (eg "Electrostatic spraying room"), and redirecting causes marks
                 # to appear next to an unrelated numeric line further down.
                 redirect_headings=False,
+                min_y_per_page=min_y_per_page,
+                max_y_per_page=max_y_per_page,
             )
             if rect and page_num != -1:
                 break
@@ -1505,62 +1672,119 @@ def place_score_near_anchor(
         return False
 
 
-def add_main_score(doc, q_num, score_text, allowed_pages):
+def add_main_score(doc, q_num, score_text, allowed_pages, student_heading_text: Optional[str] = None):
     if not q_num:
         logger.warning("No question number for main score placement")
         return False
-    
+
     q_str = str(q_num).strip()
-    strategies = [
-        (q_str, "exact Q match"),                  # "2" or "Q2"
-        (f"Q{q_str}", "Q prefix"),                 # "Q2"
-        (f"Question {q_str}", "Question prefix"),  # "Question 2"
+
+    # Build search strategies — prefer specific patterns first to avoid
+    # false positives (e.g. "1" matching "Issue-01" or "Rs.1.3 Million").
+    # The student's exact heading (captured by the LLM extractor) is tried first
+    # because it handles typos and non-standard formatting (e.g. "Quiestion 4").
+    strategies = []
+    if student_heading_text:
+        strategies.append((student_heading_text, "Student exact heading"))
+    strategies += [
+        (f"Question {q_str}", "Question prefix"),  # "Question 1"
+        (f"Q-{q_str.zfill(2)}", "Q-0N prefix"),    # "Q-01"
+        (f"Q-{q_str}", "Q-N prefix"),               # "Q-1"
+        (f"Q.{q_str}", "Q.N prefix"),               # "Q.1"
+        (f"Q{q_str}", "QN prefix"),                  # "Q1"
+        (f"Answer {q_str}", "Answer prefix"),        # "Answer 1"
+        (f"Ans.{q_str}", "Ans. prefix"),             # "Ans.1"
+        (f"Ans {q_str}", "Ans prefix"),              # "Ans 1"
     ]
-    
+
+    def _is_question_heading(page, rect, search_text):
+        """Validate that a match is an actual question heading, not embedded text.
+
+        Checks:
+        1. The match is at/near the start of a line (x < 200)
+        2. There's substantive content BELOW the heading
+        3. The match is not part of a longer word/number (e.g. "Issue-01")
+        """
+        # Check horizontal position — headings are near the left margin
+        if rect.x0 > 250:
+            return False
+
+        # Check surrounding text to reject matches inside other words.
+        # Read words on the same line and check if our match is standalone.
+        for word_obj in _page_words(page):
+            word_text = word_obj[4].strip()
+            word_y_mid = (word_obj[1] + word_obj[3]) / 2
+            rect_y_mid = (rect.y0 + rect.y1) / 2
+
+            # Same line (within 5pt)
+            if abs(word_y_mid - rect_y_mid) > 5:
+                continue
+
+            # Check if the word containing our match is actually a different
+            # label like "Issue-01", "Rs.1.3", "Page 1", etc.
+            wl = word_text.lower()
+            if any(prefix in wl for prefix in ("issue", "rs.", "rs,", "page", "total")):
+                # Our search text is embedded in a non-heading context
+                if search_text.lower() in wl and wl != search_text.lower():
+                    return False
+
+        # Validate substantive content below
+        min_y_below = rect.y1 + 5
+        max_y_below = min(rect.y1 + 80, page.rect.height - 20)
+
+        for word_obj in _page_words(page):
+            word_text = word_obj[4].strip()
+            word_y = word_obj[1]
+            if (word_y >= min_y_below and word_y <= max_y_below and
+                len(word_text) > 1 and not word_text.isspace() and
+                not re.match(r'^[^a-zA-Z0-9]*$', word_text)):
+                return True
+
+        return False
+
     for page_num in allowed_pages:
         page = doc[page_num - 1]
-        
+
         for search_text, strategy_name in strategies:
             instances = _page_search(page, search_text)
-            if instances:
-                heading_rect = instances[0]
-                
-                # ✓ NEW: Validate that there's substantive content BELOW the heading
-                # Check for text/numbers in the region below heading (y > heading.y1)
-                has_substantive_content = False
-                min_y_below = heading_rect.y1 + 5
-                max_y_below = min(heading_rect.y1 + 80, page.rect.height - 20)
-                
-                for word_obj in _page_words(page):
-                    word_text = word_obj[4].strip()
-                    word_y = word_obj[1]
-                    
-                    # Text below heading, not just whitespace or single chars
-                    if (word_y >= min_y_below and word_y <= max_y_below and 
-                        len(word_text) > 1 and not word_text.isspace() and 
-                        not re.match(r'^[^a-zA-Z0-9]*$', word_text)):
-                        has_substantive_content = True
-                        logger.debug(f"      [main-score] Found substantive content below heading: '{word_text}'")
-                        break
-                
-                if not has_substantive_content:
-                    logger.debug(f"      [main-score] No substantive content below '{search_text}' heading - SKIPPING")
+            if not instances:
+                continue
+
+            # Check each instance — pick the first valid question heading
+            for heading_rect in instances:
+                if not _is_question_heading(page, heading_rect, search_text):
+                    logger.debug(f"      [main-score] Rejected '{search_text}' at y={heading_rect.y0:.0f} - not a heading")
                     continue
-                
-                # Place to the left and above the heading (if content validated)
+
+                # Place to the left and above the heading
                 x = heading_rect.x0 - CONFIG['main_score_offset_x']
                 y = heading_rect.y0 + CONFIG['main_score_offset_y'] - 10
-                
+
                 page.insert_text(
                     (x, y),
                     score_text,
                     fontsize=CONFIG['main_score_fontsize'],
                     color=CONFIG['main_score_color']
                 )
-                logger.info(f"✓ Main score '{score_text}' placed (strategy: {strategy_name}) on page {page_num} - content validated")
+                logger.info(f"Main score '{score_text}' placed (strategy: {strategy_name}) on page {page_num} - content validated")
                 return True
-    
-    logger.warning(f"✗ Main score not placed - Q{q_str} heading not found or no substantive content")
+
+    # Fallback: place main score at top-left of the first allowed page
+    # This ensures the total score is always visible on the annotated PDF.
+    if allowed_pages:
+        fallback_page = doc[allowed_pages[0] - 1]
+        x = 30
+        y = 30
+        fallback_page.insert_text(
+            (x, y),
+            score_text,
+            fontsize=CONFIG['main_score_fontsize'],
+            color=CONFIG['main_score_color']
+        )
+        logger.info(f"Main score '{score_text}' placed at top of page {allowed_pages[0]} (fallback - no heading found)")
+        return True
+
+    logger.warning(f"Main score not placed - Q{q_str} heading not found or no substantive content")
     return False
 
 
@@ -1602,32 +1826,112 @@ def annotate_pdf(
         doc = fitz.open(input_pdf_path)
         allowed_pages = student_pages or list(range(1, len(doc) + 1))
 
-        # Pre-OCR pages that contain images so all search/text calls
-        # transparently include text recognised from images.
+        # OCR must be initialised BEFORE boundary detection so _page_search
+        # can read text from scanned (image-only) pages when locating question headings.
         _init_ocr_cache(doc, allowed_pages)
 
-        # Precompute per-page token sets to bias anchors to the correct page.
-        # Prefer student-extracted per-page text (works even when the PDF is scanned/image-only).
+        # ── Fetch student assignment doc (needed for heading text + page texts) ──
+        # Done early so student_question_heading is available for boundary detection below.
         page_token_sets: dict[int, set[str]] = {}
         student_page_texts: dict[int, str] = {}
+        student_question_heading: Optional[str] = None
         try:
             student_answer_id = grades_doc.get('student_answer_id')
             if student_answer_id:
                 s_coll = get_collection("student_assignments")
                 s_doc = s_coll.find_one({"_id": ObjectId(student_answer_id)})
-                if s_doc and isinstance(s_doc.get("page_texts"), list):
-                    for item in s_doc.get("page_texts") or []:
-                        try:
-                            pp = int(item.get("page"))
-                            tt = str(item.get("text") or "")
-                        except Exception:
-                            continue
-                        if pp in allowed_pages and tt:
-                            student_page_texts[pp] = tt
+                if s_doc:
+                    student_question_heading = s_doc.get("question_heading_text") or None
+                    if isinstance(s_doc.get("page_texts"), list):
+                        for item in s_doc.get("page_texts") or []:
+                            try:
+                                pp = int(item.get("page"))
+                                tt = str(item.get("text") or "")
+                            except Exception:
+                                continue
+                            if pp in allowed_pages and tt:
+                                student_page_texts[pp] = tt
         except Exception:
-            # Non-fatal: fall back to PDF text.
             student_page_texts = {}
 
+        # ── Find Y boundaries for the target question on each page ──
+        # When a page contains answers to multiple questions (e.g. Q-02 above Q-01),
+        # we must not annotate above the target question's heading (min_y)
+        # or below the next question's heading (max_y).
+        q_num = str(grades_doc.get('question_number', '')).strip()
+        min_y_per_page: dict[int, float] = {}
+        max_y_per_page: dict[int, float] = {}
+
+        if q_num:
+            q_heading_patterns = []
+            # Put the student's exact heading first (handles typos like "Quiestion 4")
+            if student_question_heading:
+                q_heading_patterns.append(student_question_heading)
+            q_heading_patterns += [
+                f"ANSWER {q_num}",
+                f"Answer {q_num}",
+                f"ANSWER: {q_num}",
+                f"Answer: {q_num}",
+                f"ANSWER:{q_num}",
+                f"Answer:{q_num}",
+                f"Question {q_num}",
+                f"Q-{q_num.zfill(2)}",
+                f"Q-{q_num}",
+                f"Q.{q_num}",
+                f"Q{q_num}",
+            ]
+            for page_num in allowed_pages:
+                page = doc[page_num - 1]
+                # Find this question's heading → min_y
+                for pattern in q_heading_patterns:
+                    instances = _page_search(page, pattern)
+                    for inst in (instances or []):
+                        if inst.x0 < 250:
+                            min_y_per_page[page_num] = inst.y0 - 5
+                            logger.debug(f"Q{q_num} heading found on page {page_num} at y={inst.y0:.0f}")
+                            break
+                    if page_num in min_y_per_page:
+                        break
+
+                # Find next question heading below min_y → max_y
+                # Strategy: derive neighbour patterns from the student's own heading format
+                # (e.g. "ANSWER No. 1" → "ANSWER No. {n}") so we don't need to hardcode
+                # every possible style.  Fall back to common generic templates.
+                current_min = min_y_per_page.get(page_num, 0)
+                best_next_y = float('inf')
+
+                # Build neighbour number list: 1-10 excluding current (covers any ordering)
+                try:
+                    q_int = int(q_num)
+                    neighbor_nums = [n for n in range(1, 11) if n != q_int]
+                except ValueError:
+                    neighbor_nums = []
+
+                # Derive student-specific prefix/suffix from the known heading
+                student_prefix: Optional[str] = None
+                student_suffix: Optional[str] = None
+                if student_question_heading and q_num in student_question_heading:
+                    idx = student_question_heading.find(q_num)
+                    student_prefix = student_question_heading[:idx]
+                    student_suffix = student_question_heading[idx + len(q_num):]
+
+                for n in neighbor_nums:
+                    neighbour_templates = [f"ANSWER {n}", f"Answer {n}", f"ANSWER: {n}", f"Answer: {n}", f"Q-{str(n).zfill(2)}", f"Q.{n}", f"Q{n} "]
+                    # Prepend the student's own format so it gets matched first
+                    if student_prefix is not None:
+                        neighbour_templates.insert(0, f"{student_prefix}{n}{student_suffix}")
+                    for tmpl in neighbour_templates:
+                        hits = _page_search(page, tmpl)
+                        for hit in (hits or []):
+                            if hit.x0 < 250 and hit.y0 > current_min + 30:
+                                if hit.y0 < best_next_y:
+                                    best_next_y = hit.y0
+                if best_next_y < float('inf'):
+                    max_y_per_page[page_num] = best_next_y - 5
+                    logger.debug(f"  Max Y for Q{q_num} on page {page_num}: {best_next_y:.0f}")
+
+        # Precompute per-page token sets to bias anchors to the correct page.
+        # (student_page_texts already fetched above alongside student_question_heading)
         for p in allowed_pages:
             page_text = student_page_texts.get(p)
             if page_text is None:
@@ -1662,103 +1966,311 @@ def annotate_pdf(
         # Main total score — use _fmt_mark_value so 0.25-step marks display correctly
         # (:.1f would truncate 12.25 → "12.2")
         main_score_text = f"{_fmt_mark_value(grades_doc['total_marks_awarded'])}/{_fmt_mark_value(grades_doc['total_max_possible'])}"
-        if add_main_score(doc, str(grades_doc.get('question_number', '')), main_score_text, allowed_pages):
+        if add_main_score(doc, str(grades_doc.get('question_number', '')), main_score_text, allowed_pages,
+                          student_heading_text=student_question_heading):
             annotation_mapping['total_score_placed'] = True
 
         # Per-criterion - only display/underline awarded marks (skip 0s)
         breakdown = grades_doc.get('breakdown', [])
+        is_holistic = grades_doc.get('holistic_grading', False)
         displayed_breakdown = [
             it for it in breakdown
             if float(it.get('marks_awarded', 0) or 0) > 0
         ]
         annotation_mapping['total_criteria'] = len(displayed_breakdown)
         criteria_count = 0
-        for idx, item in enumerate(displayed_breakdown, 1):
-            marks = float(item.get('marks_awarded', 0))
-            raw_evidence = item.get('evidence_list')
-            if isinstance(raw_evidence, list):
-                evidence_candidates = [str(x).strip() for x in raw_evidence if x is not None and str(x).strip()]
-            else:
-                evidence = (item.get('evidence', '') or '').strip()
-                # Back-compat: older docs store multiple snippets joined with '; '.
-                evidence_candidates = [p.strip() for p in re.split(r"\s*;\s*", evidence) if p and p.strip()]
-            criterion_name = item.get('criterion', '').strip()
 
-            def _is_informative_anchor(text: str) -> bool:
-                norm = _normalize_text_for_match(text)
-                if len(norm) < 6:
-                    return False
-                key = re.sub(r"[^a-z0-9]+", "", norm)
-                if re.fullmatch(r"20x\d", key) or re.fullmatch(r"20\d{2}", key):
-                    return False
-                # Allow short anchors if they contain a distinctive numeric/pro-rating token.
-                if re.search(r"\d+\s*/\s*\d+", text):
-                    return True
-                if re.search(r"\d", text) and len(norm) >= 4:
-                    return True
-                # Otherwise require at least 2 meaningful tokens.
-                toks = _tokenize(text)
-                return len(toks) >= 2
+        def _is_informative_anchor(text: str) -> bool:
+            norm = _normalize_text_for_match(text)
+            if len(norm) < 6:
+                return False
+            key = re.sub(r"[^a-z0-9]+", "", norm)
+            if re.fullmatch(r"20x\d", key) or re.fullmatch(r"20\d{2}", key):
+                return False
+            # Allow short anchors if they contain a distinctive numeric/pro-rating token.
+            if re.search(r"\d+\s*/\s*\d+", text):
+                return True
+            if re.search(r"\d", text) and len(norm) >= 4:
+                return True
+            # Otherwise require at least 2 meaningful tokens.
+            toks = _tokenize(text)
+            return len(toks) >= 2
 
-            evidence_missing = (not evidence_candidates)
+        if is_holistic:
+            # ── HOLISTIC GRADING ANNOTATION ──
+            # Each breakdown item = one sub-question.
+            # _correct_points_with_marks = [{text, marks}, ...] for underline + tick placement.
+            # Strategy: (1) underline each correct_point + place ticks (one ✓ per 0.5 marks),
+            #           (2) place sub-question score near student's sub-question label.
+            logger.info(f"Holistic annotation mode: {len(displayed_breakdown)} sub-question(s) with marks")
 
-            criterion_anchor = ""
-            if criterion_name and not _is_heading_like(criterion_name) and len(_normalize_text_for_match(criterion_name)) >= 6:
-                criterion_anchor = criterion_name
+            def _place_ticks(page, rect, num_ticks: int):
+                """Place tick marks above the key phrase rect, scaled to the text height."""
+                if num_ticks <= 0:
+                    return
+                # Scale tick proportionally to the line height so it looks right on any font size.
+                # A typical body line is ~12 pt; clamp scale between 0.5× and 1.5×.
+                line_h = max(rect.y1 - rect.y0, 6.0)
+                scale = max(0.5, min(1.5, line_h / 12.0))
+                tick_width = round(8 * scale)
+                tick_gap  = round(2 * scale)
+                stroke_w  = max(1.0, round(1.5 * scale, 1))
+                lx = round(3 * scale)   # left-leg x-offset
+                dn = round(4 * scale)   # left-leg down amount
+                up = round(5 * scale)   # right-leg up amount
 
-            anchor_candidates: list[str] = []
-            if not evidence_missing:
-                for ev in evidence_candidates[:3]:
-                    if _is_informative_anchor(ev):
-                        anchor_candidates.append(ev)
-            if criterion_anchor and _is_informative_anchor(criterion_anchor):
-                anchor_candidates.append(criterion_anchor)
+                # Position ticks just above the rect, centered horizontally on it
+                center_x = (rect.x0 + rect.x1) / 2
+                base_y = rect.y0 - 2  # just above the text
 
-            # Place only items with usable anchor(s) — always try evidence first.
-            success = False
-            used_anchor = ""
-            for anchor in anchor_candidates[:3]:
-                used_anchor = anchor
-                logger.debug(f"  Criterion {idx}: {criterion_name} ({marks}pts)")
-                logger.debug(f"    Anchor: {anchor[:80]}...")
-                success = place_score_near_anchor(
-                    doc, anchor, f"{marks}",
-                    allowed_pages, placed_lines_per_page, placed_marks, unplaced_items,
-                    page_token_sets=page_token_sets,
-                    line_score_accumulator=line_score_accumulator,
-                )
+                total_width = num_ticks * tick_width + (num_ticks - 1) * tick_gap
+                start_x = center_x - total_width / 2
+                for i in range(num_ticks):
+                    x = start_x + i * (tick_width + tick_gap)
+                    # Short left stroke going down
+                    page.draw_line(
+                        fitz.Point(x, base_y - 2),
+                        fitz.Point(x + lx, base_y + dn),
+                        color=(1, 0, 0), width=stroke_w
+                    )
+                    # Longer right stroke going up
+                    page.draw_line(
+                        fitz.Point(x + lx, base_y + dn),
+                        fitz.Point(x + tick_width, base_y - up),
+                        color=(1, 0, 0), width=stroke_w
+                    )
+
+            for idx, item in enumerate(displayed_breakdown, 1):
+                marks = float(item.get('marks_awarded', 0))
+                max_marks = float(item.get('max_possible', 0) or 0)
+                sub_q = item.get('_sub_question', '')
+                student_label = item.get('_student_label', '')
+
+                # Get correct points with per-point marks
+                points_with_marks = item.get('_correct_points_with_marks', [])
+
+                # Fallback: if no structured points, use evidence_list with even distribution
+                if not points_with_marks:
+                    raw_evidence = item.get('evidence_list')
+                    if isinstance(raw_evidence, list):
+                        ev_texts = [str(x).strip() for x in raw_evidence if x is not None and str(x).strip()]
+                    else:
+                        evidence = (item.get('evidence', '') or '').strip()
+                        ev_texts = [p.strip() for p in re.split(r"\s*;\s*", evidence) if p and p.strip()]
+                    if ev_texts:
+                        per_point = round(marks / len(ev_texts) / 0.5) * 0.5 if len(ev_texts) > 0 else 0.5
+                        per_point = max(per_point, 0.5)
+                        points_with_marks = [{"text": t, "marks": per_point} for t in ev_texts]
+
+                # Step 1: Underline each correct point + place tick marks
+                logger.info(f"    Processing {len(points_with_marks)} correct points for sub-question {sub_q}")
+                for pt in points_with_marks:
+                    pt_text = pt.get("text", "").strip()
+                    pt_marks = float(pt.get("marks", 0.5) or 0.5)
+                    if not pt_text:
+                        continue
+                    if not _is_informative_anchor(pt_text):
+                        logger.info(f"    Skipped (not informative): '{pt_text[:60]}'")
+                        continue
+
+                    evidence_clean = _strip_llm_artifacts(pt_text.replace("\u2026", " ").replace("...", " ").replace('|', ' '))
+                    if not evidence_clean:
+                        continue
+
+                    # Build candidate fragments for underline matching (robust, same as place_score_near_anchor)
+                    parts = [p.strip() for p in re.split(r"\n|;|\|", evidence_clean) if p and p.strip()]
+                    parts = [p for p in parts if len(p) >= 6]
+                    seen_parts = set()
+                    unique_parts: list[str] = []
+                    for p in sorted(parts, key=len, reverse=True):
+                        key = p.lower()
+                        if key in seen_parts:
+                            continue
+                        seen_parts.add(key)
+                        unique_parts.append(p)
+                    candidate_fragments = unique_parts[:4] if unique_parts else [evidence_clean]
+
+                    rect, page_num = None, -1
+                    for fragment in candidate_fragments:
+                        for candidate in _build_anchor_variations(fragment):
+                            rect, page_num = resolve_anchor_rect(
+                                doc, candidate, allowed_pages,
+                                placed_marks=placed_marks, skip_duplicates=False,
+                                expand_to_line=False, page_token_sets=page_token_sets,
+                                redirect_headings=False, min_y_per_page=min_y_per_page,
+                                max_y_per_page=max_y_per_page,
+                            )
+                            if rect and page_num > 0:
+                                break
+                        if rect and page_num > 0:
+                            break
+
+                    if rect and page_num > 0:
+                        page = doc[page_num - 1]
+                        _draw_underline_for_rect(page, rect)
+
+                        # Place tick at the KEY PHRASE — the specific concept that earned the mark.
+                        key_phrase = pt.get("key_phrase", "").strip()
+                        tick_rect = rect  # fallback
+                        tick_anchor = key_phrase or ""
+
+                        if tick_anchor and len(tick_anchor) >= 3:
+                            # Restrict key_phrase search to the SAME page as the evidence rect
+                            # to prevent ticks from drifting into another question's area.
+                            kp_rect, kp_page = resolve_anchor_rect(
+                                doc, tick_anchor, [page_num],
+                                placed_marks=set(), skip_duplicates=False,
+                                expand_to_line=False, page_token_sets=page_token_sets,
+                                redirect_headings=False, min_y_per_page=min_y_per_page,
+                                max_y_per_page=max_y_per_page,
+                            )
+                            if kp_rect and kp_page == page_num:
+                                # Hard y-boundary guard: even if resolve passed it through,
+                                # reject if it falls outside this question's known Y range.
+                                kp_y = kp_rect.y0
+                                q_min_y = min_y_per_page.get(page_num, 0)
+                                q_max_y = max_y_per_page.get(page_num, float('inf'))
+                                if kp_y >= q_min_y and kp_y <= q_max_y:
+                                    tick_rect = kp_rect
+                                    logger.info(f"      Tick anchored to key_phrase: '{tick_anchor}'")
+                                else:
+                                    logger.info(f"      Tick key_phrase out of Q boundary (y={kp_y:.0f}, range [{q_min_y:.0f}, {q_max_y:.0f}]), using evidence rect")
+
+                        num_ticks = max(1, int(pt_marks / 0.5))
+                        _place_ticks(page, tick_rect, num_ticks)
+                        logger.info(f"    \u2713 Underlined + {num_ticks} tick(s): '{pt_text[:60]}'")
+                    else:
+                        logger.info(f"    \u2717 Not found in PDF: '{pt_text[:60]}'")
+
+
+                # Step 2: Place sub-question score near the student's label or first evidence
+                score_text = f"{_fmt_mark_value(marks)}/{_fmt_mark_value(max_marks)}"
+                score_placed = False
+
+                # Try student label first (e.g., "Q1(a)", "a)", "(a)")
+                if student_label and student_label.strip():
+                    score_placed = place_score_near_anchor(
+                        doc, student_label.strip(), score_text,
+                        allowed_pages, placed_lines_per_page, placed_marks, unplaced_items,
+                        page_token_sets=page_token_sets,
+                        line_score_accumulator=None,
+                        min_y_per_page=min_y_per_page,
+                        max_y_per_page=max_y_per_page,
+                    )
+
+                # Fallback: try sub-question patterns
+                if not score_placed and sub_q:
+                    for pattern in [sub_q, f"({sub_q})", f"{sub_q})", f"{sub_q}.", f"{sub_q}:"]:
+                        score_placed = place_score_near_anchor(
+                            doc, pattern, score_text,
+                            allowed_pages, placed_lines_per_page, placed_marks, unplaced_items,
+                            page_token_sets=page_token_sets,
+                            line_score_accumulator=None,
+                            min_y_per_page=min_y_per_page,
+                            max_y_per_page=max_y_per_page,
+                        )
+                        if score_placed:
+                            break
+
+                # Fallback: use first evidence candidate
+                if not score_placed and points_with_marks:
+                    for pt in points_with_marks[:2]:
+                        pt_text = pt.get("text", "").strip()
+                        if pt_text and _is_informative_anchor(pt_text):
+                            score_placed = place_score_near_anchor(
+                                doc, pt_text, score_text,
+                                allowed_pages, placed_lines_per_page, placed_marks, unplaced_items,
+                                page_token_sets=page_token_sets,
+                                line_score_accumulator=None,
+                                min_y_per_page=min_y_per_page,
+                                max_y_per_page=max_y_per_page,
+                            )
+                            if score_placed:
+                                break
+
+                if score_placed:
+                    annotation_mapping['criterion_scores_placed'] += 1
+                    logger.info(f"  Sub-question {sub_q}: {score_text} placed")
+                else:
+                    logger.debug(f"  Sub-question {sub_q}: {score_text} NOT placed")
+                criteria_count += 1
+
+            logger.info(f"✓ Placed {annotation_mapping['criterion_scores_placed']} of {criteria_count} sub-question scores")
+
+        else:
+            # ── STANDARD PER-CRITERION ANNOTATION ──
+            for idx, item in enumerate(displayed_breakdown, 1):
+                marks = float(item.get('marks_awarded', 0))
+                raw_evidence = item.get('evidence_list')
+                if isinstance(raw_evidence, list):
+                    evidence_candidates = [str(x).strip() for x in raw_evidence if x is not None and str(x).strip()]
+                else:
+                    evidence = (item.get('evidence', '') or '').strip()
+                    # Back-compat: older docs store multiple snippets joined with '; '.
+                    evidence_candidates = [p.strip() for p in re.split(r"\s*;\s*", evidence) if p and p.strip()]
+                criterion_name = item.get('criterion', '').strip()
+
+                evidence_missing = (not evidence_candidates)
+
+                criterion_anchor = ""
+                if criterion_name and not _is_heading_like(criterion_name) and len(_normalize_text_for_match(criterion_name)) >= 6:
+                    criterion_anchor = criterion_name
+
+                anchor_candidates: list[str] = []
+                if not evidence_missing:
+                    for ev in evidence_candidates[:3]:
+                        if _is_informative_anchor(ev):
+                            anchor_candidates.append(ev)
+                if criterion_anchor and _is_informative_anchor(criterion_anchor):
+                    anchor_candidates.append(criterion_anchor)
+
+                # Place only items with usable anchor(s) — always try evidence first.
+                success = False
+                used_anchor = ""
+                for anchor in anchor_candidates[:3]:
+                    used_anchor = anchor
+                    logger.debug(f"  Criterion {idx}: {criterion_name} ({marks}pts)")
+                    logger.debug(f"    Anchor: {anchor[:80]}...")
+                    success = place_score_near_anchor(
+                        doc, anchor, f"{marks}",
+                        allowed_pages, placed_lines_per_page, placed_marks, unplaced_items,
+                        page_token_sets=page_token_sets,
+                        line_score_accumulator=line_score_accumulator,
+                        min_y_per_page=min_y_per_page,
+                        max_y_per_page=max_y_per_page,
+                    )
+                    if success:
+                        break
+
                 if success:
-                    break
+                    annotation_mapping['criterion_scores_placed'] += 1
+                else:
+                    if anchor_candidates:
+                        logger.debug(f"    [placement] ✗ All anchors failed (evidence-first). Last tried: '{used_anchor[:60]}'")
+                criteria_count += 1
 
-            if success:
-                annotation_mapping['criterion_scores_placed'] += 1
-            else:
-                if anchor_candidates:
-                    logger.debug(f"    [placement] ✗ All anchors failed (evidence-first). Last tried: '{used_anchor[:60]}'")
-            criteria_count += 1
+            # Place ONE combined score label per resolved line.
+            for entry in line_score_accumulator.values():
+                try:
+                    page_num = int(entry.get("page_num"))
+                    page_idx = int(entry.get("page_idx"))
+                    rect = entry.get("rect")
+                    marks_list = entry.get("marks") or []
+                    total = sum(float(m) for m in marks_list)
+                except Exception:
+                    continue
+                if not rect or page_num <= 0:
+                    continue
+                page = doc[page_num - 1]
+                _place_score_label(page, rect, page_idx, placed_lines_per_page, _fmt_mark_value(total))
 
-        # Place ONE combined score label per resolved line.
-        for entry in line_score_accumulator.values():
-            try:
-                page_num = int(entry.get("page_num"))
-                page_idx = int(entry.get("page_idx"))
-                rect = entry.get("rect")
-                marks_list = entry.get("marks") or []
-                total = sum(float(m) for m in marks_list)
-            except Exception:
-                continue
-            if not rect or page_num <= 0:
-                continue
-            page = doc[page_num - 1]
-            _place_score_label(page, rect, page_idx, placed_lines_per_page, _fmt_mark_value(total))
-        
-        logger.info(f"✓ Placed {annotation_mapping['criterion_scores_placed']} of {criteria_count} criteria with evidence")
+            logger.info(f"✓ Placed {annotation_mapping['criterion_scores_placed']} of {criteria_count} criteria with evidence")
         
         # Fallback 1: Place unplaced high-value items (>0.5 marks) in margins
         if unplaced_items:
             high_value_unplaced = [
                 (score, evidence) for score, evidence in unplaced_items
-                if isinstance(score, str) and float(score) >= 0.25
+                if isinstance(score, str) and score.strip() and _safe_float(score) >= 0.25
             ]
             
             if high_value_unplaced:
@@ -1797,6 +2309,9 @@ def annotate_pdf(
                     comment_page_y=comment_page_y,
                     comment_used_y=comment_used_y,
                     ocr_textpages=ocr_textpages,
+                    placed_lines_per_page=placed_lines_per_page,
+                    min_y_per_page=min_y_per_page,
+                    max_y_per_page=max_y_per_page,
                 ):
                     comments_placed += 1
                     logger.debug("    ✓ Comment placed")

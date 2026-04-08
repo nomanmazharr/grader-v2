@@ -7,7 +7,11 @@
       "Bash(python main.py)",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''grade.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''grade.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"from prompts.grading_prompts import grade_prompt; print\\(''Prompt import OK''\\); print\\(f''Prompt length: {len\\(grade_prompt.messages[0].prompt.template\\)} chars''\\)\")"
+      "Bash(python -c \"from prompts.grading_prompts import grade_prompt; print\\(''Prompt import OK''\\); print\\(f''Prompt length: {len\\(grade_prompt.messages[0].prompt.template\\)} chars''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''grade.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''grade.py: syntax OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''main.py'', doraise=True\\); print\\(''main.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''pdf_annotation/annotator.py'', doraise=True\\); print\\(''OK''\\)\")"
     ]
   }
 }

@@ -1,8 +1,10 @@
 from typing import List, Optional, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class GradeBreakdownItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     criterion: str = Field(..., description="Marking criterion or point description")
     marks_awarded: Union[float, int] = Field(..., description="Marks given")
     max_possible: Union[float, int] = Field(..., description="Maximum marks for this item")
@@ -16,6 +18,11 @@ class GradeBreakdownItem(BaseModel):
     )
     comments_summary: Optional[str] = Field(None, description="Grader comment for this specific item (if any)")
 
+    # Holistic grading fields (only populated when holistic_grading=True on the parent doc)
+    sub_question: Optional[str] = Field(None, alias="_sub_question", description="Sub-question identifier (holistic grading)")
+    student_label: Optional[str] = Field(None, alias="_student_label", description="Student's label for this sub-question (holistic grading)")
+    correct_points_with_marks: Optional[List[dict]] = Field(None, alias="_correct_points_with_marks", description="Per-point marks for holistic annotation [{text, marks}]")
+
 
 class StudentGradeDocument(BaseModel):
     student_id: str = Field(..., description="Student name or ID")
@@ -23,11 +30,11 @@ class StudentGradeDocument(BaseModel):
     total_marks_awarded: Union[float, int] = Field(..., description="Total marks awarded")
     total_max_possible: Union[float, int] = Field(..., description="Total possible marks")
     overall_reason: str = Field(..., description="Summary reason for total score")
-    
+
     breakdown: List[GradeBreakdownItem] = Field(
         ..., description="Detailed per-criterion breakdown"
     )
-    
+
     comments: List[str] = Field(
         default_factory=list,
         description="Structured list of LLM-generated feedback comments for the whole question"
@@ -42,6 +49,9 @@ class StudentGradeDocument(BaseModel):
         default_factory=list,
         description="LLM comments that did not meet the strict annotation-friendly format"
     )
+
+    # Holistic grading flag
+    holistic_grading: Optional[bool] = Field(None, description="True when holistic grading mode was used (no marking criteria)")
 
     # References & Metadata
     extracted_at: str = Field(..., description="ISO timestamp of grading")
