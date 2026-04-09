@@ -1,70 +1,3 @@
-# STUDENT_ASSIGNMENT_EXTRACTION_PROMPT_TEMPLATE = """You are an expert at extracting and structuring handwritten or typed student answers from PDF page images.
-
-# CRITICAL OUTPUT REQUIREMENTS:
-# - Your output MUST contain ONLY clean, standard printable characters.
-# - Use ONLY: letters, numbers, standard punctuation (. , ; : ! ? - ( ) [ ]), spaces, and newlines.
-# - NO control characters, NO Unicode artifacts, NO escape sequences.
-# - Replace bullet symbols with standard dashes (-) or asterisks (*).
-# - Output clean, readable text that can be directly used without post-processing.
-
-# TARGET QUESTION: {question_number}
-# You MUST extract ONLY the student's answer for Question {question_number}.
-
-# EXTRACTION RULES:
-# - The provided pages may contain answers to MULTIPLE questions. You MUST identify and extract ONLY the content belonging to Question {question_number}.
-# - Look for question labels such as "Q-{question_number}", "Q.{question_number}", "Q{question_number}", "Question {question_number}", "{question_number}.", "{question_number}-", "{question_number})" or similar patterns to identify where Question {question_number} starts.
-# - STOP extracting ONLY when you see a label that contains the word "Question", "Q.", "Q-", or "Q " immediately followed by a number DIFFERENT from {question_number} (e.g. "Question 2", "Q.3", "Q-02"). That is the ONLY valid question boundary.
-# - A bare number with any suffix — "2-", "2.", "2)", "(2)", "Case 2", "Scenario 2" — is NEVER a question boundary. It is mostly a sub-part of the current question. For better see top level student way of using question patterns as that will help to identify it's sub part or next question. Keep extracting and add it as a new entry in sub_parts.
-# - Content that appears BEFORE the start of Question {question_number} belongs to a different question — EXCLUDE it entirely.
-# - Content that appears AFTER Question {question_number} ends (i.e., after a new TOP-LEVEL question label) — EXCLUDE it entirely.
-# - Within Question {question_number}, extract ALL content including sub-sections, sub-headings, tables, and workings across ALL provided pages.
-# - If the pages only contain one question and it matches {question_number}, extract everything.
-# - If you cannot find Question {question_number} on the provided pages, return minimal output with empty answer content.
-# - NEVER merge or pull content from any other question.
-# - Ignore page headers, footers, "Continued...", watermarks, candidate numbers, etc.
-
-# TABLE EXTRACTION RULES:
-# - Tables are CRITICAL—extract them completely and accurately.
-# - Preserve row and column structure clearly.
-# - Format tables as plain text with clear separators (use | or spaces).
-# - Keep ALL numerical values, units, currency symbols, and column headings exactly as written.
-# - Maintain correct alignment of numbers with their labels.
-# - If a calculation table has multiple columns (description | amount), preserve that structure.
-# - NEVER omit a table. If any table cell/row is hard to read, include your best-effort extraction and add "[unclear]" in-place rather than dropping the row/table.
-
-# SUB-SECTION DETECTION (strict priority order – apply ONLY the first that matches):
-# 1. If the student has explicitly written numbered or lettered sub-parts such as:
-#     1.1, 1.2, 1(a), 1(b), a), b), c), (i), (ii), (A), (B), A., B., (i), (ii), i), ii), etc.
-#     → treat each as a separate sub_part with that exact identifier as question_number.
-
-# 2. OTHERWISE – even if the student uses bold headings, topic titles, underlined phrases, or descriptive section names – treat the entire answer as ONE single question.
-#     → Output exactly ONE sub_part.
-#     → Use the main question identifier (e.g., "Question 1" or "1") as the question_number.
-#     → Concatenate all content in order, preserving paragraphs and line breaks.
-
-# FORMATTING RULES:
-# - Preserve original line breaks with \n\n between paragraphs.
-# - Keep bullet points, numbering, and diagram descriptions exactly as written.
-# - Use clear spacing to separate sections.
-# - NEVER invent or create sub-parts based on content headings or topic names.
-# - Do NOT treat descriptive headings as sub-question identifiers.
-
-# QUESTION HEADING TEXT (CRITICAL FOR ANNOTATION):
-# - Populate a field `question_heading_text` with the EXACT verbatim text the student wrote as the heading/label for this question.
-# - Copy it character-for-character, including any typos, spacing, or punctuation (e.g. "Quiestion 4", "Q4.", "QUESTION  4", "Q 4)").
-# - If the student wrote no visible heading, set `question_heading_text` to null.
-# - This is used by the annotation engine to locate the heading in the PDF — accuracy is critical.
-
-# OPTIONAL PAGE TEXTS (IMPORTANT FOR ANNOTATION):
-# - Populate a field `page_texts` as an array with one entry per provided page:
-#     - `page`: the 1-based page number as given in the input
-#     - `text`: ALL visible text on that page, verbatim — even if the page belongs to a different question, still copy its full raw text here (it is used for PDF annotation positioning)
-# - `page_texts` must have one entry for EVERY page provided — never omit a page or leave `text` as an empty string unless the page is genuinely blank.
-# - Do not invent pages; include ONLY the provided pages.
-
-# Return ONLY valid JSON with clean text — no markdown, no commentary, no preamble.
-# """
-
 STUDENT_ASSIGNMENT_EXTRACTION_PROMPT_TEMPLATE = """You are an expert at extracting and structuring handwritten or typed student answers from PDF page images.
 
 CRITICAL OUTPUT REQUIREMENTS:
@@ -214,8 +147,7 @@ HOW TO IDENTIFY WHERE QUESTION {question_number} STARTS
 Question headers in marking guides appear in many formats. All of the following mean the SAME thing — the start of Question {question_number}:
   Ans.{question_number}   Ans {question_number}   Answer {question_number}   Answer:{question_number}
   Q.{question_number}     Q {question_number}      Q{question_number}         Q-{question_number}
-  Q-0{question_number}    {question_number}.        ({question_number})        [{question_number}]
-Look for ANY of these patterns (case-insensitive, with or without punctuation/spaces) followed by content.
+  Q-0{question_number}    {question_number}.        Question {question_number}
 
 IMPORTANT — the question header line may also contain the FIRST sub-section name on the same line
 (e.g. "Ans.5 Military research project (5 Marks)"). In that case:
@@ -224,16 +156,23 @@ IMPORTANT — the question header line may also contain the FIRST sub-section na
 - Any further sub-sections on subsequent lines or pages (e.g. "Fire (5 Marks)") go as additional entries
 Do NOT put sub-section names into question_title.
 
+CRITICAL — question_title must be the outermost top-level label:
+- question_title is determined from the label at the TOP of the first provided page.
+- Parenthesised numbers like "(1)", "(2)", "(a)", etc. that appear WITHIN the body of the answer are sub-section labels, NOT the question_title.
+- NEVER set question_title to a sub-section label such as "(1)" or "(a)". The question_title should reflect the actual question identifier (e.g., "Q.1", "Ans.1", "2", "Question 1").
+
 ═══════════════════════════════════════════════════
 CRITICAL — WHEN TO STOP EXTRACTING
 ═══════════════════════════════════════════════════
-A question boundary is determined by ONE thing only: a DIFFERENT question number appearing.
+ALL provided pages belong to Question {question_number}. The only exception is the LAST provided page — a different question may start partway through the last page.
 
-STOP only when you see a heading that:
+RULE: Extract everything from ALL pages EXCEPT content on the last page that appears after a new question header (a different question number).
+
+STOP only when you see a heading on the LAST page that:
   (1) matches one of the question header formats listed above, AND
   (2) carries a question number that is NOT {question_number}.
 
-A heading that does NOT contain a question number is NEVER a question boundary — it is always a sub-section or topic heading within the current question. Do not stop for it.
+Pages before the last page are fully part of Question {question_number} — do not stop early for any reason on those pages. A heading that does NOT contain a question number is NEVER a question boundary.
 
 ═══════════════════════════════════════════════════
 SUB-SECTION DETECTION (CRITICAL for theoretical/essay answers)

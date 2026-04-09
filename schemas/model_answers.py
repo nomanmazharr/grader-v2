@@ -18,8 +18,8 @@ class MarkingPoint(BaseModel):
 
 class AnswerItem(BaseModel):
     question_number: str = Field(..., description="Subquestion identifier e.g. '1.1', 'a)', '(i)'")
-    answer: Optional[str] = Field(None, description="Model answer content – no marking criteria here")
-    marking_criteria: Optional[List[MarkingPoint]] = Field(None, description="List of individual markable points")
+    answer: str = Field(..., description="Model answer content – no marking criteria here. Use empty string '' if no narrative answer exists.")
+    marking_criteria: List[MarkingPoint] = Field(default_factory=list, description="List of individual markable points. Use empty list [] if none.")
     total_marks_available: Optional[str] = Field(None, description="Marks available for this part")
     maximum_marks: Optional[str] = Field(None, description="Maximum marks if explicitly stated")
     sub_answers: Optional[List["AnswerItem"]] = Field(None, description="Nested sub-parts")
@@ -63,12 +63,12 @@ OPENAI_MODEL_ANSWER_SCHEMA = {
                         "description": "Subquestion number such as '4.1', '4.1(a)', etc. if question number explicitly present don't include heading into question number else if subsections are on base of heading only use heading in that case"
                     },
                     "answer": {
-                        "type": ["string", "null"],
-                        "description": "Model answer content for this question_number, never include marking criteria in answer"
+                        "type": "string",
+                        "description": "Model answer content for this question_number, never include marking criteria in answer. Use empty string '' if no narrative answer exists."
                     },
                     "marking_criteria": {
-                        "type": ["array", "null"],
-                        "description": "List of individual markable points from printed and handwritten criteria",
+                        "type": "array",
+                        "description": "List of individual markable points from printed and handwritten criteria. Use empty array [] if none.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -117,12 +117,12 @@ OPENAI_MODEL_ANSWER_SCHEMA = {
                                     "description": "Sub-subquestion number, don't include heading if question number explicitly present for sub answer"
                                 },
                                 "answer": {
-                                    "type": ["string", "null"],
-                                    "description": "Model answer content, don't include marking criteria in answers"
+                                    "type": "string",
+                                    "description": "Model answer content, don't include marking criteria in answers. Use empty string '' if no narrative answer exists."
                                 },
                                 "marking_criteria": {
-                                    "type": ["array", "null"],
-                                    "description": "List of individual markable points",
+                                    "type": "array",
+                                    "description": "List of individual markable points. Use empty array [] if none.",
                                     "items": {
                                         "type": "object",
                                         "properties": {

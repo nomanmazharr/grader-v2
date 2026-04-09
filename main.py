@@ -208,9 +208,6 @@ async def process_exam_async(
     if not s_ok or not student_answers_id:
         logger.error(f"Pipeline stopped: Student extraction failed for {student_name}")
         return False, "Student extraction failed", None, None
-    # question_id = "69d60b602ed125dfbb5b46a2"
-    # model_answers_id = "69d602dfd5ef48760b715a58"
-    # student_answers_id = "69d60b622ed125dfbb5b46a3"
     g_ok, g_message, grades_id = await grade_student_wrapper(
         student_name=student_name,
         question_num=question_num,
@@ -274,13 +271,13 @@ if __name__ == "__main__":
     logger.info("Async Exam Grading Pipeline")
 
     process_exam(
-        question_pdf_path='dataset/theoretical/01- Final AAD TWT Sum-26.pdf',
-        question_pages=[1],
-        question_num='1',
-        model_answer_pdf_path='dataset/theoretical/AAD Test-01 Solution Format Marking Scheme.pdf',
-        answer_pages=[1, 2],
-        student_pdf_path='dataset/theoretical/Rameesa Ayaz M. Ayaz_672959_assignsubmission_file_/Audit test 1 Rameesa Ayaz M. Ayaz_672959.pdf',
-        student_pages=[1],
+        question_pdf_path='dataset_theoretical/ICPR01(ME4)DEC24_Qs - Orchid_d2 viewing.pdf',
+        question_pages=[9, 10],
+        question_num='4',
+        model_answer_pdf_path='dataset_theoretical/ICAEW_2024_AA_Mock_Orchid_As_GAP_marked up (2024).pdf',
+        answer_pages=[19, 20, 21, 22],
+        student_pdf_path='dataset_theoretical/Claudia Wren_494629_assignsubmission_file_C.Wren Gap exam.pdf',
+        student_pages=[6, 7],
         student_name='M_Danial_Khan',
         output_dir='annotations',
         question_type='theoretical'

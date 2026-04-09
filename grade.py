@@ -248,6 +248,25 @@ class StudentGrader:
                 return float(m.group(1))
             return None
 
+        # 0. Document-level total_marks — try first since the document is already
+        # scoped to a single question and its total_marks is the authoritative total.
+        if isinstance(questions_data, dict):
+            q_total_raw = questions_data.get("total_marks")
+            if q_total_raw is not None:
+                q_text = str(q_total_raw)
+                for pattern in (
+                    r"maximum\s*marks?\s*[:=]?\s*(\d+(?:\.\d+)?)",
+                    r"max(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?)",
+                ):
+                    m = re.search(pattern, q_text, flags=re.IGNORECASE)
+                    if m:
+                        logger.info(f"Using document-level total_marks for Q{self.question_number}: {m.group(1)}")
+                        return float(m.group(1))
+                v = _best_from_nums(_parse_nums(q_text))
+                if v:
+                    logger.info(f"Using document-level total_marks for Q{self.question_number}: {v}")
+                    return v
+
         # 1. Try to find marks for the specific question being graded.
         if isinstance(questions_data, dict):
             questions_list = questions_data.get("questions")
@@ -332,25 +351,7 @@ class StudentGrader:
                             logger.info(f"Using trailing marks from question content for Q{self.question_number}: {v}")
                             return v
 
-        # 2. Document-level total_marks — use only when there's a single question
-        #    (otherwise it's likely the whole-paper total, not per-question).
-        if isinstance(questions_data, dict):
-            questions_list = questions_data.get("questions")
-            is_single_question = not isinstance(questions_list, list) or len(questions_list) <= 1
-
-            q_total_raw = questions_data.get("total_marks")
-            if q_total_raw is not None and is_single_question:
-                q_text = str(q_total_raw)
-                for pattern in (
-                    r"maximum\s*marks?\s*[:=]?\s*(\d+(?:\.\d+)?)",
-                    r"max(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?)",
-                ):
-                    m = re.search(pattern, q_text, flags=re.IGNORECASE)
-                    if m:
-                        return float(m.group(1))
-                v = _best_from_nums(_parse_nums(q_text))
-                if v:
-                    return v
+        # 2. (Skipped — document-level total_marks already handled in step 0.)
 
         # 3. LLM-reported total from main_grade.
         if main_grade and isinstance(main_grade, dict):

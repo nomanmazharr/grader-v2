@@ -2125,16 +2125,8 @@ def annotate_pdf(
                                 max_y_per_page=max_y_per_page,
                             )
                             if kp_rect and kp_page == page_num:
-                                # Hard y-boundary guard: even if resolve passed it through,
-                                # reject if it falls outside this question's known Y range.
-                                kp_y = kp_rect.y0
-                                q_min_y = min_y_per_page.get(page_num, 0)
-                                q_max_y = max_y_per_page.get(page_num, float('inf'))
-                                if kp_y >= q_min_y and kp_y <= q_max_y:
-                                    tick_rect = kp_rect
-                                    logger.info(f"      Tick anchored to key_phrase: '{tick_anchor}'")
-                                else:
-                                    logger.info(f"      Tick key_phrase out of Q boundary (y={kp_y:.0f}, range [{q_min_y:.0f}, {q_max_y:.0f}]), using evidence rect")
+                                tick_rect = kp_rect
+                                logger.info(f"      Tick anchored to key_phrase: '{tick_anchor}'")
 
                         num_ticks = max(1, int(pt_marks / 0.5))
                         _place_ticks(page, tick_rect, num_ticks)
