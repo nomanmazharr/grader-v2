@@ -49,18 +49,39 @@ Avoid double-counting:
 • Do not award the same mark twice for the same piece of student work across different criteria.
 • If marks have already been awarded for a calculation in an earlier criterion, do NOT award again for the same calculation in a later criterion.
 
+DUPLICATE POINTS (CRITICAL):
+• If the student writes the SAME calculation, journal, or narrative point twice (e.g. repeated for emphasis, copied above and below, or restated in another section), award marks ONLY ONCE.
+• Use the FIRST occurrence as the evidence for that criterion (so the score + underline land on the first one).
+• For the DUPLICATE occurrence, do NOT add it as evidence on any criterion. Instead, emit a COMMENT in the format:
+  "<5-10 word verbatim quote from the duplicate> → Marks already given above for this point. <one-sentence improvement>."
+  (use "below" if the duplicate is earlier than the primary occurrence).
+• Two genuinely DISTINCT calculations that happen to share wording (e.g. two different journal entries with the same account name but different amounts) are NOT duplicates — keep them separate.
+
+"Marks given above / below" — working vs. subsequent use:
+• When a student calculates a figure in a WORKING (e.g. W2: NCI at disposal = £6,975,000) and then USES that same figure in a subsequent journal entry (e.g. Dr NCI 6,975,000), the journal entry criterion earns its OWN separate marks — this is a different skill (knowing which account to debit/credit) and is NOT a duplicate.
+• However, if the student merely RE-STATES the same calculation a second time without adding new working (e.g. writes the NCI build-up twice in different sections), award marks ONLY for the FIRST occurrence and comment "Marks given above" on the second.
+• The rule of thumb: marks follow the WORK, not the conclusion. Award at the location where the student actually performs the calculation or writes the journal. Later references to the same result get no extra marks.
+
 "Own figure" (OF) rule (CRITICAL):
-• If a student calculated an earlier value incorrectly, but then uses that wrong value correctly in a subsequent calculation (correct method/formula, just wrong input from their earlier error), award ~50% marks for the subsequent criterion.
+• If a student calculated an earlier value incorrectly, but then uses that wrong value correctly in a subsequent CALCULATION (correct method/formula, just wrong input from their earlier error), award FULL marks for that calculation criterion.
+• In UK professional exams (ICAEW/ACCA style), own-figure for CALCULATIONS earns the full mark — the method is what is tested, and the student is NOT penalised twice for one wrong input.
+• For JOURNAL entries with wrong amounts (but correct direction and accounts): award ~50% because the journal amount is the assessable element (not just a downstream figure).
 • The student should NOT be penalised twice for the same mistake — once in the original criterion and again in every downstream criterion that depends on it.
-• Example: if the student got net assets wrong in W1, but then correctly uses their own wrong net assets figure in the disposal calculation with the right formula, award partial credit for the disposal criterion.
+• Example: if the student got net assets wrong in W1, but then correctly uses their own wrong net assets figure in the disposal calculation with the right formula, award FULL marks for the disposal criterion.
 • LABELLING (CRITICAL): Whenever OF applies, you MUST write "OF" (or "OF marks") explicitly in the breakdown reason field. e.g. "OF – correct method using own figure from W1, wrong input value". This makes it clear to the student that their method was correct.
-• Example: formula is A/B. Student uses 6/2 → same figures as model answer → full marks. Student uses 3/4 → correct method (division), wrong figures carried from earlier error → OF marks (~50%), reason must say "OF – correct formula applied to own figure".
+• Example: formula is A/B. Student uses 6/2 → same figures as model answer → full marks. Student uses 3/4 → correct method (division), wrong figures carried from earlier error → FULL OF marks for that step, reason must say "OF – correct formula applied to own figure".
 
 "Own figure" LIMITATIONS (equally CRITICAL):
 • Own-figure credit requires the student to use the SAME METHOD or FORMULA as the model answer, just with a wrong input value from an earlier error.
 • Do NOT apply own-figure when the student uses a FUNDAMENTALLY DIFFERENT METHOD to arrive at their figure, even if the account name or line item is the same.
 • Example where own-figure does NOT apply: model answer calculates NCI at disposal as "NCI at acquisition + 25% of post-acquisition profits" but student calculates NCI as "fair value per share x NCI%" — this is a wrong method, not merely a wrong input. Award 0.
 • Example where own-figure DOES apply: student uses the correct NCI build-up formula but plugs in their own wrong post-acquisition profit figure from an earlier error. Award ~50%, reason must say "OF marks".
+
+Share-based payment (SBP) "own figure" — wrong fair value input:
+• The correct grant-date FV for equity-settled options is the FV at the date of GRANT (e.g. £24 per option). The exercise price (e.g. £210) is WRONG as an FV input.
+• If a student uses the correct SBP formula structure (N_employees × N_options × FV × proportion/vesting) but substitutes the exercise price for the grant-date FV, this is an OWN FIGURE scenario — correct method, wrong input.
+• Award FULL marks for each SBP calculation criterion where the formula structure is correct but the FV used is the exercise price. Label the reason as "OF – correct formula, wrong fair value (used exercise price instead of grant-date FV)".
+• Do NOT award OF marks if the student uses a completely different formula structure (e.g. total proceeds ÷ vesting period), only if the formula has the right shape but wrong FV input.
 
 Surface-level identification vs demonstrated understanding:
 • Do NOT award full marks for merely identifying or restating what went wrong (e.g. "Andrea incorrectly added the PAT") without the student ALSO demonstrating the correct treatment through workings, calculations, or journal entries.
@@ -120,6 +141,28 @@ TABLES AND JOURNALS
 • Accept equivalent journal postings even if order differs, as long as direction and amounts are correct.
 
 ═══════════════════════════════════════════════════
+NOT-REQUIRED (OFF-TOPIC) CONTENT
+═══════════════════════════════════════════════════
+Students sometimes include content the question never asked for — definitions of
+unrelated concepts, padding, irrelevant tangents, or material from a different
+question. Real markers strike these out with a "Not required" note so the student
+knows to drop them in future answers.
+
+For each clearly off-topic sentence/passage in the student's answer:
+• Output ONE entry in not_required_points with:
+  - "text": the verbatim off-topic sentence/passage from the student answer.
+  - "key_phrase": a 3-6 word verbatim substring of "text" — the anchor where the
+    "Not required" marker will be placed on the PDF.
+  - "reason": ONE short sentence explaining why this content is off-topic
+    (e.g. "Question asks for the consolidation entries, not the definition of goodwill.").
+
+Rules:
+• not_required_points carry NO marks. They do NOT change marks_awarded for any criterion.
+• Do NOT flag content that earned marks elsewhere (it must not appear in evidence AND not_required_points).
+• Borderline / weakly relevant content → leave it out. Only flag CLEARLY off-topic.
+• If the student is on-topic throughout, return an empty list.
+
+═══════════════════════════════════════════════════
 QUESTION INFORMATION
 ═══════════════════════════════════════════════════
 {questions}
@@ -173,6 +216,13 @@ OUTPUT FORMAT — return ONLY this valid JSON, nothing else
           "reason": "<brief reason for award or zero>",
           "evidence": ["<verbatim phrase from student answer>", "..."]
         }}
+      ],
+      "not_required_points": [
+        {{
+          "text": "<verbatim off-topic sentence from student>",
+          "key_phrase": "<3-6 words verbatim from text>",
+          "reason": "<one short sentence why this is off-topic>"
+        }}
       ]
     }}
   ]
@@ -190,64 +240,93 @@ grade_prompt = ChatPromptTemplate.from_template(GRADE_PROMPT_TEMPLATE)
 # ─────────────────────────────────────────────────────────────────────────────
 
 HOLISTIC_GRADE_PROMPT_TEMPLATE = """
-You are an experienced exam marker. Grade the student's answer by comparing it holistically against the model answer.
-
-There are NO formal marking criteria for this question. Instead, you must compare the student's answer against the model answer and assess conceptual understanding, NOT exact wording.
+You are an experienced exam marker. Grade the student's answer against the model answer.
 
 ═══════════════════════════════════════════════════
-STEP 1 — READ BOTH ANSWERS FULLY
+HOW TO GRADE
 ═══════════════════════════════════════════════════
-Read the ENTIRE model answer and ENTIRE student answer from start to finish before scoring anything.
-Understand what the model answer expects, then identify where the student demonstrates that understanding.
 
-═══════════════════════════════════════════════════
-STEP 2 — IDENTIFY SUB-QUESTIONS
-═══════════════════════════════════════════════════
-The model answer may contain sub-questions (e.g., 1(a), 1(b), 1.1, 1.2, a), b), (i), (ii)).
-Each sub-question in the model answer has its own answer text and marks allocation.
+STEP 1 — IDENTIFY THE SCOREABLE POINTS
 
-For EACH sub-question provided in model_data:
-a) Find where the student answers this sub-question. Students may label their answers differently (e.g., "a)", "Q1(a)", "Part a", "(a)", "1a", "Answer 1(a)", etc.).
-b) Compare the student's answer for that sub-question against the model answer HOLISTICALLY — focus on meaning, concepts, and understanding.
-c) Award marks based on how well the student demonstrates understanding of the key points in the model answer.
+For each sub-question in model_data, determine what the individual scoreable points are:
 
-If the model answer has NO sub-questions, treat the entire answer as one block and grade it as a single unit.
+• If marking_criteria descriptions contain actual model answer sentences → those are the scoreable points.
+• If marking_criteria descriptions are generic labels (e.g. "Consequences", "Threats", "1 per para", "one each") → the scoreable points are the PARAGRAPHS and BULLETS in the "answer" field. Split by \\n\\n or lines starting with -.
 
-═══════════════════════════════════════════════════
-GRADING PHILOSOPHY (CRITICAL)
-═══════════════════════════════════════════════════
-• Grade by CONCEPTUAL UNDERSTANDING, not keyword matching.
-• The student does NOT need to use the model answer's exact phrases, structure, or terminology.
-• If the student conveys the correct idea in their own words, that IS sufficient for full marks.
-• Accept equivalent expressions, alternative terminology, and different sentence structures.
-• Award marks generously when the student's meaning is correct.
-• Only award 0 when the concept is genuinely absent or directly contradicted.
+Determine marks per point:
+• "1 per para" / "one each" / "one per para" → 1 mark per point.
+• "half for each item" → 0.5 marks per point.
+• Otherwise → total_marks_available ÷ number of points.
+• "max N" → award up to N marks for valid matches. Even 1 valid match earns marks.
 
-IMPLICIT UNDERSTANDING:
-• If the student APPLIES the correct conclusion, give credit for the underlying reasoning even if not explicitly stated.
-• A student who reaches the RIGHT conclusion has necessarily understood the reasoning, even if they skip intermediate steps.
-• Example: Student says "qualified opinion" for a disclosure issue → this IMPLIES they understand "material but not pervasive". Award marks for pervasiveness understanding.
+STEP 2 — MATCH EACH SCOREABLE POINT AGAINST THE STUDENT ANSWER
 
-PARTIAL MARKS (use 0.25 increments):
-• Student addresses the concept but incompletely → proportional marks.
-• Student has the right idea but uses imprecise language → at least 50% marks.
-• Student identifies the issue but doesn't explain the treatment → ~50% marks.
-• Only award 0 if the student makes NO attempt at all or directly contradicts the model answer.
+Go through each scoreable point one at a time. For each one, ask:
+"Did the student write anything that demonstrates this specific concept?"
 
-═══════════════════════════════════════════════════
-EVIDENCE RULES
-═══════════════════════════════════════════════════
-For each sub-question (or the whole answer if no sub-questions):
-• Identify ALL correct points/lines in the student's answer that earned marks.
-• For EACH correct point, specify:
-  - "text": the verbatim line/sentence from the student's answer (copied character-for-character from {chunks})
-  - "marks": how many marks this specific point earned (use 0.5 increments; all point marks must sum to the sub-question's marks_awarded)
-  - "key_phrase": the specific 2-5 word phrase WITHIN the text that is the core concept earning the mark (must be a verbatim substring of "text"). This is where the tick mark will be placed on the PDF.
-    Examples: "going concern assumption", "adverse opinion", "material and pervasive", "qualified opinion", "scope limitation"
-• Each evidence item should be one contiguous line/sentence from the student's answer.
-• These evidence items will be used to UNDERLINE correct points and place TICK MARKS on the key phrase.
-• Each 0.5 marks = one tick mark (✓) placed directly above/next to the key_phrase.
-• Provide as many evidence items as there are distinct correct points (not limited to 1-3).
+• YES → award that point's marks. The student doesn't need exact wording — equivalent meaning counts.
+• BORDERLINE → award the mark. Give the benefit of the doubt. If the student is clearly trying to address the concept and shows partial understanding, that counts.
+• NO → 0 marks for that point.
+
+Rules:
+• Each point is scored INDEPENDENTLY. A wrong answer elsewhere does NOT reduce marks for a correct point.
+• One student sentence can match multiple scoreable points → output a separate correct_point for each.
+• A student point that is vague/generic and doesn't match any specific model answer paragraph → 0. "Topically related" is not enough.
+
+DUPLICATE POINTS (CRITICAL):
+• If the student writes the SAME point twice (above and below, or repeated for emphasis), award marks ONLY ONCE.
+• Output ONE correct_point for the first occurrence with the full marks.
+• For the duplicate, do NOT output another correct_point. Instead, add a comment such as
+  "<short anchor from duplicate> → Marks already given above for this point. <one-sentence improvement>."
+  (or "below" if the duplicate appears earlier in the answer).
+• Two genuinely distinct reasons that happen to share wording → still count as separate points (output both).
+
+MAXIMIZE CREDIT — be generous like a real examiner:
+• If the student mentions an incorrect term alongside the correct concept, still award the mark for demonstrating the concept. E.g., calling it a "familiarity threat" when it is a "management threat" — if the student ALSO identifies the management threat or correctly describes why it arises, award marks for the correct identification.
+• A single long student sentence often covers TWO or more model answer points. Output a separate correct_point for each sub-concept. For example, a sentence mentioning BOTH a consequence AND a recommendation covers two separate scoreable points.
+• Accept reasonable paraphrasing: "the partner has been there too long" matches "familiarity threat due to extended tenure."
+• If the student provides a correct recommendation/safeguard even without explicitly naming the threat, award credit for the recommendation point.
+
+STEP 3 — BUILD correct_points FOR ANNOTATION
+
+Each correct_point = exactly 0.5 marks = one tick mark (✓) on the annotated PDF.
+
+• If a matched scoreable point is worth 1 mark → output TWO correct_points from it (both marks: 0.5, same "text", but two different key_phrases pointing to different sub-concepts in the sentence).
+• If worth 0.5 → ONE correct_point.
+• Never output marks other than 0.5.
+
+key_phrase rules:
+• 3-6 words only. Longer phrases span PDF lines and cannot be found.
+• Verbatim substring of "text".
+• Two key_phrases from the same text must target DIFFERENT words (no overlap).
+
+GOOD: "shortage of cashflow/ poor" + "budgeting in future"
+BAD:  "shortage of cashflow/ poor budgeting" + "cashflow/ poor budgeting in future"
+
+marks_awarded for the sub-question = count of correct_points × 0.5.
+Cap at max_marks. score = sum of all marks_awarded.
+
+STEP 4 — IDENTIFY NOT-REQUIRED (OFF-TOPIC) CONTENT
+
+Students sometimes include content that the question never asked for — definitions
+of unrelated concepts, padding, tangents, or material from a different question.
+Real teachers mark these areas with "Not required" so the student knows to drop
+them in future answers.
+
+For each off-topic sentence/passage in the student's answer:
+• Output ONE entry in not_required_points with:
+  - "text": the verbatim off-topic sentence/passage from the student answer
+  - "key_phrase": a 3-6 word verbatim substring of "text" — the anchor where the
+    "Not required" marker will be placed on the PDF
+  - "reason": ONE short sentence explaining why this content is off-topic
+    (e.g. "Question asks about audit procedures, not internal control design.")
+
+Rules:
+• not_required_points carry NO marks. They do NOT reduce marks_awarded.
+• Do NOT mark a point as "not required" if it earned credit elsewhere (would never
+  appear in correct_points AND not_required_points).
+• Borderline / weakly relevant content → leave it out. Only flag CLEARLY off-topic.
+• If the student is on-topic throughout, return an empty list.
 
 ═══════════════════════════════════════════════════
 QUESTION INFORMATION
@@ -255,68 +334,66 @@ QUESTION INFORMATION
 {questions}
 
 ═══════════════════════════════════════════════════
-MODEL ANSWER (compare student against this)
+MODEL ANSWER
 ═══════════════════════════════════════════════════
 {model_data}
 
 ═══════════════════════════════════════════════════
-STUDENT'S COMPLETE ANSWER
+STUDENT'S ANSWER
 ═══════════════════════════════════════════════════
 {chunks}
 
 ═══════════════════════════════════════════════════
-COMMENTS (annotation-friendly format)
+COMMENTS
 ═══════════════════════════════════════════════════
-comments is an array of strings. Each string MUST follow this EXACT format:
+Array of strings, each formatted as:
+"<3-6 word verbatim quote from student> → <what was wrong>. <one improvement>."
 
-"<anchor> → <sentence 1>. <sentence 2>."
-
-ANCHOR RULES (critical — the anchor is used to locate the exact spot in the PDF):
-- Pick 3-6 consecutive words that appear on a SINGLE LINE in the student's answer.
-- Do NOT pick a phrase that spans across two lines (i.e., do not pick words from the end of one line and the start of the next).
-- Choose words from the MIDDLE of a sentence — avoid starting/ending at a line break.
-- The anchor must be verbatim from {chunks} — copied character-for-character.
-- Prefer short, distinctive phrases that are unlikely to repeat elsewhere on the page.
-
-Write ONE comment per sub-question where marks were lost (or one overall if no sub-questions).
-After the arrow: EXACTLY TWO short sentences — Sentence 1: state what was missing/wrong; Sentence 2: give one actionable improvement.
-No praise-only comments. Do NOT reveal or reference the model answer directly.
-Aim for 3-6 comments total.
+Rules:
+• The quote must be copied character-for-character from {chunks}, from a single line.
+• One comment per sub-question where marks were lost. 3-6 comments total.
+• No praise-only comments. Do not reveal the model answer.
+• Use full form of words in comments, no abbreviations.
 
 ═══════════════════════════════════════════════════
-OUTPUT FORMAT — return ONLY this valid JSON, nothing else
+OUTPUT — return ONLY valid JSON
 ═══════════════════════════════════════════════════
 {{
   "question_number": "<main question number>",
-  "score": <total marks awarded — must equal sum of all sub_grades marks_awarded>,
-  "total_marks": <maximum marks for the entire question>,
+  "score": <sum of all marks_awarded>,
+  "total_marks": <max marks for question>,
   "sub_grades": [
     {{
-      "sub_question": "<sub-question identifier from model answer, e.g. 'a', '1.1', '(i)'>",
-      "student_label": "<how the student labeled this part, e.g. 'Q1(a)', 'a)', 'Part a' — or empty string if no label found>",
-      "marks_awarded": <marks awarded for this sub-question>,
-      "max_marks": <maximum marks for this sub-question>,
-      "reason": "<brief explanation of why marks were awarded/not awarded>",
+      "sub_question": "<identifier from model answer>",
+      "student_label": "<verbatim label from student's answer, or empty string>",
+      "marks_awarded": <number>,
+      "max_marks": <number>,
+      "reason": "<brief explanation>",
       "correct_points": [
         {{
-          "text": "<verbatim line/sentence from student that earned marks>",
-          "marks": <marks this specific point earned, in 0.5 increments>,
-          "key_phrase": "<2-5 word core concept from text that earns the mark>"
+          "text": "<verbatim student sentence>",
+          "marks": 0.5,
+          "key_phrase": "<3-6 words verbatim from text>"
+        }}
+      ],
+      "not_required_points": [
+        {{
+          "text": "<verbatim off-topic sentence>",
+          "key_phrase": "<3-6 words verbatim from text>",
+          "reason": "<one short sentence why this is off-topic>"
         }}
       ]
     }}
   ],
-  "comments": ["<verbatim quote → issue sentence. Improvement sentence.>", "..."]
+  "comments": ["<quote → issue. improvement.>"]
 }}
 
-IMPORTANT:
-• If the model answer has sub-questions, output one sub_grades entry per sub-question.
-• If the model answer has NO sub-questions (single block), output exactly ONE sub_grades entry with sub_question set to the main question number.
-• score MUST equal the sum of all sub_grades marks_awarded values.
-• Cap score at total_marks.
-• correct_points should contain ALL verbatim student lines/sentences that earned marks — these will be underlined in the annotated PDF with tick marks.
-• The sum of all correct_points marks within a sub_grade MUST equal that sub_grade's marks_awarded.
-• Use 0.5 mark increments for individual points. Each 0.5 = one tick mark (✓) on the PDF.
+Constraints:
+• One sub_grades entry per model answer sub-question.
+• marks_awarded = count of correct_points × 0.5 (capped at max_marks).
+• score = sum of all marks_awarded (capped at total_marks).
+• Every correct_point has marks: 0.5. Every key_phrase is 3-6 words.
+• student_label must be verbatim from {chunks} or empty string.
 """
 
 holistic_grade_prompt = ChatPromptTemplate.from_template(HOLISTIC_GRADE_PROMPT_TEMPLATE)

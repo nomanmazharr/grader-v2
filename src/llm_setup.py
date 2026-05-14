@@ -95,21 +95,20 @@ def _build_chat_model(provider: str, model: str, temperature: float = 0):
     if provider == "openai":
         return ChatOpenAI(
             model=model,
-            api_key=openai_api,
+            api_key=openai_api,  # type: ignore[arg-type]
             temperature=temperature,
         )
     if provider in ["anthropic", "claude"]:
-        return ChatAnthropic(
-            model=model,
-            api_key=anthropic_api,
-            temperature=temperature,
-            max_tokens=16384,
+        return ChatAnthropic(  # type: ignore[call-arg]
+            model=model,  # type: ignore[call-arg]
+            api_key=anthropic_api,  # type: ignore[arg-type]
+            max_tokens=16000,  # type: ignore[call-arg]  # Anthropic default is ~1024; grading 82 criteria needs far more
             max_retries=2,
         )
     if provider in ["xai", "grok"]:
-        return ChatXAI(
+        return ChatXAI(  # type: ignore[call-arg]
             model=model,
-            xai_api_key=xai_api,
+            xai_api_key=xai_api,  # type: ignore[arg-type]
             temperature=temperature,
             max_retries=2,
         )

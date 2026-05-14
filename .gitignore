@@ -1,3 +1,4 @@
+dev/
 base/
 __pycache__/
 .env
@@ -16,3 +17,7 @@ scripts/
 reqi.txt
 testing_mehreen/
 .claude/settings.local.json
+PAC_grade_breakdown.txt
+grade_breakdown_v7.txt
+grade_detail_v7.txt
+pyrightconfig.json

@@ -13,10 +13,19 @@ from llm_setup import llm_grader
 from logging_config import logger
 from schemas.student_grades import StudentGradeDocument
 from database.mongodb import get_collection
+from errors import GradingError, classify_error
 
 
-class GradingError(Exception):
-    pass
+class NotRequiredPoint(BaseModel):
+    text: str = Field(..., description="Verbatim line/sentence from student that is off-topic / not required")
+    key_phrase: str = Field("", description="3-6 word verbatim anchor within text where the 'Not required' marker is placed")
+    reason: str = Field("", description="One-sentence reason this content is off-topic or not asked for")
+
+
+class CorrectPoint(BaseModel):
+    text: str = Field(..., description="Verbatim line/sentence from student that earned marks")
+    marks: float = Field(..., ge=0, description="Marks this specific point earned (0.5 increments)")
+    key_phrase: str = Field("", description="2-5 word core concept within text where tick mark is placed")
 
 
 class LLMGradingBreakdownItem(BaseModel):
@@ -35,6 +44,10 @@ class LLMGradingItem(BaseModel):
     comments: list[str] = Field(default_factory=list, description="Feedback comments")
     correct_words: list[str] = Field(default_factory=list, description="Verbatim correct phrases")
     breakdown: list[LLMGradingBreakdownItem] = Field(default_factory=list, description="Per-criterion breakdown")
+    not_required_points: list[NotRequiredPoint] = Field(
+        default_factory=list,
+        description="Off-topic / irrelevant content flagged for the student (no marks impact)",
+    )
 
 
 class LLMGradingResponse(BaseModel):
@@ -42,11 +55,6 @@ class LLMGradingResponse(BaseModel):
 
 
 # ── Holistic grading models (no-criteria theoretical questions) ──
-
-class CorrectPoint(BaseModel):
-    text: str = Field(..., description="Verbatim line/sentence from student that earned marks")
-    marks: float = Field(..., ge=0, description="Marks this specific point earned (0.5 increments)")
-    key_phrase: str = Field("", description="2-5 word core concept within text where tick mark is placed")
 
 
 class HolisticSubQuestionGrade(BaseModel):
@@ -56,6 +64,7 @@ class HolisticSubQuestionGrade(BaseModel):
     max_marks: float = Field(..., ge=0, description="Maximum marks for this sub-question")
     reason: str = Field("", description="Brief explanation of why marks were awarded/not awarded")
     correct_points: list[CorrectPoint] = Field(default_factory=list, description="Correct points with per-point marks")
+    not_required_points: list[NotRequiredPoint] = Field(default_factory=list, description="Off-topic / irrelevant content that earns no marks but is flagged for the student")
 
 
 class HolisticGradingResponse(BaseModel):
@@ -115,6 +124,10 @@ class StudentGrader:
         # Used to (a) prevent the LLM from inventing criteria and (b) enforce max_possible.
         self._allowed_criteria_last_run: set[str] = set()
         self._criterion_max_map_last_run: dict[str, float] = {}
+        self._criterion_category_map_last_run: dict[str, str] = {}
+        # Criteria that require the exact expected number (no OF bypass allowed).
+        # Populated from rubric fields with exact_match=True.
+        self._exact_match_criteria_last_run: set[str] = set()
         # Cache rubric order (description → position) for post-processing heuristics.
         self._rubric_criteria_order_last_run: list[str] = []
         self._rubric_position_last_run: dict[str, int] = {}
@@ -627,7 +640,7 @@ class StudentGrader:
         # Match if the leading digit(s) agree (e.g. "Ans.1" vs "Q.1" → "1" == "1")
         return a_digits == q_digits or a_digits.startswith(q_digits) or q_digits.startswith(a_digits)
 
-    def _flatten_model_answers(self, model_data: dict) -> dict:
+    def _flatten_model_answers(self, model_data: dict, questions_data: Optional[dict] = None) -> dict:
         if not isinstance(model_data, dict):
             return model_data
 
@@ -703,10 +716,15 @@ class StudentGrader:
                         existing["marks"] = marks_num
                     continue
 
-                out.append({
+                _entry: dict[str, Any] = {
                     "marks": marks_num if marks_num is not None else marks,
                     "description": desc,
-                })
+                }
+                if it.get("category"):
+                    _entry["category"] = it["category"]
+                if it.get("exact_match"):
+                    _entry["exact_match"] = it["exact_match"]
+                out.append(_entry)
                 key_to_index[key] = len(out) - 1
 
             return out
@@ -1137,10 +1155,11 @@ class StudentGrader:
                         logger.debug(f"Skipping section heading criterion: '{description}' ({marks} marks)")
                         continue
 
-                combined_criteria.append({
-                    "marks": marks,
-                    "description": description,
-                })
+                _cat = str(criteria_item.get("category", "") or "").strip()
+                _crit_entry: dict[str, Any] = {"marks": marks, "description": description}
+                if _cat:
+                    _crit_entry["category"] = _cat
+                combined_criteria.append(_crit_entry)
 
         for answer in answers:
             if not isinstance(answer, dict):
@@ -1191,26 +1210,57 @@ class StudentGrader:
 
             # Build sub-question structure from model answer for holistic prompt.
             # Each answer entry with a distinct question_number becomes a sub-question.
+
+            # Build a lookup of sub-question marks from the question paper (authoritative).
+            # This covers both direct sub_questions and nested structures.
+            _paper_sq_marks: dict[str, float] = {}
+            if isinstance(questions_data, dict):
+                def _collect_sq_marks(sq_list: list) -> None:
+                    for sq in sq_list:
+                        if not isinstance(sq, dict):
+                            continue
+                        sq_label = str(sq.get("question_number", "")).strip()
+                        raw_marks = sq.get("marks")
+                        if sq_label and raw_marks is not None:
+                            nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", str(raw_marks))]
+                            if nums:
+                                _paper_sq_marks[sq_label] = max(nums)
+                        nested = sq.get("sub_questions")
+                        if nested:
+                            _collect_sq_marks(nested)
+
+                for q in (questions_data.get("questions") or []):
+                    if isinstance(q, dict):
+                        _collect_sq_marks(q.get("sub_questions") or [])
+
             holistic_subs: list[dict] = []
             for answer in answers:
                 if not isinstance(answer, dict):
                     continue
                 sq_num = str(answer.get("question_number", "")).strip()
                 sq_answer = str(answer.get("answer", "") or "").strip()
-                # Try to get max marks from the answer entry
-                sq_marks = 0.0
-                for marks_key in ("total_marks_available", "maximum_marks", "marks"):
-                    raw = answer.get(marks_key)
-                    if raw is not None:
-                        nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", str(raw))]
-                        if nums:
-                            sq_marks = max(nums)
-                            break
+                # Use question-paper marks as the authoritative cap; fall back to
+                # maximum_marks from the model answer (never total_marks_available,
+                # which can exceed the capped mark).
+                sq_marks = _paper_sq_marks.get(sq_num, 0.0)
+                if not sq_marks:
+                    for marks_key in ("maximum_marks", "marks"):
+                        raw = answer.get(marks_key)
+                        if raw is not None:
+                            nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", str(raw))]
+                            if nums:
+                                sq_marks = max(nums)
+                                break
+                # Include marking_criteria when present — the LLM will use per-point
+                # weights (e.g. 0.5 per bullet) to score each point individually.
+                # When empty/absent the LLM falls back to pure holistic judgement.
+                sq_criteria = answer.get("marking_criteria") or []
                 if sq_num and sq_answer:
                     holistic_subs.append({
                         "sub_question": sq_num,
                         "answer": sq_answer,
                         "max_marks": sq_marks,
+                        "marking_criteria": sq_criteria,
                     })
 
             # If only one sub-question or all share the same number, treat as single block
@@ -1279,6 +1329,8 @@ class StudentGrader:
         """
         allowed: set[str] = set()
         max_map: dict[str, float] = {}
+        cat_map: dict[str, str] = {}
+        exact_match: set[str] = set()
         ordered: list[str] = []
         pos_map: dict[str, int] = {}
 
@@ -1287,6 +1339,8 @@ class StudentGrader:
             if not isinstance(answers, list) or not answers:
                 self._allowed_criteria_last_run = set()
                 self._criterion_max_map_last_run = {}
+                self._criterion_category_map_last_run = {}
+                self._exact_match_criteria_last_run = set()
                 self._rubric_criteria_order_last_run = []
                 self._rubric_position_last_run = {}
                 return
@@ -1296,6 +1350,8 @@ class StudentGrader:
             if not isinstance(criteria, list):
                 self._allowed_criteria_last_run = set()
                 self._criterion_max_map_last_run = {}
+                self._criterion_category_map_last_run = {}
+                self._exact_match_criteria_last_run = set()
                 self._rubric_criteria_order_last_run = []
                 self._rubric_position_last_run = {}
                 return
@@ -1326,10 +1382,19 @@ class StudentGrader:
                 prev = max_map.get(desc)
                 if prev is None or max_marks > prev:
                     max_map[desc] = max_marks
+                # Cache category from rubric (LLM output never includes this field).
+                cat_val = str(it.get("category", "") or "").strip().lower()
+                if cat_val and desc not in cat_map:
+                    cat_map[desc] = cat_val
+                # Cache exact_match flag — disables OF bypass for this criterion.
+                if it.get("exact_match"):
+                    exact_match.add(desc)
 
         finally:
             self._allowed_criteria_last_run = allowed
             self._criterion_max_map_last_run = max_map
+            self._criterion_category_map_last_run = cat_map
+            self._exact_match_criteria_last_run = exact_match
             self._rubric_criteria_order_last_run = ordered
             self._rubric_position_last_run = pos_map
 
@@ -1468,7 +1533,7 @@ class StudentGrader:
         s_clean = self._clean_for_llm(s_doc, ["question", "sub_parts"])
 
         # Grade holistically by combining all sub-answers/criteria into one payload.
-        m_clean = self._flatten_model_answers(m_clean)
+        m_clean = self._flatten_model_answers(m_clean, q_clean)
 
         # Cache rubric criteria for strict post-processing.
         self._cache_rubric_criteria(m_clean)
@@ -1949,10 +2014,19 @@ class StudentGrader:
         breakdown = []
         for sg in holistic_parsed.get("sub_grades", []):
             sq_label = sg.get("sub_question", "")
+
+            # Strip artificial chunk separator dashes so annotator finds real PDF text.
+            # Chunks are formatted as "--- 4.1 ---\n<answer>" so the LLM returns
+            # "--- 4.1 ---" verbatim. Strip to just "4.1" for PDF search.
             student_label = sg.get("student_label", "")
+            student_label = re.sub(r'^[-\s]+|[-\s]+$', '', student_label).strip()
+
             criterion_text = f"Sub-question {sq_label}" if len(holistic_parsed.get("sub_grades", [])) > 1 else f"Question {self.question_number}"
 
-            # correct_points is now list of {"text": str, "marks": float}
+            # Marks awarded for this sub-question — round to nearest 0.5.
+            marks_awarded = round(float(sg.get("marks_awarded", 0) or 0) / 0.5) * 0.5
+
+            # correct_points is now list of {"text": str, "marks": float, "key_phrase": str}
             raw_points = sg.get("correct_points", [])
             # Handle both formats: list of objects or list of strings (backward compat)
             evidence_texts = []
@@ -1960,18 +2034,75 @@ class StudentGrader:
             for pt in raw_points:
                 if isinstance(pt, dict):
                     text = str(pt.get("text", "")).strip()
+                    # Every correct_point must be exactly 0.5 marks (1 tick).
+                    # If the LLM outputs marks > 0.5, split into multiple 0.5 entries.
                     pt_marks = float(pt.get("marks", 0.5) or 0.5)
+                    pt_marks = max(0.5, round(pt_marks / 0.5) * 0.5)
                     key_phrase = str(pt.get("key_phrase", "")).strip()
+                    # Enforce max 6 words — long key_phrases span PDF lines and
+                    # can't be found by the annotator. Truncate to first 6 words.
+                    kp_words = key_phrase.split()
+                    if len(kp_words) > 6:
+                        key_phrase = " ".join(kp_words[:6])
                     if text:
                         evidence_texts.append(text)
-                        points_with_marks.append({"text": text, "marks": pt_marks, "key_phrase": key_phrase})
+                        if pt_marks == 0.5:
+                            points_with_marks.append({
+                                "text": text,
+                                "marks": 0.5,
+                                "key_phrase": key_phrase,
+                            })
+                        else:
+                            # Split into N × 0.5 entries. First entry keeps key_phrase;
+                            # subsequent entries reuse the same text (annotator underlines
+                            # the same line, placing additional ticks alongside).
+                            n_ticks = int(round(pt_marks / 0.5))
+                            for tick_i in range(n_ticks):
+                                points_with_marks.append({
+                                    "text": text,
+                                    "marks": 0.5,
+                                    "key_phrase": key_phrase if tick_i == 0 else "",
+                                })
                 elif isinstance(pt, str) and pt.strip():
                     evidence_texts.append(pt.strip())
                     points_with_marks.append({"text": pt.strip(), "marks": 0.5, "key_phrase": ""})
 
+            # Normalize: align correct_points count with marks_awarded.
+            # Each correct_point = 0.5 marks = 1 tick.
+            if points_with_marks and marks_awarded > 0:
+                target_count = int(round(marks_awarded / 0.5))
+                if len(points_with_marks) > target_count:
+                    # Too many points — trim from the end (least important).
+                    points_with_marks = points_with_marks[:target_count]
+                elif len(points_with_marks) < target_count:
+                    # Fewer evidence points than marks allow — cap to evidenced
+                    # total plus a small grace (0.5) per sub-question.
+                    evidenced_marks = len(points_with_marks) * 0.5
+                    marks_awarded = min(marks_awarded, evidenced_marks + 0.5)
+
+            # Off-topic ("Not required") points — flagged by LLM, no marks.
+            # Same key_phrase truncation rule as correct_points.
+            raw_nr = sg.get("not_required_points", []) or []
+            not_required_points: list[dict] = []
+            for nr in raw_nr:
+                if not isinstance(nr, dict):
+                    continue
+                nr_text = str(nr.get("text", "")).strip()
+                if not nr_text:
+                    continue
+                nr_kp = str(nr.get("key_phrase", "")).strip()
+                kp_words = nr_kp.split()
+                if len(kp_words) > 6:
+                    nr_kp = " ".join(kp_words[:6])
+                not_required_points.append({
+                    "text": nr_text,
+                    "key_phrase": nr_kp,
+                    "reason": str(nr.get("reason", "")).strip(),
+                })
+
             breakdown.append({
                 "criterion": criterion_text,
-                "marks_awarded": float(sg.get("marks_awarded", 0) or 0),
+                "marks_awarded": marks_awarded,
                 "max_possible": float(sg.get("max_marks", 0) or 0),
                 "reason": sg.get("reason", ""),
                 "evidence": evidence_texts,
@@ -1980,7 +2111,38 @@ class StudentGrader:
                 "_sub_question": sq_label,
                 "_student_label": student_label,
                 "_correct_points_with_marks": points_with_marks,
+                "_not_required_points": not_required_points,
             })
+
+        # Guard: if the LLM reported a non-zero score but produced no sub_grades,
+        # the structured output parsing silently dropped the breakdown. Fail loudly
+        # so the text-based fallback / repair path can try instead of saving 0/20.
+        llm_score_raw = float(holistic_parsed.get("score", 0) or 0)
+        if llm_score_raw > 0 and not breakdown:
+            raise GradingError(
+                f"Holistic LLM reported score={llm_score_raw} but returned "
+                f"0 sub_grades — structured output likely failed to parse"
+            )
+
+        # Safety cap: ensure the sum of per-sub marks doesn't exceed
+        # the LLM's own reported total score (prevents grace compounding).
+        llm_reported_score = round(float(holistic_parsed.get("score", 0) or 0) / 0.5) * 0.5
+        breakdown_sum = sum(float(b.get("marks_awarded", 0) or 0) for b in breakdown)
+        if llm_reported_score > 0 and breakdown_sum > llm_reported_score:
+            # Scale each sub-question's marks proportionally to fit the LLM total.
+            scale = llm_reported_score / breakdown_sum if breakdown_sum > 0 else 1.0
+            for b in breakdown:
+                old_m = float(b.get("marks_awarded", 0) or 0)
+                b["marks_awarded"] = round((old_m * scale) / 0.5) * 0.5
+                # Trim correct_points to match adjusted marks
+                adjusted_count = int(round(b["marks_awarded"] / 0.5))
+                pts = b.get("_correct_points_with_marks", [])
+                if len(pts) > adjusted_count:
+                    b["_correct_points_with_marks"] = pts[:adjusted_count]
+            logger.info(
+                f"Capped breakdown sum {breakdown_sum} → {llm_reported_score} "
+                f"(LLM reported score)"
+            )
 
         converted = {
             "grades": [{
@@ -2508,6 +2670,17 @@ class StudentGrader:
             if not ev_blob:
                 return False, ""
 
+            # Context guard: a criterion that explicitly names profit/contribution/revenue/income
+            # as the concept being measured requires the evidence to also contain that vocabulary.
+            # Without this, a calculation like "7,200,000*9/12" in the student's net-assets working
+            # table would be incorrectly credited for a criterion about profit contribution, purely
+            # because the arithmetic result equals the expected GBP amount.
+            _INCOME_TERMS_RE = re.compile(
+                r"\b(profit|contribution|revenue|income|earning)\b", re.IGNORECASE
+            )
+            if _INCOME_TERMS_RE.search(criterion_text) and not _INCOME_TERMS_RE.search(ev_blob):
+                return False, ""
+
             # Find candidate expressions like 7200000*9/12 or (7200000*9/12)
             expr_re = re.compile(
                 r"[0-9][0-9,]*(?:\.[0-9]+)?(?:\s*[mk])?(?:\s*[+\-*/x×]\s*\(?\s*[0-9][0-9,]*(?:\.[0-9]+)?(?:\s*[mk])?\s*\)?)+",
@@ -2777,11 +2950,19 @@ class StudentGrader:
                 return True
 
             # Only enforce this alignment guardrail for narrative criteria.
-            # Numeric/method criteria (with numbers, ratios, Dr/Cr journals) are better handled by the
+            # Numeric/method criteria (with GBP amounts, large calculations) are better handled by the
             # other guardrails (evidence-present, taint check, strict-number match for full marks).
             # Enforcing alignment here tends to incorrectly revoke legitimate own-figure work.
+            # HOWEVER: criteria whose only digits are dates or small ordinals (e.g. "31 May 20X4",
+            # "within 30 days") are still narrative criteria — keep alignment enforcement for those.
             if re.search(r"\d", crit_norm):
-                return True
+                # Has a large number (3+ digits) or explicit GBP/currency marker → numeric criterion.
+                has_large_num = bool(re.search(r"\b\d{3,}\b", crit_norm))
+                has_currency = bool(re.search(r"[£$]|\bgbp\b", crit_norm, re.IGNORECASE))
+                if has_large_num or has_currency:
+                    return True
+                # Only small numbers (≤ 2 digits) present — treat as narrative (date-qualified).
+                # Fall through to apply alignment check.
             if crit_norm.strip().startswith("dr ") or crit_norm.strip().startswith("cr "):
                 return True
 
@@ -2843,11 +3024,18 @@ class StudentGrader:
                 frozenset({"consolidation", "consolidated", "consolidate"}),
                 frozenset({"profit", "income", "earnings"}),
                 frozenset({"comprehensive", "reserve", "surplus"}),
+                # Personnel synonyms: "Four cyclists departed / 8 riders" ↔ "8 staff members"
+                frozenset({"cyclist", "rider", "employee", "staff", "member", "player", "worker"}),
+                # Associate / equity method synonyms
+                frozenset({"associate", "equity", "accounted"}),
             ]
             _WORD_TO_GROUP: dict[str, int] = {}
             for _gi, _grp in enumerate(_SYNONYM_GROUPS):
                 for _sw in _grp:
                     _WORD_TO_GROUP[_sw] = _gi
+                    # Also map common plural form so "cyclists" matches "cyclist", etc.
+                    if not _sw.endswith("s"):
+                        _WORD_TO_GROUP[_sw + "s"] = _gi
 
             # Compute overlap: exact word matches first.
             exact_overlap = {w for w in crit_words if w in ev_words}
@@ -2867,10 +3055,15 @@ class StudentGrader:
                     overlap += 1
                     matched_groups.add(g)
 
-            # Require at least 2 overlapping content words, OR 1 overlap plus a strong numeric anchor.
+            # Require at least 2 overlapping content words, OR 1 overlap plus a strong anchor.
             if overlap >= 2:
                 return True
             if overlap >= 1 and (has_number or has_ratio):
+                return True
+            # A single long domain-specific word (≥7 chars) is a strong enough anchor on its own.
+            # e.g. "associate" in both criterion and evidence passes without a numeric anchor.
+            long_exact = {w for w in exact_overlap if len(w) >= 7}
+            if long_exact:
                 return True
             return False
 
@@ -3018,11 +3211,23 @@ class StudentGrader:
 
             # Enforce max_possible from the rubric (ignore LLM-supplied max_possible).
             # If the rubric doesn't have a numeric max for this criterion, treat it as non-scoreable.
-            # For holistic grading, trust the LLM's max_possible (from sub-question marks).
+            # For holistic grading, use the authoritative max_marks from _holistic_sub_questions
+            # (sourced from the question paper), falling back to the LLM's value only if not found.
+            # Note: model answer sub-criteria marks (e.g. 0.5/point) are still used by the LLM to
+            # score individual points — the cap only limits the final marks_awarded total.
             rubric_max = rubric_max_map.get(criterion)
             if self._holistic_grading:
-                llm_max = float(item.get("max_possible", 0) or 0)
-                max_possible = llm_max if llm_max > 0 else original_marks_awarded
+                sq_label = item.get("_sub_question", "")
+                authoritative_max = 0.0
+                for hq in (self._holistic_sub_questions or []):
+                    if str(hq.get("sub_question", "")).strip() == str(sq_label).strip():
+                        authoritative_max = float(hq.get("max_marks", 0) or 0)
+                        break
+                if authoritative_max > 0:
+                    max_possible = authoritative_max
+                else:
+                    llm_max = float(item.get("max_possible", 0) or 0)
+                    max_possible = llm_max if llm_max > 0 else original_marks_awarded
             elif rubric_max is None and self._criteria_were_synthesized:
                 # For synthesized criteria, the LLM may rephrase — trust the LLM's max_possible
                 llm_max = float(item.get("max_possible", 0) or 0)
@@ -3114,17 +3319,70 @@ class StudentGrader:
                     evidence_warnings.append(f"Marks revoked (evidence appears in question/markscheme, not student work): {criterion}")
                     marks_awarded = 0.0
 
+            # Income/profit context revocation: a criterion that explicitly names profit,
+            # contribution, revenue, income, or earnings as the concept measured requires the
+            # evidence to also contain that vocabulary.  Without this, a calculation like
+            # "7,200,000*9/12" in the student's net-assets working table would remain credited
+            # for a profit-contribution criterion after the LLM incorrectly awarded marks.
+            # This is intentionally narrow (only income-context terms) to avoid revoking
+            # legitimate marks for criteria that describe profit without using that exact word.
+            # Limit to micro-criteria (≤ 1 mark); section-total criteria with large marks
+            # are less likely to be wrongly awarded and should not be revoked this way.
+            # SKIP for journal and calc criteria — they have dedicated direction/number guards.
+            # Those criteria contain "profit or loss" as an ACCOUNT NAME not a concept check,
+            # so the income guard fires spuriously (e.g. "Dr Profit or loss 167" → evidence
+            # shows "Dr Revaluation Loss (PL)" which is equivalent but lacks the word "profit").
+            # Look up category from rubric cache (LLM output never includes category).
+            _income_cat = self._criterion_category_map_last_run.get(
+                criterion, str(item.get("category", "") or "")
+            ).lower()
+            _skip_income_guard = _income_cat in ("journal", "calculation", "calc")
+            if (
+                not _skip_income_guard
+                and marks_awarded > 0
+                and evid_list
+                and isinstance(criterion, str)
+                and float(max_possible) <= 1.0
+                and not self._holistic_grading
+            ):
+                _INCOME_REVOKE_RE = re.compile(
+                    r"\b(profit|contribution|revenue|income|earning)\b", re.IGNORECASE
+                )
+                if _INCOME_REVOKE_RE.search(criterion):
+                    _ev_income_ctx = " ".join(evid_list)
+                    # Accept P&L, P/L, PL, loss, OCI, exchange/FX reserve, comprehensive,
+                    # NCI (non-controlling interest share of profit), EPS (earnings per share),
+                    # and plural forms (profits, earnings) as valid income-context evidence.
+                    _INCOME_EVID_RE = re.compile(
+                        r"\b(profits?|contribution|revenue|income|earnings?|loss|oci|"
+                        r"exchange|reserve|comprehensive|nci|eps)\b"
+                        r"|p[&/]l|\bpl\b|\bfx\b",
+                        re.IGNORECASE,
+                    )
+                    if not _INCOME_EVID_RE.search(_ev_income_ctx):
+                        evidence_warnings.append(
+                            f"Marks revoked (profit-criterion evidence lacks profit context): {criterion}"
+                        )
+                        marks_awarded = 0.0
+
             # Alignment guardrail: for longer narrative criteria, require evidence to actually align.
             # Prevents awarding marks for vague mentions (e.g., saying "exchange difference" but not stating the required treatment).
-            # Only enforce for narrative (non-numeric) criteria; numeric/method criteria are handled by other guardrails.
-            # SKIP for synthesized criteria and holistic grading — the LLM's meaning-based grading is trusted.
+            # Skip for large-number / calculation criteria; those are handled by numeric guardrails.
+            # Also skip for Dr/Cr journal criteria, synthesized criteria, and holistic grading.
+            # BUT apply even when criterion has small numbers (dates, ordinals) — those are still narrative.
+            def _criterion_has_large_number(crit: str) -> bool:
+                c = _norm_for_evidence_match(crit)
+                return bool(re.search(r"\b\d{3,}\b", c)) or bool(
+                    re.search(r"[£$]|\bgbp\b", c, re.IGNORECASE)
+                )
+
             if (
                 marks_awarded > 0
                 and evid_list
                 and student_blob_norm
                 and isinstance(criterion, str)
                 and criterion.strip()
-                and not re.search(r"\d", criterion)
+                and not _criterion_has_large_number(criterion)
                 and not criterion.strip().lower().startswith(("dr ", "cr "))
                 and float(max_possible) < 1.0
                 and not self._criteria_were_synthesized
@@ -3133,6 +3391,36 @@ class StudentGrader:
                 if not _criterion_evidence_alignment_ok(str(criterion), evid_list):
                     evidence_warnings.append(f"Marks revoked (weak evidence alignment to criterion): {criterion}")
                     marks_awarded = 0.0
+
+            # Negation/contradiction guard: if a criterion states something "is required"
+            # or "must" occur, and the evidence explicitly states the opposite (e.g., "no
+            # impairment review", "not required"), revoke marks.
+            # This catches the case where the alignment guardrail was bypassed (e.g., because
+            # the criterion contains a date like "31 May 20X4") but the evidence contradicts
+            # the criterion's core assertion.
+            if marks_awarded > 0 and evid_list and isinstance(criterion, str) and not self._holistic_grading:
+                _crit_lower = criterion.lower()
+                if re.search(r"\brequired\b|\bnecessary\b|\bmust\b", _crit_lower):
+                    _NEG_STOP = {
+                        "required", "necessary", "must", "should", "would", "which", "this",
+                        "that", "also", "have", "been", "will", "need", "needs", "being",
+                        "review", "report", "audit", "before", "after",
+                    }
+                    _crit_key = [
+                        w for w in re.findall(r"[a-z]{4,}", _crit_lower) if w not in _NEG_STOP
+                    ]
+                    _ev_combined = " ".join(evid_list).lower()
+                    for _kw in _crit_key[:6]:
+                        # Match "no <optional words> <keyword-prefix>" — covers "no impairments"
+                        # when keyword is "impairment" and similar plural/suffix variations.
+                        _kw_prefix = _kw[:min(len(_kw), 7)]
+                        if re.search(rf"\bno\s+(?:\w+\s+){{0,2}}{re.escape(_kw_prefix)}", _ev_combined) or \
+                           re.search(rf"\bnot\s+(?:\w+\s+){{0,2}}{re.escape(_kw_prefix)}", _ev_combined):
+                            evidence_warnings.append(
+                                f"Marks revoked (evidence contradicts required criterion): {criterion}"
+                            )
+                            marks_awarded = 0.0
+                            break
 
             # Evidence recovery for numeric-calc criteria (SKIP for holistic grading):
             # Sometimes the LLM attaches unhelpful evidence (e.g., just "Profit after tax 7,200,000")
@@ -3145,6 +3433,20 @@ class StudentGrader:
                 if expected_gbp is not None and expected_calc is not None:
                     if math.isclose(float(expected_gbp), float(expected_calc), rel_tol=1e-6, abs_tol=2.0):
                         snippet = _find_calc_snippet_in_student(str(criterion))
+                        # Context guard: if the criterion is about profit/contribution/income,
+                        # only accept the recovered snippet when the evidence or snippet itself
+                        # also contains profit-context vocabulary.  A "7,200,000*9/12" pattern
+                        # found in a net-assets table must not be credited for a profit criterion.
+                        if snippet:
+                            _INCOME_TERMS_RE = re.compile(
+                                r"\b(profit|contribution|revenue|income|earning)\b", re.IGNORECASE
+                            )
+                            if _INCOME_TERMS_RE.search(str(criterion)):
+                                ev_ctx = _norm_for_evidence_match(
+                                    " ".join((evid_list or []) + [snippet])
+                                )
+                                if not _INCOME_TERMS_RE.search(ev_ctx):
+                                    snippet = None
                         if snippet:
                             # Attach recovered evidence and award.
                             if snippet not in evid_list:
@@ -3218,7 +3520,34 @@ class StudentGrader:
                             if not expected_ok and _evidence_has_calc_result(ev_blob, expected_val):
                                 expected_ok = True
 
+                        # Also accept: if the criterion explicitly states "= X" (the direct answer),
+                        # check that stated answer against evidence. This handles criteria where
+                        # _compute_simple_calc returns None or a unit-mismatch value (e.g., £k vs £).
+                        # Example: "NCI column = 1,350 (25% × £5,400k × 9/12)" — the "= 1,350" is
+                        # the canonical answer; evidence "1350" should pass even if the bracketed
+                        # calc computes to a different unit scale.
                         if not (literal_ok or expected_ok):
+                            _eq_match = re.search(r"=\s*\(?([\d,]+)\)?", str(criterion))
+                            if _eq_match:
+                                _stated_ans = _eq_match.group(1)
+                                if self._contains_number_variant(ev_blob, _stated_ans):
+                                    expected_ok = True
+
+                        # If LLM explicitly identified this as own-figure (OF), skip number
+                        # mismatch revocation. In UK professional exams, OF for CALC criteria
+                        # awards FULL marks — the student is not penalised twice for one wrong
+                        # input. The numbers in evidence will differ from the criterion by design.
+                        _reason_text_nm = str(item.get("reason", "")).lower()
+                        _is_of_nm = bool(re.search(
+                            r"\bof\b|\bown.?figure\b|\bown.?fig\b", _reason_text_nm
+                        ))
+                        # exact_match criteria (e.g. SOCIE financial-statement rows) must show
+                        # the rubric's expected number — OF bypass is not allowed because the
+                        # amount itself is the assessable element, not a downstream carry-forward.
+                        if _is_of_nm and criterion in self._exact_match_criteria_last_run:
+                            _is_of_nm = False
+
+                        if not (literal_ok or expected_ok) and not _is_of_nm:
                             evidence_warnings.append(f"Marks revoked (number mismatch): {criterion}")
                             marks_awarded = 0.0
 
@@ -3236,11 +3565,29 @@ class StudentGrader:
                     # Also require the journal amount to be present when the criterion includes a number.
                     # BUT: if the LLM already gave partial credit (marks < max), it likely recognised
                     # an "own figure" scenario (correct journal structure, wrong amount). Don't override that.
+                    # If the LLM gave FULL marks but the amount is wrong, award 50% OF instead of
+                    # revoking to 0 — the student demonstrated correct journal structure (OF mark).
                     crit_nums = self._numbers_in_text(criterion)
                     if marks_awarded > 0 and marks_awarded >= max_possible and crit_nums:
                         if not any(self._contains_number_variant(" ".join(evid_list), n) for n in crit_nums):
-                            evidence_warnings.append(f"Marks revoked (missing journal amount in evidence): {criterion}")
-                            marks_awarded = 0.0
+                            _ev_lower = " ".join(evid_list).lower()
+                            _crit_lower2 = str(criterion).strip().lower()
+                            _direction_present = (
+                                (_crit_lower2.startswith("dr ") and re.search(r"\bdr\b", _ev_lower)) or
+                                (_crit_lower2.startswith("cr ") and re.search(r"\bcr\b", _ev_lower))
+                            )
+                            if _direction_present:
+                                _of_val = max(0.25, round(float(max_possible) * 0.5 / 0.25) * 0.25)
+                                _of_val = min(_of_val, float(max_possible) - 0.25)
+                                marks_awarded = _of_val
+                                evidence_warnings.append(
+                                    f"OF mark (correct journal direction, own figure amount): {criterion}"
+                                )
+                            else:
+                                evidence_warnings.append(
+                                    f"Marks revoked (missing journal amount in evidence): {criterion}"
+                                )
+                                marks_awarded = 0.0
 
             # Journal-line recovery: if a Dr/Cr criterion got 0 but a matching journal line exists in the student text,
             # attach that verbatim line as evidence and award full marks.
@@ -3263,7 +3610,37 @@ class StudentGrader:
                 else:
                     saved_reason = "Marks revoked by guardrails"
 
+            # Deduplicate evidence_list: the LLM sometimes produces both a plain-text
+            # and a pipe-table version of the same quote.  Keep the more descriptive
+            # form (longer after normalisation) and drop near-duplicates.
+            if evid_list:
+                seen_ev_norm: dict[str, str] = {}
+                deduped_ev: list[str] = []
+                for _ev in evid_list:
+                    if not isinstance(_ev, str):
+                        continue
+                    _ev_norm = re.sub(r"[|\s]+", " ", _ev).strip().lower()
+                    if not _ev_norm:
+                        continue
+                    if _ev_norm not in seen_ev_norm:
+                        seen_ev_norm[_ev_norm] = _ev
+                        deduped_ev.append(_ev)
+                evid_list = deduped_ev
+
             sum_awarded_calc += marks_awarded
+
+            # Detect "own figure" (OF) scenarios: LLM gave partial credit on a
+            # calc/journal criterion, or journal guard downgraded to partial.
+            # This flag is surfaced in annotations so students see "OF" clearly.
+            # Use rubric category cache — LLM output items never include category.
+            _item_category = self._criterion_category_map_last_run.get(
+                criterion, str(item.get("category", "") or "")
+            ).lower()
+            _is_of_mark = (
+                0 < float(marks_awarded) < float(max_possible)
+                and _item_category in ("calculation", "journal", "calc")
+                and not self._holistic_grading
+            )
 
             bd_item = {
                 "criterion": criterion,
@@ -3273,13 +3650,74 @@ class StudentGrader:
                 "evidence": "; ".join(evid_list) if evid_list else "",
                 "evidence_list": evid_list if evid_list else [],
                 "comments_summary": item.get("comments_summary", ""),
+                "is_of_mark": _is_of_mark,
             }
             # For holistic grading, preserve sub-question metadata for the annotator.
             if self._holistic_grading:
                 bd_item["_sub_question"] = item.get("_sub_question", "")
                 bd_item["_student_label"] = item.get("_student_label", "")
                 bd_item["_correct_points_with_marks"] = item.get("_correct_points_with_marks", [])
+                bd_item["_not_required_points"] = item.get("_not_required_points", [])
             normalized_breakdown.append(bd_item)
+
+        # "Marks given above / below" guard — SKIP for holistic grading.
+        # When two criteria in the same grading run were both awarded marks and
+        # their evidence strings are identical (after whitespace normalisation),
+        # keep only the one with the higher max_possible and zero out the other.
+        # This mirrors the teacher's annotation rule: marks are awarded once, at
+        # the location where the actual working appears; subsequent references to
+        # the same result (e.g., restating a goodwill figure in narrative or in
+        # a journal after calculating it in a working) do NOT earn extra marks.
+        # Exception: a journal entry criterion citing the same number as a calc
+        # criterion is a DIFFERENT skill and keeps its marks — we only zero out
+        # when the criteria descriptions themselves overlap significantly.
+        if normalized_breakdown and not self._holistic_grading:
+            try:
+                _ev_index: dict[str, list[int]] = {}
+                for _idx, _bd in enumerate(normalized_breakdown):
+                    _ev_raw = _bd.get("evidence", "") or ""
+                    _awarded = float(_bd.get("marks_awarded", 0) or 0)
+                    if not _ev_raw or _awarded <= 0:
+                        continue
+                    _ev_key = re.sub(r"[\s;|]+", " ", _ev_raw).strip().lower()
+                    if len(_ev_key) < 12:
+                        continue
+                    _ev_index.setdefault(_ev_key, []).append(_idx)
+                for _ev_key, _idxs in _ev_index.items():
+                    if len(_idxs) < 2:
+                        continue
+                    # Sort: keep the one with highest max_possible (most specific criterion).
+                    _idxs_sorted = sorted(
+                        _idxs,
+                        key=lambda i: (
+                            float(normalized_breakdown[i].get("max_possible", 0) or 0),
+                            float(normalized_breakdown[i].get("marks_awarded", 0) or 0),
+                        ),
+                        reverse=True,
+                    )
+                    _keeper_crit = str(normalized_breakdown[_idxs_sorted[0]].get("criterion", "") or "")
+                    for _dup_idx in _idxs_sorted[1:]:
+                        _dup_crit = str(normalized_breakdown[_dup_idx].get("criterion", "") or "").lower()
+                        _keep_crit_lower = _keeper_crit.lower()
+                        # Only zero out when the duplicate criterion describes the SAME concept
+                        # (shares 3+ significant words with the keeper), not a different skill.
+                        _dup_words = set(re.findall(r"[a-z]{4,}", _dup_crit))
+                        _keep_words = set(re.findall(r"[a-z]{4,}", _keep_crit_lower))
+                        _overlap = _dup_words & _keep_words
+                        _stop = {"mark", "marks", "amount", "value", "total", "year", "each", "from", "with", "that", "this", "have", "been"}
+                        _overlap -= _stop
+                        if len(_overlap) >= 2:
+                            _dup_marks = float(normalized_breakdown[_dup_idx].get("marks_awarded", 0) or 0)
+                            if _dup_marks > 0:
+                                normalized_breakdown[_dup_idx]["marks_awarded"] = 0.0
+                                sum_awarded_calc -= _dup_marks
+                                _prev_reason = (normalized_breakdown[_dup_idx].get("reason", "") or "").strip()
+                                normalized_breakdown[_dup_idx]["reason"] = (
+                                    f"Marks given above: same evidence already credited for "
+                                    f"'{_keeper_crit[:60]}'. " + _prev_reason
+                                ).strip()
+            except Exception:
+                pass  # Guard must never fail the grader
 
         # Broad-criterion gating (generic) — SKIP for holistic grading:
         # If a high-mark narrative criterion sits next to many micro-criteria (<= 0.5 each),
@@ -3468,6 +3906,25 @@ class StudentGrader:
         logger.info(f"Question max marks used: {total_max}")
         logger.info(f"Final saved total: {rounded_total}")
 
+        # Capture top-level not_required_points from the numerical LLM output.
+        # In holistic mode these are stored per-sub-question on the breakdown items
+        # (under _not_required_points) and the top-level field stays empty.
+        nr_points_top: list[dict] = []
+        if not self._holistic_grading:
+            raw_nr = main_grade.get("not_required_points", []) or []
+            if isinstance(raw_nr, list):
+                for nr in raw_nr:
+                    if not isinstance(nr, dict):
+                        continue
+                    text = str(nr.get("text", "") or "").strip()
+                    if not text:
+                        continue
+                    nr_points_top.append({
+                        "text": text,
+                        "key_phrase": str(nr.get("key_phrase", "") or "").strip(),
+                        "reason": str(nr.get("reason", "") or "").strip(),
+                    })
+
         doc = {
             "student_id": self.student_name,
             "question_number": self.question_number,
@@ -3479,6 +3936,7 @@ class StudentGrader:
             "comments": annotation_comments,
             "guardrail_warnings": evidence_warnings,
             "unanchored_comments": unanchored_comments,
+            "not_required_points": nr_points_top,
             "extracted_at": now_iso,
             "question_id": self.questions_id,
             "model_answer_id": self.model_answers_id,

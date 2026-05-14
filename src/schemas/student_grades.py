@@ -50,6 +50,15 @@ class StudentGradeDocument(BaseModel):
         description="LLM comments that did not meet the strict annotation-friendly format"
     )
 
+    # Off-topic content flagged by the LLM. Carries no marks impact but is annotated
+    # on the PDF with a strikethrough + 'Not required' margin label so the student
+    # knows to drop the content in future answers. Holistic mode stores the same
+    # information per sub-question on each breakdown item (under `_not_required_points`).
+    not_required_points: List[dict] = Field(
+        default_factory=list,
+        description="Verbatim off-topic snippets {text, key_phrase, reason} for PDF annotation"
+    )
+
     # Holistic grading flag
     holistic_grading: Optional[bool] = Field(None, description="True when holistic grading mode was used (no marking criteria)")
 

@@ -11,7 +11,22 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''grade.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''grade.py: syntax OK''\\)\")",
       "Bash(python -c \":*)",
       "Bash(python -c \"import py_compile; py_compile.compile\\(''main.py'', doraise=True\\); print\\(''main.py OK''\\)\")",
-      "Bash(python -c \"import py_compile; py_compile.compile\\(''pdf_annotation/annotator.py'', doraise=True\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''pdf_annotation/annotator.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(cp errors/__init__.py src/errors/__init__.py)",
+      "Bash(cp errors/exceptions.py src/errors/exceptions.py)",
+      "Bash(cp errors/classifier.py src/errors/classifier.py)",
+      "Bash(cp logging_config.py src/logging_config.py)",
+      "Bash(cp llm_setup.py src/llm_setup.py)",
+      "Bash(cp pdf_annotation/annotator.py src/annotation/annotator.py)",
+      "Bash(cp pdf_annotation/annotator_config.py src/annotation/annotator_config.py)",
+      "Bash(cp pdf_annotation/annotator_draw.py src/annotation/annotator_draw.py)",
+      "Bash(cp pdf_annotation/annotator_match.py src/annotation/annotator_match.py)",
+      "Bash(cp pdf_annotation/annotator_ocr.py src/annotation/annotator_ocr.py)",
+      "Bash(touch src/__init__.py src/grading/__init__.py src/extraction/__init__.py src/annotation/__init__.py src/providers/__init__.py src/schemas/__init__.py src/prompts/__init__.py src/utils/__init__.py)",
+      "Bash(cp database/question_loader.py src/database/question_loader.py)",
+      "Bash(cp student_assignment_extraction.py src/extraction/student_assignment_extraction.py)",
+      "Bash(cp question_pdf.py dev/question_pdf.py)",
+      "Bash(cp rubric_extraction.py dev/rubric_extraction.py)"
     ]
   }
 }
