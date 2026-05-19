@@ -490,6 +490,105 @@ def add_main_score(
 
 # ── Comment popup placement ────────────────────────────────────────────────────
 
+def _strip_subq_prefix(comment: str) -> tuple[Optional[str], str]:
+    """Extract a leading [<sub_question>] tag from a comment string.
+
+    Returns (sub_id, comment_without_prefix). sub_id is None if no prefix is present.
+    The numeric portion of sub_id (e.g. '4.1' from '4.1 Threats') is what the PDF
+    search uses — descriptive suffixes added by the prompt are tolerated.
+    """
+    if not comment or not isinstance(comment, str):
+        return None, comment or ""
+    m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*", comment)
+    if not m:
+        return None, comment
+    sub_id = m.group(1).strip()
+    remainder = comment[m.end():]
+    return sub_id, remainder
+
+
+def compute_subq_y_bounds(
+    doc,
+    allowed_pages: list[int],
+    sub_ids: list[str],
+) -> dict[str, dict[int, tuple[float, float]]]:
+    """For each sub_id (e.g. '4.1', '4.2 Threats'), find its Y range on each
+    allowed page so comments can be constrained to that sub-question's region.
+
+    The search uses only the leading numeric portion (e.g. '4.1') because student
+    handwriting rarely echoes descriptive labels from the rubric. The next
+    numerically-sorted sub_id's position gives the max_y; page bottom otherwise.
+
+    Returns {sub_id: {page_num: (min_y, max_y)}}.
+    """
+    result: dict[str, dict[int, tuple[float, float]]] = {sid: {} for sid in sub_ids}
+    if not sub_ids:
+        return result
+
+    # Map each sub_id to its numeric prefix (e.g. '4.1 Threats' -> '4.1').
+    def _numeric(sid: str) -> Optional[str]:
+        m = re.match(r"\s*(\d+(?:\.\d+)*)", sid)
+        return m.group(1) if m else None
+
+    sid_numeric: dict[str, str] = {}
+    for sid in sub_ids:
+        n = _numeric(sid)
+        if n:
+            sid_numeric[sid] = n
+
+    if not sid_numeric:
+        return result
+
+    # Unique numeric sub-question prefixes in numerical order. Used to look up
+    # the next sub-question's start position on each page.
+    unique_numerics = sorted(
+        set(sid_numeric.values()),
+        key=lambda n: tuple(float(p) for p in n.split(".")),
+    )
+
+    for page_num in allowed_pages:
+        try:
+            page = doc[page_num - 1]
+        except Exception:
+            continue
+
+        numeric_positions: dict[str, float] = {}
+        for n in unique_numerics:
+            try:
+                instances = _page_search(page, n) or []
+            except Exception:
+                instances = []
+            for inst in instances:
+                # Sub-question labels are written near the left margin in the
+                # student answer; reject inline references like "as in 4.1".
+                if inst.x0 < 110:
+                    numeric_positions[n] = inst.y0
+                    break
+
+        if not numeric_positions:
+            continue
+
+        sorted_present = sorted(
+            numeric_positions.keys(),
+            key=lambda n: tuple(float(p) for p in n.split(".")),
+        )
+        position_index = {n: i for i, n in enumerate(sorted_present)}
+
+        for sid, numeric in sid_numeric.items():
+            if numeric not in numeric_positions:
+                continue
+            min_y = numeric_positions[numeric] - 5
+            max_y = page.rect.height - 20
+            idx = position_index[numeric]
+            for next_n in sorted_present[idx + 1:]:
+                if next_n in numeric_positions:
+                    max_y = numeric_positions[next_n] - 5
+                    break
+            result[sid][page_num] = (min_y, max_y)
+
+    return result
+
+
 def add_popup_for_comment(
     doc,
     comment: str,
@@ -502,6 +601,7 @@ def add_popup_for_comment(
     placed_lines_per_page: Optional[dict] = None,
     min_y_per_page: Optional[dict[int, float]] = None,
     max_y_per_page: Optional[dict[int, float]] = None,
+    subq_y_bounds: Optional[dict[str, dict[int, tuple[float, float]]]] = None,
 ) -> bool:
     """Place a PDF comment annotation anchored to the feedback text.
 
@@ -514,6 +614,15 @@ def add_popup_for_comment(
     FIX-2: anchored comments are clamped to q_max_y so the popup icon cannot
     bleed visually into the first line of the next question.
     """
+    # Strip the [<sub_question>] prefix added by the grading prompts. The sub_id
+    # narrows comment placement to its sub-question region; if no prefix is
+    # present (older outputs or non-conforming LLM responses), fall back to the
+    # whole-question Y range.
+    sub_id, comment = _strip_subq_prefix(comment)
+    sub_bounds_for_comment: dict[int, tuple[float, float]] = {}
+    if sub_id and subq_y_bounds:
+        sub_bounds_for_comment = subq_y_bounds.get(sub_id, {}) or {}
+
     parsed = _split_comment_arrow(comment)
     if not parsed:
         logger.debug(f"  No usable arrow split in comment: '{str(comment)[:40]}...'")
@@ -535,6 +644,13 @@ def add_popup_for_comment(
     )
     ranked_pages = ranked_pages if ranked_pages else list(allowed_pages)
 
+    # If a sub-question prefix is present and we have bounds for it, prefer the
+    # pages where that sub-question actually appears.
+    if sub_bounds_for_comment:
+        sub_pages = [p for p in ranked_pages if p in sub_bounds_for_comment]
+        if sub_pages:
+            ranked_pages = sub_pages + [p for p in ranked_pages if p not in sub_pages]
+
     def _place_note_on_page(
         page,
         page_num: int,
@@ -542,6 +658,12 @@ def add_popup_for_comment(
     ) -> bool:
         q_min_y = float((min_y_per_page or {}).get(page_num, 0))
         q_max_y = float((max_y_per_page or {}).get(page_num, page.rect.height - 20))
+
+        # Tighten to the sub-question's region when we have it for this page.
+        if page_num in sub_bounds_for_comment:
+            sub_min, sub_max = sub_bounds_for_comment[page_num]
+            q_min_y = max(q_min_y, float(sub_min))
+            q_max_y = min(q_max_y, float(sub_max))
 
         if target_rect is not None:
             # Reject if anchor is outside this question's territory

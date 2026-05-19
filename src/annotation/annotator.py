@@ -36,7 +36,7 @@ from .annotator_match import resolve_anchor_rect, _rank_pages_for_anchor
 from .annotator_draw import (
     _safe_float, _fmt_mark_value, _place_score_label,
     _place_ticks, place_score_near_anchor, add_main_score, add_popup_for_comment,
-    place_not_required_marker,
+    place_not_required_marker, compute_subq_y_bounds, _strip_subq_prefix,
 )
 
 
@@ -568,24 +568,16 @@ def annotate_pdf(
                 # ── Step 2: Place sub-question score near student's label ───────
                 # FIX-1 (via draw_underline=False): heading/label lines are never
                 # underlined — only the score mark is placed beside them.
+                # ORDER: prefer the sub-question NUMBER lookup ("4.1", "4.2", …)
+                # over the student_label, because student_label is often a
+                # generic single character ("A", "B", "a)") that matches dozens
+                # of false positions in the PDF — including the page header.
                 score_text = (
                     f"{_fmt_mark_value(marks)}/{_fmt_mark_value(max_marks)}"
                 )
                 score_placed = False
 
-                if student_label and student_label.strip():
-                    score_placed = place_score_near_anchor(
-                        doc, student_label.strip(), score_text,
-                        allowed_pages, placed_lines_per_page, placed_marks,
-                        unplaced_items,
-                        page_token_sets=page_token_sets,
-                        line_score_accumulator=None,
-                        min_y_per_page=min_y_per_page,
-                        max_y_per_page=max_y_per_page,
-                        draw_underline=False,  # FIX-1: do not underline the sub-q heading
-                    )
-
-                if not score_placed and sub_q:
+                if sub_q:
                     for pattern in [
                         sub_q, f"({sub_q})", f"{sub_q})",
                         f"{sub_q}.", f"{sub_q}:",
@@ -602,6 +594,31 @@ def annotate_pdf(
                         )
                         if score_placed:
                             break
+
+                # Fallback to student_label ONLY when it is specific enough.
+                # A label without a digit is too ambiguous: "A", "a", "(a)",
+                # "(b)", "(i)", "(ii)" all match dozens of arbitrary positions
+                # in the PDF (every parenthesised letter, every standalone
+                # capital, etc.) and put the score in the wrong region.
+                # Requiring a digit keeps "4.1", "1.1", "a.1" but rejects all
+                # the letter-only labels that have caused mis-placement.
+                def _label_is_specific(label: str) -> bool:
+                    s = (label or "").strip()
+                    if len(s) < 3:
+                        return False
+                    return bool(re.search(r"\d", s))
+
+                if not score_placed and _label_is_specific(student_label):
+                    score_placed = place_score_near_anchor(
+                        doc, student_label.strip(), score_text,
+                        allowed_pages, placed_lines_per_page, placed_marks,
+                        unplaced_items,
+                        page_token_sets=page_token_sets,
+                        line_score_accumulator=None,
+                        min_y_per_page=min_y_per_page,
+                        max_y_per_page=max_y_per_page,
+                        draw_underline=False,  # FIX-1: do not underline the sub-q heading
+                    )
 
                 # Fallback: anchor to first evidence fragment
                 if not score_placed and points_with_marks:
@@ -847,7 +864,28 @@ def annotate_pdf(
         all_comments = grades_doc.get('comments', [])
         logger.info(f"Processing {len(all_comments)} comments for feedback...")
 
+        # Pre-compute sub-question Y bounds for every [<sub_question>] tag found
+        # in the comments. The grading prompt prepends a tag like "[4.1]" or
+        # "[4.3 Payroll Threats]" so the popup lands inside the correct sub-region.
+        sub_ids_in_comments: list[str] = []
+        seen_ids: set[str] = set()
+        for c in all_comments:
+            if not isinstance(c, str):
+                continue
+            sid, _ = _strip_subq_prefix(c)
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                sub_ids_in_comments.append(sid)
+        subq_y_bounds = compute_subq_y_bounds(doc, allowed_pages, sub_ids_in_comments)
+        if sub_ids_in_comments:
+            pages_with_bounds = sum(1 for sid in sub_ids_in_comments if subq_y_bounds.get(sid))
+            logger.info(
+                f"Sub-question Y bounds resolved: {pages_with_bounds}/{len(sub_ids_in_comments)} "
+                f"sub_ids found in PDF — comments will be constrained to their sub-question region"
+            )
+
         comments_placed = 0
+        unplaced_comments: list[str] = []
         for idx, comment in enumerate(all_comments, 1):
             if not comment or not isinstance(comment, str):
                 logger.debug(f"  Comment {idx}: INVALID (empty or non-string)")
@@ -868,15 +906,27 @@ def annotate_pdf(
                     placed_lines_per_page=placed_lines_per_page,
                     min_y_per_page=min_y_per_page,
                     max_y_per_page=max_y_per_page,
+                    subq_y_bounds=subq_y_bounds,
                 ):
                     comments_placed += 1
                     logger.debug("    ✓ Comment placed")
                 else:
-                    logger.debug("    ✗ Comment not placed (anchor split or match failed)")
+                    unplaced_comments.append(comment.strip())
+                    logger.warning(
+                        f"  ✗ Comment {idx} NOT PLACED on PDF "
+                        f"(anchor split or match failed): {comment[:80]!r}"
+                    )
             except Exception as e:
-                logger.debug(f"    ✗ Error: {e}")
+                unplaced_comments.append(comment.strip())
+                logger.warning(f"  ✗ Comment {idx} error during placement: {e}")
 
         annotation_mapping['comments_placed'] = comments_placed
+        annotation_mapping['unplaced_comments'] = unplaced_comments
+        if unplaced_comments:
+            logger.warning(
+                f"✗ {len(unplaced_comments)} comment(s) failed to place on PDF "
+                f"(see 'unplaced_comments' in annotation mapping JSON)"
+            )
         logger.info(f"✓ Comments: {comments_placed}/{len(all_comments)} placed")
 
         # ── Save ───────────────────────────────────────────────────────────────

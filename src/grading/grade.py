@@ -1161,6 +1161,17 @@ class StudentGrader:
                     _crit_entry["category"] = _cat
                 combined_criteria.append(_crit_entry)
 
+        def _collect_answer_text(node: dict, parts_list: list) -> None:
+            """Recursively collect non-empty answer text from a model-answer node and its sub_answers."""
+            if not isinstance(node, dict):
+                return
+            text = node.get("answer")
+            label = str(node.get("question_number", "")).strip()
+            if isinstance(text, str) and text.strip():
+                parts_list.append(f"Part {label}\n{text.strip()}" if label else text.strip())
+            for child in (node.get("sub_answers") or []):
+                _collect_answer_text(child, parts_list)
+
         for answer in answers:
             if not isinstance(answer, dict):
                 continue
@@ -1172,6 +1183,10 @@ class StudentGrader:
                     combined_answer_parts.append(f"Part {part_label}\n{answer_text.strip()}")
                 else:
                     combined_answer_parts.append(answer_text.strip())
+
+            # Also collect text from sub_answers (hierarchical structure for theoretical papers)
+            for child in (answer.get("sub_answers") or []):
+                _collect_answer_text(child, combined_answer_parts)
 
             criteria = answer.get("marking_criteria")
             sibling_count = len(criteria) if isinstance(criteria, list) else 0
@@ -1234,34 +1249,69 @@ class StudentGrader:
                         _collect_sq_marks(q.get("sub_questions") or [])
 
             holistic_subs: list[dict] = []
-            for answer in answers:
-                if not isinstance(answer, dict):
-                    continue
-                sq_num = str(answer.get("question_number", "")).strip()
-                sq_answer = str(answer.get("answer", "") or "").strip()
-                # Use question-paper marks as the authoritative cap; fall back to
-                # maximum_marks from the model answer (never total_marks_available,
-                # which can exceed the capped mark).
+
+            def _add_holistic_sub(node: dict, parent_section: Optional[str] = None, section_cap: Optional[float] = None) -> None:
+                """Recursively add leaf sub-questions to holistic_subs.
+
+                For hierarchical model answers (theoretical papers), parent sections
+                have answer='' and carry their sub-sections in sub_answers.  We recurse
+                until we reach leaf nodes (non-empty answer text) and add those.
+                The parent's subsection_max is forwarded as section_cap so the prompt
+                can enforce cross-sub-question caps.
+                """
+                if not isinstance(node, dict):
+                    return
+                sq_num = str(node.get("question_number", "")).strip()
+                sq_answer = str(node.get("answer", "") or "").strip()
+                sub_list = node.get("sub_answers") or []
+
+                if sub_list:
+                    # Parent section: pass its subsection_max down as the cap for children
+                    raw_cap = node.get("subsection_max")
+                    child_cap = float(raw_cap) if raw_cap is not None else section_cap
+                    for child in sub_list:
+                        _add_holistic_sub(child, parent_section=sq_num, section_cap=child_cap)
+                    return
+
+                if not (sq_num and sq_answer):
+                    return
+
+                # Leaf node — resolve max_marks.
+                # Priority: question-paper marks > maximum_marks / subsection_max > total_marks_available
                 sq_marks = _paper_sq_marks.get(sq_num, 0.0)
                 if not sq_marks:
-                    for marks_key in ("maximum_marks", "marks"):
-                        raw = answer.get(marks_key)
+                    for marks_key in ("maximum_marks", "subsection_max", "marks"):
+                        raw = node.get(marks_key)
                         if raw is not None:
                             nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", str(raw))]
                             if nums:
                                 sq_marks = max(nums)
                                 break
-                # Include marking_criteria when present — the LLM will use per-point
-                # weights (e.g. 0.5 per bullet) to score each point individually.
-                # When empty/absent the LLM falls back to pure holistic judgement.
-                sq_criteria = answer.get("marking_criteria") or []
-                if sq_num and sq_answer:
-                    holistic_subs.append({
-                        "sub_question": sq_num,
-                        "answer": sq_answer,
-                        "max_marks": sq_marks,
-                        "marking_criteria": sq_criteria,
-                    })
+                if not sq_marks:
+                    # Last resort: total_marks_available (may exceed section cap, but better than 0)
+                    raw = node.get("total_marks_available")
+                    if raw is not None:
+                        nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", str(raw))]
+                        if nums:
+                            sq_marks = max(nums)
+
+                entry: dict = {
+                    "sub_question": sq_num,
+                    "answer": sq_answer,
+                    "max_marks": sq_marks,
+                    "marking_criteria": node.get("marking_criteria") or [],
+                }
+                rule = node.get("marking_rule")
+                if rule:
+                    entry["marking_rule"] = rule
+                if parent_section is not None:
+                    entry["parent_section"] = parent_section
+                if section_cap is not None:
+                    entry["section_cap"] = section_cap
+                holistic_subs.append(entry)
+
+            for answer in answers:
+                _add_holistic_sub(answer)
 
             # If only one sub-question or all share the same number, treat as single block
             if len(holistic_subs) <= 1:
@@ -1540,6 +1590,89 @@ class StudentGrader:
 
         return q_clean, m_clean, s_clean
 
+    def _normalize_floating_letter_labels(self, student_data: dict) -> dict:
+        """Combine bare letter-labels ('a)', 'b)', '(i)') with their inferred
+        numeric parent, in-place on a copy of student_data.
+
+        Some extractions (especially older ones, or when the student omits the
+        '4.1' heading because it's pre-printed on the question paper) emit
+        sub_parts as 'a)', 'b)', '4.2', '4.3', '4.4' — losing the '4.1'
+        parent. The grader then says "Student did not attempt 4.1" even though
+        the content is there.
+
+        Inference: if a letter-label appears BEFORE any numeric sub-label, its
+        parent is "{main_q}.1". Letter-labels appearing between numeric labels
+        inherit the MOST-RECENT prior numeric as their parent. Combined label
+        becomes e.g. "4.1(a)" preserving the student's original casing.
+        """
+        if not isinstance(student_data, dict):
+            return student_data
+        sub_parts = student_data.get("sub_parts")
+        if not isinstance(sub_parts, list) or not sub_parts:
+            return student_data
+
+        main_q = str(student_data.get("question", "")).strip() or str(self.question_number)
+        if not main_q:
+            return student_data
+
+        # Detect: do any bare letter-labels appear BEFORE the first numeric label?
+        letter_re = re.compile(r"^[\(\[]?([A-Za-z]+|[ivxIVX]+)[\)\]\.]?$")
+        numeric_re = re.compile(r"^\d+(?:\.\d+)*[)\.]?$")
+
+        has_leading_letters = False
+        for sp in sub_parts:
+            if not isinstance(sp, dict):
+                continue
+            lab = str(sp.get("question_number", "")).strip()
+            if numeric_re.match(lab):
+                break
+            if letter_re.match(lab):
+                has_leading_letters = True
+                break
+
+        # Initial inferred parent if there are leading letter-labels with no
+        # numeric predecessor: "{main_q}.1".
+        current_parent: Optional[str] = f"{main_q}.1" if has_leading_letters else None
+
+        new_sub_parts: list[dict] = []
+        renamed_log: list[str] = []
+        for sp in sub_parts:
+            if not isinstance(sp, dict):
+                new_sub_parts.append(sp)
+                continue
+            lab = str(sp.get("question_number", "")).strip()
+
+            if numeric_re.match(lab):
+                # Top-level numeric: update parent context for following letters.
+                current_parent = lab.rstrip(")").rstrip(".")
+                new_sub_parts.append(sp)
+                continue
+
+            m = letter_re.match(lab)
+            if m and current_parent:
+                letter = m.group(1)
+                # Preserve original brackets/casing minimally — combine as parent(letter).
+                combined = f"{current_parent}({letter})"
+                renamed_log.append(f"{lab!r}→{combined!r}")
+                new_sp = dict(sp)
+                new_sp["question_number"] = combined
+                new_sub_parts.append(new_sp)
+                continue
+
+            # Anything else (e.g. already-combined "4.1(a)", or unusual label)
+            # passes through unchanged.
+            new_sub_parts.append(sp)
+
+        if renamed_log:
+            logger.info(
+                f"Normalized floating letter-labels in student sub_parts: "
+                f"{'; '.join(renamed_log)}"
+            )
+
+        out = dict(student_data)
+        out["sub_parts"] = new_sub_parts
+        return out
+
     def _format_student_for_prompt(self, student_data: dict) -> str:
         """Flatten student assignment JSON into readable text for the grader.
 
@@ -1548,6 +1681,11 @@ class StudentGrader:
         """
         if not isinstance(student_data, dict):
             return str(student_data)
+
+        # Normalize floating letter-labels BEFORE flattening into prompt text.
+        # This is the fallback for students extracted before the parent-preserving
+        # extraction prompt was deployed.
+        student_data = self._normalize_floating_letter_labels(student_data)
 
         def _extract_question_id(label: str) -> Optional[str]:
             """Extract the canonical question number from a sub-part label.
@@ -1899,6 +2037,626 @@ class StudentGrader:
 
 
 
+    def _sanitize_holistic_comments(
+        self, comments: list, student_text: str
+    ) -> list[str]:
+        """Pre-flight check on comment anchors before they hit the annotator.
+
+        The annotator dumps any comment whose anchor it cannot find into
+        `unanchored_comments` — invisible to the student. Two LLM failure modes
+        cause this:
+          1. Anchor too long (6+ words) — spans PDF lines, exact match fails.
+          2. Hallucinated anchor — not a verbatim substring of the student text.
+
+        This pass trims oversize anchors to a 3-5 word window and verifies
+        each anchor is actually present in the student text. Comments that
+        can't be salvaged are dropped with a debug log.
+        """
+        if not isinstance(comments, list) or not comments:
+            return []
+
+        # Normalised version of student text for substring search — tolerant of
+        # whitespace differences but preserves typos/casing the LLM should copy.
+        st = student_text or self._student_text_last_run or ""
+        st_norm = re.sub(r"\s+", " ", st)
+        st_norm_lower = st_norm.lower()
+
+        def _anchor_present(anchor: str) -> bool:
+            if not anchor:
+                return False
+            a_norm = re.sub(r"\s+", " ", anchor).strip()
+            return a_norm.lower() in st_norm_lower
+
+        prefix_re = re.compile(r"^\s*\[([^\]]+)\]\s*")
+        out: list[str] = []
+        dropped = 0
+        trimmed = 0
+
+        for c in comments:
+            if not isinstance(c, str) or "→" not in c:
+                # Wrong format — pass through; annotator will skip it itself.
+                if isinstance(c, str) and c.strip():
+                    out.append(c)
+                continue
+
+            prefix_match = prefix_re.match(c)
+            prefix = prefix_match.group(0) if prefix_match else ""
+            body = c[len(prefix):] if prefix else c
+
+            left, right = body.split("→", 1)
+            anchor = left.strip().strip('"\'')
+            feedback = right.strip()
+
+            if not anchor or not feedback:
+                dropped += 1
+                logger.debug(f"  Dropping malformed comment: {c[:80]!r}")
+                continue
+
+            # 1. Verify the anchor is actually in the student text. If the LLM
+            #    hallucinated something the student didn't write, the annotator
+            #    will silently fail — drop the comment now.
+            if not _anchor_present(anchor):
+                # Last-chance salvage: try shorter prefixes (3 words, 4 words).
+                a_words = anchor.split()
+                salvaged: Optional[str] = None
+                for n in (3, 4, 5):
+                    if n < len(a_words):
+                        candidate = " ".join(a_words[:n])
+                        if _anchor_present(candidate):
+                            salvaged = candidate
+                            break
+                if not salvaged:
+                    dropped += 1
+                    logger.debug(
+                        f"  Dropping comment with hallucinated/unverifiable anchor: "
+                        f"{anchor!r}"
+                    )
+                    continue
+                anchor = salvaged
+                trimmed += 1
+
+            # 2. Trim oversize anchors to a 3-5 word window. Search for a 4-word
+            #    or 5-word sub-window that appears verbatim in the student text;
+            #    prefer the first such window so the popup lands near the start
+            #    of the issue.
+            a_words = anchor.split()
+            if len(a_words) > 5:
+                shorter: Optional[str] = None
+                for size in (5, 4, 3):
+                    for start in range(0, len(a_words) - size + 1):
+                        cand = " ".join(a_words[start:start + size])
+                        if _anchor_present(cand):
+                            shorter = cand
+                            break
+                    if shorter:
+                        break
+                if shorter:
+                    anchor = shorter
+                    trimmed += 1
+                else:
+                    # Fall back to first 4 words even if not perfect match.
+                    anchor = " ".join(a_words[:4])
+                    trimmed += 1
+
+            out.append(f"{prefix}{anchor} → {feedback}")
+
+        if dropped or trimmed:
+            logger.info(
+                f"Comment sanitization: trimmed {trimmed} anchor(s), "
+                f"dropped {dropped} comment(s) with un-locatable anchors"
+            )
+        return out
+
+    # Stop-words that should never be the FIRST or LAST word of a key_phrase
+    # (they make the underline bleed onto a stray article/preposition).
+    _KP_STOPWORDS = frozenset({
+        "a", "an", "the", "to", "of", "in", "on", "at", "for", "with", "by",
+        "and", "or", "but", "so", "as", "is", "are", "was", "were", "be",
+        "this", "that", "these", "those", "it", "its", "their",
+    })
+
+    @classmethod
+    def _trim_stopword_edges(cls, key_phrase: str, sentence: str) -> str:
+        """Strip leading/trailing stop-words from key_phrase so the underline
+        doesn't bleed onto a stray "a" / "the" / "to" / "of" at the edges.
+
+        Example: "Griffins goals aligning to closely to" → "Griffins goals aligning to closely"
+        Example: "unable to identify issues in the" → "unable to identify issues"
+        Example: "to keep Nicola on as engagement partner" → "keep Nicola on as engagement partner"
+        """
+        if not key_phrase:
+            return key_phrase
+        tokens = key_phrase.split()
+
+        def _is_stop(tok: str) -> bool:
+            return re.sub(r"[^\w]+", "", tok).lower() in cls._KP_STOPWORDS
+
+        while tokens and _is_stop(tokens[-1]):
+            tokens.pop()
+        while tokens and _is_stop(tokens[0]):
+            tokens.pop(0)
+        return " ".join(tokens) if tokens else key_phrase
+
+    @staticmethod
+    def _expand_short_key_phrase(short_kp: str, sentence: str) -> str:
+        """Grow a too-short key_phrase (1-3 words) into a 4-6 word window of
+        surrounding context from the parent sentence.
+
+        Used to avoid placing ticks on bare fragments like "reviewing payroll"
+        or "to Yeti's" — those visually land on stray articles in the rendered
+        PDF. We find the short phrase inside the sentence and pad outward
+        until the slice is 4-6 words, preferring left-padding (subject context)
+        over right-padding when the short phrase already contains the verb.
+        """
+        if not short_kp or not sentence:
+            return short_kp
+        kp_tokens = short_kp.split()
+        if len(kp_tokens) >= 4:
+            return short_kp
+
+        sent_tokens = sentence.split()
+        if len(sent_tokens) < 4:
+            return short_kp  # whole sentence is too short to grow into
+
+        # Locate the short phrase inside the sentence (case-insensitive, tolerant
+        # of trailing/leading punctuation differences like "yrs" vs "yrs.").
+        def _norm(s: str) -> str:
+            return re.sub(r"[^\w]+", "", s).lower()
+
+        kp_norm = _norm(short_kp)
+        sent_norm = [_norm(t) for t in sent_tokens]
+        for start in range(len(sent_tokens) - len(kp_tokens) + 1):
+            window_norm = "".join(sent_norm[start:start + len(kp_tokens)])
+            if window_norm == kp_norm:
+                # Found placement. Pad to 4-6 words.
+                target = min(6, max(4, len(kp_tokens) + 2))
+                # Prefer extending leftward first (gives context/subject).
+                lo, hi = start, start + len(kp_tokens)
+                while (hi - lo) < target and (lo > 0 or hi < len(sent_tokens)):
+                    if lo > 0 and (hi - lo) < target:
+                        lo -= 1
+                    elif hi < len(sent_tokens):
+                        hi += 1
+                    else:
+                        break
+                return " ".join(sent_tokens[lo:hi])
+
+        # Phrase not found by full-match — fall back to any 4-5 word window
+        # of the sentence that contains at least one substantive keyword from
+        # the original short phrase.
+        kp_word_set = {_norm(w) for w in kp_tokens if len(w) >= 3}
+        for size in (5, 4):
+            for start in range(max(0, len(sent_tokens) - size + 1)):
+                window = sent_tokens[start:start + size]
+                if len(window) < 4:
+                    continue
+                window_norm_set = {_norm(w) for w in window}
+                if kp_word_set & window_norm_set:
+                    return " ".join(window)
+
+        return short_kp  # give up; caller will drop it
+
+    # ── Coverage audit helpers (option B post-processing) ──────────────────
+
+    @staticmethod
+    def _audit_split_sentences(text: str) -> list[str]:
+        """Split student text into sentence-like chunks for keyword scanning."""
+        if not text:
+            return []
+        chunks = re.split(r"(?<=[.!?])\s+|\n+", text)
+        return [c.strip() for c in chunks if c and c.strip()]
+
+    @staticmethod
+    def _audit_stem_match(kw_token: str, txt_tokens: set) -> bool:
+        """True if any text token shares a stem prefix with kw_token.
+
+        Catches morphological variants like physical/physically, decide/decision,
+        consent/consenting, separated/separation. Uses a 4–5-char prefix as the stem.
+        """
+        kw = kw_token.lower()
+        if len(kw) < 4:
+            return kw in txt_tokens
+        stem = kw[:5] if len(kw) >= 6 else kw[:4]
+        for t in txt_tokens:
+            if len(t) < 3:
+                continue
+            if t.startswith(stem) or kw.startswith(t[:max(4, min(len(t), 5))]):
+                return True
+        return False
+
+    @staticmethod
+    def _audit_keyword_in_text(keyword: str, text: str) -> bool:
+        """Check if a keyword (or close morphological/partial variant) appears in text.
+
+        Multi-word keywords: pass if the literal phrase appears, OR if at least
+        half of the substantive (≥4-char) tokens have a stem match in text.
+        Single-word keywords: pass on stem-prefix match (handles plural/-ed/-ing/etc.).
+        """
+        if not keyword or not text:
+            return False
+        kw_low = keyword.lower().strip()
+        txt_low = text.lower()
+        txt_tokens = set(re.findall(r"[a-z]+", txt_low))
+
+        # Multi-word / separator-containing keyword.
+        if any(c in kw_low for c in (" ", "/", "-")):
+            if kw_low in txt_low:
+                return True
+            kw_tokens = [t for t in re.findall(r"[a-z]+", kw_low) if len(t) >= 4]
+            if not kw_tokens:
+                return False
+            matches = sum(
+                1 for kt in kw_tokens if StudentGrader._audit_stem_match(kt, txt_tokens)
+            )
+            return matches >= max(1, (len(kw_tokens) + 1) // 2)
+
+        # Single-word keyword.
+        if len(kw_low) < 3:
+            return False
+        return StudentGrader._audit_stem_match(kw_low, txt_tokens)
+
+    def _audit_score_criterion(self, criterion: dict, sentence: str) -> float:
+        """0..1 score for how strongly a sentence supports a criterion."""
+        keywords = [k for k in (criterion.get("keywords") or []) if isinstance(k, str)]
+        if not keywords:
+            desc = str(criterion.get("description", "") or "")
+            keywords = [w for w in re.findall(r"\w+", desc) if len(w) > 4][:6]
+            if not keywords:
+                return 0.0
+        matched = sum(1 for kw in keywords if self._audit_keyword_in_text(kw, sentence))
+        return matched / float(len(keywords))
+
+    def _audit_best_sentence(
+        self, criterion: dict, sentences: list[str], threshold: float = 0.34
+    ) -> Optional[Tuple[str, float]]:
+        best, best_score = None, 0.0
+        for s in sentences:
+            score = self._audit_score_criterion(criterion, s)
+            if score > best_score:
+                best, best_score = s, score
+        if best is not None and best_score >= threshold:
+            return best, best_score
+        return None
+
+    def _audit_existing_ticks_for_criterion(
+        self, criterion: dict, existing_pts: list[dict]
+    ) -> int:
+        """Count how many existing correct_points already credit this criterion
+        (by keyword presence in the tick's text or key_phrase)."""
+        keywords = [k for k in (criterion.get("keywords") or []) if isinstance(k, str)]
+        if not keywords:
+            return 0
+        count = 0
+        for pt in existing_pts:
+            blob = f"{pt.get('text', '')} {pt.get('key_phrase', '')}"
+            if any(self._audit_keyword_in_text(kw, blob) for kw in keywords):
+                count += 1
+        return count
+
+    def _audit_pick_anchor(
+        self, sentence: str, keywords: list[str], used_phrases: list[str]
+    ) -> Optional[str]:
+        """Pick a 4-6 word slice of sentence containing a keyword, with no word
+        overlap against used_phrases. Falls back to any non-overlapping window.
+
+        Minimum 4 words: a 1-3 word slice places the tick on an ambiguous
+        fragment that visually looks like a tick on a stray article in the PDF.
+        """
+        if not sentence:
+            return None
+        used_words: set = set()
+        for up in used_phrases:
+            used_words.update(re.findall(r"\w+", (up or "").lower()))
+
+        tokens = sentence.split()
+        n = len(tokens)
+        if n < 4:
+            return None
+
+        kw_positions: list[int] = []
+        for kw in keywords or []:
+            kw_low = kw.lower().strip()
+            if not kw_low:
+                continue
+            kw_tokens = [t for t in re.findall(r"[a-z]+", kw_low) if len(t) >= 3]
+            for i, tok in enumerate(tokens):
+                tok_clean = re.sub(r"[^a-z]+", "", tok.lower())
+                if not tok_clean:
+                    continue
+                if any(
+                    self._audit_stem_match(kt, {tok_clean}) for kt in kw_tokens
+                ):
+                    kw_positions.append(i)
+
+        for pos in kw_positions:
+            for size in (5, 4, 6):
+                for start in range(max(0, pos - size + 1), min(n - size + 1, pos + 1) + 1):
+                    if start < 0 or start + size > n:
+                        continue
+                    window = tokens[start:start + size]
+                    if len(window) < 4:
+                        continue
+                    win_words = set(re.findall(r"\w+", " ".join(window).lower()))
+                    if not (win_words & used_words):
+                        return " ".join(window)
+
+        for size in (5, 4):
+            for start in range(max(0, n - size + 1)):
+                window = tokens[start:start + size]
+                if len(window) < 4:
+                    continue
+                win_words = set(re.findall(r"\w+", " ".join(window).lower()))
+                if not (win_words & used_words):
+                    return " ".join(window)
+        return None
+
+    def _audit_holistic_coverage(
+        self, breakdown: list, student_text: str
+    ) -> list:
+        """For each sub-question, ensure rubric criteria with sufficient student
+        text support have their full mark value's worth of ticks. Adds ticks for
+        under-credited criteria, anchored at non-overlapping key_phrases inside
+        the best-matching student sentence. Caps at each sub-question's max_marks.
+
+        Guardrails:
+        • Dual threshold — easier to AUGMENT criteria the LLM already credited
+          (existing_for_crit > 0) than to introduce NEW credit (existing == 0).
+        • Per-sentence global cap — any single student sentence can earn at most
+          PER_TEXT_TICK_CAP ticks across all leaves (prevents one sentence from
+          being credited for every shared-keyword criterion in the rubric).
+        """
+        if os.getenv("AUDIT_HOLISTIC_COVERAGE", "1").strip().lower() in {"0", "false", "no"}:
+            return breakdown
+        if not getattr(self, "_holistic_grading", False):
+            return breakdown
+        if not (self._holistic_sub_questions and student_text):
+            return breakdown
+
+        AUGMENT_THRESHOLD = float(os.getenv("AUDIT_AUGMENT_THRESHOLD", "0.34"))
+        NEW_THRESHOLD = float(os.getenv("AUDIT_NEW_THRESHOLD", "0.55"))
+        PER_TEXT_TICK_CAP = int(os.getenv("AUDIT_PER_TEXT_TICK_CAP", "4"))
+        # When the LLM has already credited a parent section to ≥SECTION_TRUST_RATIO
+        # of its section_cap, skip the audit ENTIRELY for that section's leaves
+        # (no new credit AND no augmenting). The LLM's coverage call is final.
+        # Default 0.75 — at ≥75% of the cap, trust the LLM.
+        SECTION_TRUST_RATIO = float(os.getenv("AUDIT_SECTION_TRUST_RATIO", "0.75"))
+
+        sq_meta: dict = {}
+        for sq in self._holistic_sub_questions:
+            label = str(sq.get("sub_question", "")).strip()
+            sq_meta[label] = {
+                "criteria": sq.get("marking_criteria") or [],
+                "max_marks": float(sq.get("max_marks") or 0),
+                "parent_section": sq.get("parent_section"),
+                "section_cap": sq.get("section_cap"),
+            }
+
+        sentences = self._audit_split_sentences(student_text)
+
+        # Seed per-sentence tick counter with all existing LLM ticks across the
+        # whole question so audit additions stay under the cap globally.
+        sentence_ticks: dict[str, int] = {}
+        for item in breakdown:
+            for pt in (item.get("_correct_points_with_marks", []) or []):
+                txt = pt.get("text", "")
+                if txt:
+                    sentence_ticks[txt] = sentence_ticks.get(txt, 0) + 1
+
+        # Pre-compute LLM-awarded marks per parent_section. If the LLM has
+        # already credited a section close to its cap, we should not add any
+        # NEW criteria there (only augment existing partial credit). This
+        # prevents the audit from over-shooting on tightly-capped sections
+        # like 4.2 (cap=4, where rubric criteria across leaves are similar).
+        section_llm_marks: dict[str, float] = {}
+        section_caps: dict[str, float] = {}
+        for item in breakdown:
+            sq = str(item.get("_sub_question", "")).strip()
+            meta = sq_meta.get(sq) or {}
+            parent = meta.get("parent_section")
+            cap = meta.get("section_cap")
+            if parent and cap is not None:
+                section_llm_marks[parent] = (
+                    section_llm_marks.get(parent, 0.0)
+                    + float(item.get("marks_awarded", 0) or 0)
+                )
+                section_caps[parent] = float(cap)
+
+        section_trusted: set[str] = set()
+        for parent, llm_total in section_llm_marks.items():
+            cap = section_caps.get(parent, 0.0)
+            if cap > 0 and llm_total >= cap * SECTION_TRUST_RATIO:
+                section_trusted.add(parent)
+                logger.info(
+                    f"Audit: section {parent} LLM gave {llm_total}/{cap} "
+                    f"(≥{SECTION_TRUST_RATIO:.0%}) — skipping audit entirely"
+                )
+
+        # Running marks per parent_section so audit additions stop at the cap.
+        section_running_marks: dict[str, float] = dict(section_llm_marks)
+
+        audit_log: list[str] = []
+
+        for item in breakdown:
+            sq = str(item.get("_sub_question", "")).strip()
+            meta = sq_meta.get(sq)
+            if not meta or not meta["criteria"]:
+                continue
+
+            existing_pts = list(item.get("_correct_points_with_marks", []) or [])
+            added = 0
+            parent_section = meta.get("parent_section")
+            section_cap_val = meta.get("section_cap")
+            is_trusted = parent_section in section_trusted
+
+            # Trusted-section short-circuit: when the LLM has already credited
+            # this parent section close to its cap (≥ SECTION_TRUST_RATIO), skip
+            # the audit entirely for this leaf — no new credit AND no augmenting
+            # of partial credits. The LLM's coverage call is treated as final.
+            # Without this, partial-credit augmentation can still push the
+            # section's total to the cap when teacher would have left it lower.
+            if is_trusted:
+                continue
+
+            for crit in meta["criteria"]:
+                crit_marks = float(crit.get("marks") or 1)
+                expected_ticks = int(round(crit_marks * 2))
+                existing_for_crit = self._audit_existing_ticks_for_criterion(crit, existing_pts)
+                if existing_for_crit >= expected_ticks:
+                    continue
+
+                threshold = AUGMENT_THRESHOLD if existing_for_crit > 0 else NEW_THRESHOLD
+                match = self._audit_best_sentence(crit, sentences, threshold=threshold)
+                if not match:
+                    continue
+                best_sent, _score = match
+                keywords = [k for k in (crit.get("keywords") or []) if isinstance(k, str)]
+                used_phrases_in_sent = [
+                    pt.get("key_phrase", "") for pt in existing_pts
+                    if pt.get("text", "") == best_sent
+                ]
+
+                need = expected_ticks - existing_for_crit
+                for _ in range(need):
+                    # Stop if the parent section_cap is already saturated.
+                    if (
+                        parent_section
+                        and section_cap_val is not None
+                        and section_running_marks.get(parent_section, 0.0) >= float(section_cap_val)
+                    ):
+                        break
+                    # Per-sentence global cap — protects against over-crediting
+                    # the same student sentence under multiple shared-keyword criteria.
+                    if sentence_ticks.get(best_sent, 0) >= PER_TEXT_TICK_CAP:
+                        break
+                    anchor = self._audit_pick_anchor(best_sent, keywords, used_phrases_in_sent)
+                    if not anchor:
+                        break
+                    existing_pts.append({
+                        "text": best_sent,
+                        "marks": 0.5,
+                        "key_phrase": anchor,
+                    })
+                    used_phrases_in_sent.append(anchor)
+                    sentence_ticks[best_sent] = sentence_ticks.get(best_sent, 0) + 1
+                    if parent_section:
+                        section_running_marks[parent_section] = (
+                            section_running_marks.get(parent_section, 0.0) + 0.5
+                        )
+                    added += 1
+
+            sub_max = meta["max_marks"]
+            if sub_max > 0:
+                cap_count = int(round(sub_max / 0.5))
+                if len(existing_pts) > cap_count:
+                    existing_pts = existing_pts[:cap_count]
+
+            item["_correct_points_with_marks"] = existing_pts
+            item["marks_awarded"] = len(existing_pts) * 0.5
+            item["evidence"] = list(dict.fromkeys(pt["text"] for pt in existing_pts))
+
+            if added > 0:
+                audit_log.append(
+                    f"{sq}: +{added} ticks (now {len(existing_pts)} = {item['marks_awarded']} marks)"
+                )
+
+        if audit_log:
+            logger.info(f"Coverage audit added ticks → {'; '.join(audit_log)}")
+        return breakdown
+
+    def _aggregate_holistic_breakdown(self, breakdown: list) -> list:
+        """Aggregate per-criterion holistic breakdown into parent-section level entries.
+
+        For theoretical papers, the LLM grades fine-grained sub-questions like
+        "4.1(a) Consequences", "4.1(b) Recommendations", etc.  The MongoDB
+        breakdown should show one entry per top-level section (4.1, 4.2, …)
+        with aggregated marks, while keeping all tick annotation data merged.
+        """
+        from collections import OrderedDict
+
+        # Build lookup: sub_question_label → {parent_section, section_cap}
+        sq_meta: dict = {}
+        for sq in (getattr(self, "_holistic_sub_questions", None) or []):
+            label = str(sq.get("sub_question", "")).strip()
+            sq_meta[label] = {
+                "parent_section": sq.get("parent_section"),
+                "section_cap": sq.get("section_cap"),
+            }
+
+        groups: "OrderedDict[str, list]" = OrderedDict()
+        group_cap: dict = {}
+
+        for item in breakdown:
+            sub_q = str(item.get("_sub_question", "")).strip()
+            meta = sq_meta.get(sub_q, {})
+            parent = meta.get("parent_section")
+            section_cap = meta.get("section_cap")
+
+            group_key = parent if parent else sub_q
+            if group_key not in groups:
+                groups[group_key] = []
+                group_cap[group_key] = section_cap if (parent and section_cap is not None) else item.get("max_possible", 0)
+            groups[group_key].append(item)
+
+        # If every item is its own group there is nothing to aggregate.
+        if len(groups) == len(breakdown):
+            return breakdown
+
+        aggregated = []
+        for group_key, items in groups.items():
+            total_awarded = sum(float(i.get("marks_awarded", 0) or 0) for i in items)
+            max_possible = float(group_cap.get(group_key) or 0)
+            total_awarded = min(total_awarded, max_possible)
+            total_awarded = round(total_awarded / 0.5) * 0.5
+
+            # Merge evidence (deduplicated, order preserved).
+            seen_ev: set = set()
+            all_evidence = []
+            for item in items:
+                for ev in (item.get("evidence") or []):
+                    if ev not in seen_ev:
+                        all_evidence.append(ev)
+                        seen_ev.add(ev)
+
+            # Merge tick-annotation points.
+            all_correct_points = []
+            for item in items:
+                all_correct_points.extend(item.get("_correct_points_with_marks") or [])
+            target_count = int(round(total_awarded / 0.5))
+            if len(all_correct_points) > target_count:
+                all_correct_points = all_correct_points[:target_count]
+
+            # Merge not-required points (deduplicated).
+            seen_nr: set = set()
+            all_nr: list = []
+            for item in items:
+                for nr in (item.get("_not_required_points") or []):
+                    key = nr.get("text", "")
+                    if key not in seen_nr:
+                        all_nr.append(nr)
+                        seen_nr.add(key)
+
+            reasons = [i.get("reason", "").strip() for i in items if i.get("reason", "").strip()]
+            combined_reason = "; ".join(reasons)
+
+            student_label = next(
+                (i.get("_student_label", "") for i in items if i.get("_student_label", "")), ""
+            )
+
+            aggregated.append({
+                "criterion": f"Sub-question {group_key}",
+                "marks_awarded": total_awarded,
+                "max_possible": max_possible,
+                "reason": combined_reason,
+                "evidence": all_evidence,
+                "comments_summary": "",
+                "_sub_question": group_key,
+                "_student_label": student_label,
+                "_correct_points_with_marks": all_correct_points,
+                "_not_required_points": all_nr,
+            })
+
+        return aggregated
+
     def _run_holistic_grading(self, student_data: dict, model_data: dict, questions_data: dict) -> dict:
         """Execute holistic grading: compare full answers without per-criterion breakdown.
 
@@ -1956,6 +2714,22 @@ class StudentGrader:
             logger.warning(f"Holistic structured grading failed; falling back to text: {e}")
             holistic_parsed = None
 
+        # Degenerate-case detection: some providers/structured-output paths return
+        # the top-level score but drop the nested sub_grades array entirely. Treat
+        # that as a structured-output failure and fall through to the text path,
+        # which carries the same content as raw JSON in the message body.
+        if (
+            holistic_parsed is not None
+            and float(holistic_parsed.get("score", 0) or 0) > 0
+            and not (holistic_parsed.get("sub_grades") or [])
+        ):
+            logger.warning(
+                "Holistic structured output reported "
+                f"score={holistic_parsed.get('score')} but returned 0 sub_grades — "
+                "treating as parse failure and retrying via text path"
+            )
+            holistic_parsed = None
+
         # Attempt 2: text output + parse
         if holistic_parsed is None:
             try:
@@ -1963,9 +2737,18 @@ class StudentGrader:
                 holistic_parsed = _coerce_holistic(output)
                 validated = HolisticGradingResponse(**holistic_parsed)
                 holistic_parsed = validated.model_dump()
+                # Same degenerate-case guard for the text path.
+                if (
+                    float(holistic_parsed.get("score", 0) or 0) > 0
+                    and not (holistic_parsed.get("sub_grades") or [])
+                ):
+                    raise GradingError(
+                        f"Text path returned score={holistic_parsed.get('score')} with 0 sub_grades"
+                    )
                 logger.info(f"Holistic grading complete → {self.student_name} (Q{self.question_number}) [text]")
             except Exception as e:
                 logger.warning(f"Holistic text grading failed; attempting repair: {e}")
+                holistic_parsed = None
 
         # Attempt 3: repair
         if holistic_parsed is None:
@@ -2039,11 +2822,42 @@ class StudentGrader:
                     pt_marks = float(pt.get("marks", 0.5) or 0.5)
                     pt_marks = max(0.5, round(pt_marks / 0.5) * 0.5)
                     key_phrase = str(pt.get("key_phrase", "")).strip()
-                    # Enforce max 6 words — long key_phrases span PDF lines and
-                    # can't be found by the annotator. Truncate to first 6 words.
+                    # Enforce 4-6 word window. Long phrases (>6 words) span PDF
+                    # lines and can't be found; short phrases (<4 words) place
+                    # the tick on an ambiguous fragment that visually looks like
+                    # a tick on a stray article ("a", "the") in the rendered PDF.
                     kp_words = key_phrase.split()
                     if len(kp_words) > 6:
                         key_phrase = " ".join(kp_words[:6])
+                    elif 0 < len(kp_words) < 4 and text:
+                        # Try to grow the slice in-place by extending into the
+                        # surrounding sentence words.
+                        key_phrase = self._expand_short_key_phrase(key_phrase, text)
+                        kp_words = key_phrase.split()
+                        if len(kp_words) < 4:
+                            # Couldn't grow to ≥4 words — drop this tick rather
+                            # than place it on a misleading fragment.
+                            logger.debug(
+                                f"  Dropping tick with un-growable short key_phrase: "
+                                f"{pt.get('key_phrase', '')!r} (text: {text[:60]!r})"
+                            )
+                            continue
+                    # Trim trailing/leading stop-words so the underline doesn't
+                    # extend onto a stray article/preposition ("to", "the", "a",
+                    # "of", "in"). This is what creates the visual "tick on a"
+                    # complaint — the rect ends on a stop word and the underline
+                    # bleeds onto it. After trim, re-expand if we fell under 4.
+                    key_phrase = self._trim_stopword_edges(key_phrase, text)
+                    kp_words = key_phrase.split()
+                    if len(kp_words) < 4 and text:
+                        key_phrase = self._expand_short_key_phrase(key_phrase, text)
+                        kp_words = key_phrase.split()
+                        if len(kp_words) < 4:
+                            logger.debug(
+                                f"  Dropping tick after stop-word trim left short phrase: "
+                                f"{pt.get('key_phrase', '')!r} (text: {text[:60]!r})"
+                            )
+                            continue
                     if text:
                         evidence_texts.append(text)
                         if pt_marks == 0.5:
@@ -2067,18 +2881,30 @@ class StudentGrader:
                     evidence_texts.append(pt.strip())
                     points_with_marks.append({"text": pt.strip(), "marks": 0.5, "key_phrase": ""})
 
-            # Normalize: align correct_points count with marks_awarded.
-            # Each correct_point = 0.5 marks = 1 tick.
-            if points_with_marks and marks_awarded > 0:
+            # Strict consistency: marks_awarded MUST equal len(points_with_marks) × 0.5.
+            # Each correct_point = 0.5 marks = 1 tick on the PDF, so the totals
+            # rendered to the student cannot diverge from the visible tick count.
+            if marks_awarded > 0:
                 target_count = int(round(marks_awarded / 0.5))
                 if len(points_with_marks) > target_count:
-                    # Too many points — trim from the end (least important).
-                    points_with_marks = points_with_marks[:target_count]
+                    # Too many evidenced ticks — LLM reported lower marks; raise marks
+                    # to match the evidence it produced (each tick is 0.5 of evidence).
+                    marks_awarded = len(points_with_marks) * 0.5
                 elif len(points_with_marks) < target_count:
-                    # Fewer evidence points than marks allow — cap to evidenced
-                    # total plus a small grace (0.5) per sub-question.
-                    evidenced_marks = len(points_with_marks) * 0.5
-                    marks_awarded = min(marks_awarded, evidenced_marks + 0.5)
+                    # Fewer evidenced ticks than LLM-reported marks — trust the
+                    # evidence: marks must equal the visible tick count × 0.5.
+                    marks_awarded = len(points_with_marks) * 0.5
+            elif points_with_marks:
+                # LLM reported 0 marks but produced ticks — trust the ticks.
+                marks_awarded = len(points_with_marks) * 0.5
+
+            # Re-cap at this sub-question's own max_marks after the alignment.
+            sq_max = float(sg.get("max_marks", 0) or 0)
+            if sq_max > 0 and marks_awarded > sq_max:
+                marks_awarded = sq_max
+                target_count = int(round(marks_awarded / 0.5))
+                if len(points_with_marks) > target_count:
+                    points_with_marks = points_with_marks[:target_count]
 
             # Off-topic ("Not required") points — flagged by LLM, no marks.
             # Same key_phrase truncation rule as correct_points.
@@ -2124,32 +2950,34 @@ class StudentGrader:
                 f"0 sub_grades — structured output likely failed to parse"
             )
 
-        # Safety cap: ensure the sum of per-sub marks doesn't exceed
-        # the LLM's own reported total score (prevents grace compounding).
-        llm_reported_score = round(float(holistic_parsed.get("score", 0) or 0) / 0.5) * 0.5
-        breakdown_sum = sum(float(b.get("marks_awarded", 0) or 0) for b in breakdown)
-        if llm_reported_score > 0 and breakdown_sum > llm_reported_score:
-            # Scale each sub-question's marks proportionally to fit the LLM total.
-            scale = llm_reported_score / breakdown_sum if breakdown_sum > 0 else 1.0
-            for b in breakdown:
-                old_m = float(b.get("marks_awarded", 0) or 0)
-                b["marks_awarded"] = round((old_m * scale) / 0.5) * 0.5
-                # Trim correct_points to match adjusted marks
-                adjusted_count = int(round(b["marks_awarded"] / 0.5))
-                pts = b.get("_correct_points_with_marks", [])
-                if len(pts) > adjusted_count:
-                    b["_correct_points_with_marks"] = pts[:adjusted_count]
-            logger.info(
-                f"Capped breakdown sum {breakdown_sum} → {llm_reported_score} "
-                f"(LLM reported score)"
-            )
+        # Coverage audit: add ticks for rubric criteria the LLM under-credited.
+        # The audit becomes the authoritative source of marks for each sub-question;
+        # the LLM's reported score is no longer used as an upper bound after this.
+        breakdown = self._audit_holistic_coverage(breakdown, student_text)
+
+        # Aggregate fine-grained sub-question entries into parent-section level
+        # (e.g. "4.1(a) Consequences" + "4.1(b) Recommendations" + … → "4.1").
+        breakdown = self._aggregate_holistic_breakdown(breakdown)
+
+        # Recompute total score from audited+aggregated breakdown so the
+        # student-facing total matches the tick counts shown in each section.
+        total_max = float(holistic_parsed.get("total_marks", 0) or 0)
+        audited_score = sum(float(b.get("marks_awarded", 0) or 0) for b in breakdown)
+        if total_max > 0:
+            audited_score = min(audited_score, total_max)
+        audited_score = round(audited_score / 0.5) * 0.5
+
+        comments = self._sanitize_holistic_comments(
+            holistic_parsed.get("comments", []) or [],
+            student_text,
+        )
 
         converted = {
             "grades": [{
                 "question_number": holistic_parsed.get("question_number", self.question_number),
-                "score": holistic_parsed.get("score", 0),
-                "total_marks": holistic_parsed.get("total_marks", 0),
-                "comments": holistic_parsed.get("comments", []),
+                "score": audited_score,
+                "total_marks": total_max,
+                "comments": comments,
                 "correct_words": [],
                 "breakdown": breakdown,
             }]
@@ -2157,8 +2985,9 @@ class StudentGrader:
 
         logger.info(
             f"Holistic grading converted to standard format: "
-            f"{len(breakdown)} sub-question breakdown items, "
-            f"score={holistic_parsed.get('score', 0)}/{holistic_parsed.get('total_marks', 0)}"
+            f"{len(breakdown)} section-level breakdown items, "
+            f"score={audited_score}/{total_max} "
+            f"(LLM-only score was {holistic_parsed.get('score', 0)})"
         )
         return converted
 

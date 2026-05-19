@@ -1,89 +1,139 @@
-STUDENT_ASSIGNMENT_EXTRACTION_PROMPT_TEMPLATE = """You are an expert at extracting and structuring handwritten or typed student answers from PDF page images.
+STUDENT_ASSIGNMENT_EXTRACTION_PROMPT_TEMPLATE = """You are extracting a student's typed/handwritten answer from PDF page images.
 
-CRITICAL OUTPUT REQUIREMENTS:
-- Your output MUST contain ONLY clean, standard printable characters.
-- Use ONLY: letters, numbers, standard punctuation (. , ; : ! ? - ( ) [ ]), spaces, and newlines.
-- NO control characters, NO Unicode artifacts, NO escape sequences.
-- Replace bullet symbols with standard dashes (-) or asterisks (*).
-- Output clean, readable text that can be directly used without post-processing.
+The pages provided ARE this student's answer. They have already been pre-selected
+upstream — your job is to faithfully extract every word, NOT to filter by question
+label. Whatever the student wrote on these pages is the answer; never return empty
+output when the pages contain text.
 
-TARGET QUESTION: {question_number}
-You MUST extract ONLY the student's answer for Question {question_number}.
+═══════════════════════════════════════════════════
+OUTPUT FIELDS
+═══════════════════════════════════════════════════
 
-EXTRACTION RULES:
-- Key rule all the given pages belongs to the same question mainly focus on first and last page as they may contain different question, but check properly if question is different because mostly it's same question with different subpart.
-- From the given pages only first and last may contain answers to MULTIPLE questions. You MUST identify and extract ONLY the content belonging to Question {question_number}.
-- Look for question labels such as "Q-{question_number}", "Q.{question_number}", "Q{question_number}", "Question {question_number}", "{question_number}.", "{question_number}-", "{question_number})" or similar patterns to identify where Question {question_number} starts.
-- STOP extracting ONLY when you see a label that contains the word "Question", "Q.", "Q-", or "Q " immediately followed by a number DIFFERENT from {question_number} (e.g. "Question 2", "Q.3", "Q-02"). That is the ONLY valid question boundary.
-- SAME-PAGE BOUNDARY RULE (CRITICAL): A new question label (e.g. "Q2") may appear partway through a page. Any content that appears BEFORE that label on the SAME page still belongs to Question {question_number} and MUST be included. Extract ALL text on the page up to (but not including) the new question label, then stop. Never discard content just because the same page also contains a later question.
-- SCENARIO NUMBERING IS NEVER A QUESTION BOUNDARY: Patterns such as "1-", "2-", "3-", "1.", "2.", "1)", "(1)", "Case 1", "Case 2", "Scenario 1", "Scenario 2" etc. are sub-parts of the current question. NEVER stop extraction or treat them as the start of a new top-level question.
-- In auditing or case-study questions, students frequently label separate company scenarios as "1- Company Name" and "2- Another Company". These are ALWAYS sub-parts of the same question, never a new question.
-- Content that appears BEFORE the start of Question {question_number} belongs to a different question — EXCLUDE it entirely.
-- Content that appears AFTER Question {question_number} ends (i.e., after a new TOP-LEVEL question label) — EXCLUDE it entirely.
-- Within Question {question_number}, extract ALL content including sub-sections, sub-headings, tables, and workings across ALL provided pages.
-- MULTI-PAGE SUB-QUESTIONS: A sub-question (e.g. 4.1, 4.2) may start near the BOTTOM of one page and continue to the TOP of the NEXT page. In that case BOTH pages belong to that sub-question. Do NOT treat a page break as the end of a sub-question. Continue extracting the sub-question's content from the next page until you see a NEW sub-question label (e.g. 4.2) or a new top-level question label.
-- If only the sub-question HEADING appears on one page and its full answer is on the following page, include ALL the answer content — the heading and the answer are one unit.
-- If the pages only contain one question and it matches {question_number}, extract everything.
-- If you cannot find Question {question_number} on the provided pages, return minimal output with empty answer content.
-- NEVER merge or pull content from any other question.
-- Ignore page headers, footers, "Continued...", watermarks, candidate numbers, etc.
-- LAST-PAGE BOUNDARY CHECK: The last provided page may contain BOTH the end of Question {question_number} AND the start of a new question (e.g. "Question 2"). In that case extract ALL content on that page that belongs to Question {question_number} (everything before the new question label), then stop. Never discard content from the last page just because another question also starts on it.
+1. `question`: set this to "{question_number}".
 
-TABLE EXTRACTION RULES:
-- Tables are CRITICAL—extract them completely and accurately.
-- Preserve row and column structure clearly.
-- Format tables as plain text with clear separators (use | or spaces).
-- Keep ALL numerical values, units, currency symbols, and column headings exactly as written.
-- Maintain correct alignment of numbers with their labels.
-- NEVER omit a table. If any table cell/row is hard to read, include your best-effort extraction and add "[unclear]" in-place rather than dropping the row/table.
+2. `sub_parts`: an array, ALWAYS containing at least one entry.
 
-SUB-SECTION DETECTION (strict priority order – apply ONLY the first that matches):
+   • If the student used explicit sub-part labels (e.g. "4.1", "4.2", "a)", "b)",
+     "(i)", "(ii)", "1-", "2-", "Case 1", "Scenario 2", "Part A"), create ONE
+     entry per label:
+         - `question_number`: the label EXACTLY as the student wrote it
+           (preserve casing, punctuation, and any typos)
+         - `answer`: the full content under that label up to (but not including)
+           the next sub-part label or the end of the pages, preserving paragraphs,
+           tables, bullet points, and workings
 
-1. MULTIPLE SCENARIOS / CASES PATTERN (most common in auditing/accounting questions)
-   If the answer contains clear numbered scenario blocks in any of these formats:
-       • "1- ", "2- ", "3- ", ... (dash style)
-       • "1. ", "2. ", "3. ", ... (dot style)
-       • "1)", "2)", "(1)", "(2)", "Case 1", "Case 2", "Scenario 1", "Scenario 2"
-   followed by a company name, topic, or descriptive title (e.g. "1- Saffron limited:-", "2- Tech limited:"),
-   → treat EACH block as a separate sub_part.
-   → The sub_question_number = the exact prefix the student wrote ("1-", "2-", "1.", "Case 1", etc.).
-   → Extract the full content under each block (Materiality, Auditor action, Impact on report, etc.).
+   • NESTED LABELS — PRESERVE THE PARENT (CRITICAL):
+     If a top-level numeric sub-part label (e.g. "4.1") is followed by letter-style
+     sub-sub-labels ("a)", "b)", "(i)", "(ii)") BEFORE the next numeric label
+     appears, the letter-labels are CHILDREN of the numeric label. You MUST
+     combine the two into the `question_number` so the parent is preserved.
 
-2. OTHER NUMBERED/LETTERED SUB-PARTS
-   If the student has explicitly written sub-parts such as:
-       1.1, 1.2, 1(a), 1(b), a), b), c), (i), (ii), (A), (B), A., B., i), ii), etc.
-   → treat each as a separate sub_part with that exact identifier as question_number.
+       Student writes:                    Output should be:
+         4.1                              question_number "4.1(a)" with the a) answer,
+         a) ...consequences...            then "4.1(b)" with the b) answer.
+         b) ...recommendations...
+         4.2                              question_number "4.2"
+         ...
+         4.3                              question_number "4.3(a)" / "4.3(b)" if
+         A) ...threat...                  A)/b) appear under 4.3.
+         b) ...other threat...
 
-3. INTELLIGENT FALLBACK (use your reasoning)
-   If the student used any other clear, consistent NUMBERED OR LETTERED labeling system (e.g. "Part A", "Part B", "Step 1", "Step 2", "W1", "W2") that logically divides the answer into separate parts, treat those as sub_parts.
-   CRITICAL: Purely descriptive topic headings such as "Correct financial reporting treatment of X", "Discussion of Y", "Analysis of Z" etc. — with NO numeric or alphabetic label — do NOT qualify as sub-parts under this rule, no matter how consistently repeated. These are section headings within a single answer.
-   Only use this fallback when the labeling is numbered/lettered AND obvious and consistent across the pages.
+     The combined label uses the EXACT casing the student used (`4.3(A)` if
+     student wrote `A)`, `4.1(a)` if lowercase). NEVER drop the numeric parent
+     — letter-only labels like "a)" floating without context cannot be matched
+     to the rubric's sub-question structure downstream.
 
-4. OTHERWISE (final fallback)
-   If none of the above patterns are present, treat the entire answer as ONE single question.
-   → Output exactly ONE sub_part.
-   → Use the main question identifier (e.g. "Question 1" or "1") as the question_number.
-   → The answer field MUST contain ALL content for this question from ALL provided pages, concatenated in order — including every topic section, every working, every journal, every table. Do NOT stop at the first section heading. Continue until you reach the end of the question (a new top-level question label) or the end of the provided pages.
+   • MISSING PARENT — INFER IT (CRITICAL):
+     Students often omit the top-level numeric heading (e.g. "4.1") because
+     it's already printed in the question paper, and write only their letter
+     labels ("a)", "b)"). The question heading may also live on a different
+     page from the answer content. In BOTH cases you must INFER the missing
+     numeric parent from context:
 
-FORMATTING RULES:
-- Preserve original line breaks with \n\n between paragraphs.
-- Keep bullet points, numbering, and diagram descriptions exactly as written.
-- Use clear spacing to separate sections.
-- NEVER invent or create sub-parts based on content headings or topic names.
-- Do NOT treat descriptive headings as sub-question identifiers.
+       Case A — letter-labels appear at the START of the answer with NO
+                preceding numeric label, and the next numeric label is
+                e.g. "4.2":
 
-QUESTION HEADING TEXT (CRITICAL FOR ANNOTATION):
-- Populate a field `question_heading_text` with the EXACT verbatim text the student wrote as the heading/label for this question.
-- Copy it character-for-character, including any typos, spacing, or punctuation (e.g. "Quiestion 4", "Q4.", "QUESTION  4", "Q 4)").
-- If the student wrote no visible heading, set `question_heading_text` to null.
+         Student writes:                Output should be:
+           a) ...consequences...        question_number "4.1(a)" — INFERRED
+           b) ...recommendations...     question_number "4.1(b)" — INFERRED
+           4.2 ...                      question_number "4.2"
+           4.3 ...                      question_number "4.3"
 
-OPTIONAL PAGE TEXTS (IMPORTANT FOR ANNOTATION):
-- Populate a field `page_texts` as an array with one entry per provided page:
-    - `page`: the 1-based page number as given in the input
-    - `text`: ALL visible text on that page, verbatim — even if the page belongs to a different question, still copy its full raw text here.
-- `page_texts` must have one entry for EVERY page provided.
+       Case B — between two numeric labels, letter-labels appear that
+                clearly belong to a SKIPPED numeric (e.g. "4.1" missing
+                between section start and "4.2"):
 
-Return ONLY valid JSON with clean text — no markdown, no commentary, no preamble.
+         Apply the same inference. The skipped numeric is "(first numeric
+         seen) − 1" within the main question's structure.
+
+     For Question {question_number} specifically: if letter-labels appear
+     BEFORE the first numeric sub-label, infer their parent as "{question_number}.1".
+     If letter-labels appear between "{question_number}.N" and "{question_number}.M",
+     the parent is "{question_number}.N" (the most-recent prior numeric).
+
+     NEVER emit a bare letter-label ("a)", "b)", "A)", "(i)") as a top-level
+     `question_number` when a numeric parent can be reasonably inferred from
+     context — the grader will treat it as a separate question and fail to
+     match against the rubric.
+
+   • If NO sub-part labels are present, output EXACTLY ONE entry with:
+         - `question_number`: "{question_number}"
+         - `answer`: ALL content from ALL provided pages, concatenated in order
+
+   Descriptive topic headings ("Materiality", "Auditor action", "Conclusion",
+   "Discussion of X") are NEVER sub-parts — they are section headings inside a
+   sub-part. Sub-part identifiers are numbered or lettered labels only.
+
+3. `question_heading_text`: the EXACT verbatim heading the student wrote at the
+   start of their answer (e.g. "Quiestion 4", "Q4.", "QUESTION 4"), preserving
+   typos and spacing. Set to null if no visible heading.
+
+4. `page_texts`: one entry per provided page:
+         - `page`: 1-based page number
+         - `text`: ALL visible text on the page, verbatim
+
+═══════════════════════════════════════════════════
+ADJACENT-QUESTION TRIMMING (only when clearly present)
+═══════════════════════════════════════════════════
+
+If — and ONLY if — the first or last page contains a clearly-labelled OTHER
+top-level question (e.g. an explicit "Question 5" or "Q.3" written at the left
+margin), exclude only that other question's content from `sub_parts`. The full
+raw text still goes into `page_texts`. If no such other-question label appears,
+treat all content as belonging to this answer.
+
+Sub-part numbering like "4.1" / "4.2" or scenario numbering like "1-" / "2-" is
+NEVER an other-question boundary — those are sub-parts of the current answer.
+
+═══════════════════════════════════════════════════
+TEXT & TABLE FORMATTING
+═══════════════════════════════════════════════════
+
+- Use clean printable ASCII: letters, digits, standard punctuation (. , ; : ! ? - ( ) [ ]),
+  spaces, newlines. No control characters or Unicode artifacts.
+- Replace bullet symbols with "-" or "*".
+- Preserve paragraph breaks with \\n\\n.
+- Preserve every word, number, currency symbol, and unit exactly as written.
+- Tables: keep row and column structure as plain text using " | " or aligned
+  spaces. Keep all values and headings. NEVER drop a row — if a cell is
+  unreadable, write "[unclear]" in place.
+- Ignore page headers, footers, watermarks, "Continued...", candidate numbers.
+
+═══════════════════════════════════════════════════
+HARD CONSTRAINTS
+═══════════════════════════════════════════════════
+
+- `sub_parts` MUST contain at least one entry whenever the pages have any
+  student writing. Returning empty `sub_parts` (or an entry with an empty
+  `answer` while `page_texts` has content) is a failure.
+- NEVER invent sub-parts from descriptive topic headings.
+- NEVER paraphrase, summarise, or skip content — copy verbatim.
+- The label the student wrote for a sub-part may differ from the model's
+  expected numbering (e.g. student writes "4.1" while the system asks for
+  question "{question_number}"). Use the STUDENT'S label, not the system's.
+
+Return ONLY valid JSON — no markdown, no commentary, no preamble.
 """
 
 

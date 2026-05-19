@@ -46,7 +46,8 @@ OPENAI_STUDENT_SCHEMA = {
         },
         "sub_parts": {
             "type": "array",
-            "description": "All sub-parts or scenario entries within this question. Include EVERY sub-part the student wrote, across ALL provided pages. Sub-parts can be labelled as '1-', '2-', '3-', '1)', '2)', 'a)', 'b)', '1.1', '(i)', 'Case 1', 'Scenario 2', etc. A new sub-part label does NOT mean a new question — only a label containing the word 'Question' / 'Q' followed by a DIFFERENT number signals a new top-level question.",
+            "minItems": 1,
+            "description": "All sub-parts the student wrote, across ALL provided pages. MUST contain at least one entry whenever the pages have student writing — never return an empty array. Sub-part labels can be '4.1', '4.2', '1.1', 'a)', 'b)', '(i)', '1-', '2-', 'Case 1', 'Scenario 2', etc. Use the student's exact label, even if it differs from the system's expected question number. If the student wrote no sub-part labels at all, emit ONE entry whose answer field contains the full text from every page concatenated in order.",
             "items": {
                 "type": "object",
                 "properties": {

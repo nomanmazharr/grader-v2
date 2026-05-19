@@ -30,9 +30,23 @@ def _parse_pages(page_str: str) -> list[int]:
 
 
 def _extract_question_number(title: str) -> str:
-    """Extract leading number from title like '1 BAUHAUS PLC' → '1'."""
-    match = re.match(r'^(\d+)', title.strip())
-    return match.group(1) if match else "1"
+    """Best-effort guess at the question number from a model-answer title.
+
+    Handles all common title shapes — used only as the DEFAULT for the
+    explicit question_number input. The user can override in the UI.
+
+      "1 BAUHAUS PLC"                      → "1"
+      "1. Bauhaus"                         → "1"
+      "Question 4: ICAEW Mock Orchid 2024" → "4"
+      "Q4 Audit"                           → "4"
+      "Q.4 Audit" / "Q-4 Audit"            → "4"
+      anything else                        → ""
+    """
+    if not title:
+        return ""
+    pattern = r"^\s*(?:question\s+|q\.?\s*|q-\s*)?(\d+(?:\.\d+)?)"
+    match = re.match(pattern, title.strip(), flags=re.IGNORECASE)
+    return match.group(1) if match else ""
 
 
 def _save_file(uploaded_file, temp_dir: str) -> str:
@@ -85,13 +99,35 @@ def main():
     st.header("Student Assignment")
     student_pdf = st.file_uploader("Upload Student PDF", type="pdf")
 
+    default_qnum = _extract_question_number(selected["question_title"])
+
     col1, col2 = st.columns(2)
     with col1:
         student_name = st.text_input("Student Name", value="Student")
         student_pages_str = st.text_input("Student Pages (e.g. 1-5 or 1,2,3)", value="1,2,3,4,5")
+        question_num = st.text_input(
+            "Question Number",
+            value=default_qnum,
+            help=(
+                "The main question number the student is answering (e.g. '4' for "
+                "Q4 with sub-parts 4.1, 4.2, 4.3, 4.4). Auto-filled from the model "
+                "answer title — override if it looks wrong."
+            ),
+        )
     with col2:
         output_dir = st.text_input("Output Directory", value="annotations")
-        question_type = st.selectbox("Question Type", options=["numerical", "theoretical"], index=0) or "numerical"
+        question_type = st.selectbox(
+            "Question Type",
+            options=["numerical", "theoretical"],
+            index=0,
+            help=(
+                "numerical → per-criterion grading (1 mark per criterion, "
+                "full-line underline of working). Use for calculation / journal questions.\n\n"
+                "theoretical → holistic grading (0.5 marks per tick, sub-section "
+                "caps enforced). Use for narrative/discussion questions like audit, "
+                "ethics, internal control."
+            ),
+        ) or "numerical"
 
     # ── Grade ────────────────────────────────────────────────────────────────
     if st.button("Grade Student", type="primary"):
@@ -104,8 +140,12 @@ def main():
             st.error("Please specify valid student page numbers.")
             st.stop()
 
+        question_num = (question_num or "").strip()
+        if not question_num:
+            st.error("Please enter the question number the student is answering.")
+            st.stop()
+
         model_answers_id = selected["_id"]
-        question_num = _extract_question_number(selected["question_title"])
 
         os.makedirs(output_dir, exist_ok=True)
         student_path = _save_file(student_pdf, temp_dir)
