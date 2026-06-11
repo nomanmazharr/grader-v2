@@ -21,3 +21,14 @@ PAC_grade_breakdown.txt
 grade_breakdown_v7.txt
 grade_detail_v7.txt
 pyrightconfig.json
+*.json
+*.txt
+*.docx
+inspect_misses.py
+inspect_misses2.py
+render_annotations.py
+generate_bcp.py
+analyze_placements.py
+test_variants.py
+inspect_amber_socie.py
+inspect_page6_socie.py

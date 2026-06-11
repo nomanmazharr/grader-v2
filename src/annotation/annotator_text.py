@@ -63,8 +63,11 @@ def _split_comment_arrow(comment: str) -> Optional[tuple[str, str]]:
 def _build_anchor_variations(text: str) -> list[str]:
     """Build a small list of surface-form variants for an anchor string.
 
-    Handles percent / per cent / % interchangeability that arises from
-    LLM paraphrasing vs. the actual PDF symbol.
+    Handles symbol/code interchangeability that arises from LLM paraphrasing
+    vs. the actual PDF text:
+      • percent / per cent / %
+      • GBP / £
+      • USD / $
     """
     if not text or not isinstance(text, str):
         return []
@@ -85,6 +88,19 @@ def _build_anchor_variations(text: str) -> list[str]:
     if "%" in base:
         variants.append(re.sub(r"%", " percent", base))
         variants.append(re.sub(r"%", " per cent", base))
+
+    # GBP <-> £ — LLM evidence frequently uses the currency code "GBP"
+    # while student PDFs render the £ symbol (or vice versa).
+    if re.search(r"\bGBP\s*(?=\d)", base):
+        variants.append(re.sub(r"\bGBP\s*(?=\d)", "£", base))
+    if re.search(r"£\s*(?=\d)", base):
+        variants.append(re.sub(r"£\s*(?=\d)", "GBP", base))
+
+    # USD <-> $ — same pattern for US dollar evidence.
+    if re.search(r"\bUSD\s*(?=\d)", base):
+        variants.append(re.sub(r"\bUSD\s*(?=\d)", "$", base))
+    if re.search(r"\$\s*(?=\d)", base):
+        variants.append(re.sub(r"\$\s*(?=\d)", "USD", base))
 
     out: list[str] = []
     seen: set[str] = set()

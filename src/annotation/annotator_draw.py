@@ -96,6 +96,31 @@ def _fmt_mark_value(value: float) -> str:
 
 # ── Score label placement ──────────────────────────────────────────────────────
 
+def _find_value_x_on_line(page, rect: fitz.Rect) -> Optional[float]:
+    """Return the right-edge x-position of the rightmost numeric word on the
+    same line as *rect*. Returns None when the line has no numeric token —
+    i.e. it is a purely textual sentence.
+
+    "Numeric" here means the word contains at least one digit. Used to
+    anchor score labels over the value column on accounting/calc lines
+    rather than over the descriptive text on the left.
+    """
+    try:
+        line_y = (rect.y0 + rect.y1) / 2
+        best_x: Optional[float] = None
+        for w in _page_words(page):
+            wx0, wy0, wx1, wy1, text, *_ = w
+            if abs((wy0 + wy1) / 2 - line_y) > 4:
+                continue
+            t = (text or "").strip()
+            if t and any(c.isdigit() for c in t):
+                if best_x is None or wx1 > best_x:
+                    best_x = wx1
+        return best_x
+    except Exception:
+        return None
+
+
 def _place_score_label(
     page,
     rect: fitz.Rect,
@@ -103,7 +128,20 @@ def _place_score_label(
     placed_lines_per_page: dict,
     score_text: str,
 ) -> None:
-    """Place one red score label near the matched rect, avoiding collisions."""
+    """Place one red score label near the matched rect, avoiding collisions.
+
+    Placement priority:
+      1. If the line has a numeric value further right than the matched
+         rect (typical `description … value` layout), place the score
+         JUST AFTER that value on the same line — mirrors how theory-line
+         scores sit just after the descriptive text, so the reader sees
+         "value 0.25" unambiguously associated with that row.
+      2. Same case but with no room right of the value → fall back to
+         ABOVE the value (better than reverting to the text side).
+      3. Full-line evidence reaching the right margin → ABOVE the right
+         portion of the rect.
+      4. Else default just-right-of-rect — works for plain text answers.
+    """
     local_fs = _detect_fontsize_at_rect(page, rect, default=float(CONFIG['criterion_score_fontsize']))
     score_font = max(7.0, min(14.0, local_fs))
 
@@ -111,18 +149,47 @@ def _place_score_label(
     nearby_boxes: list[fitz.Rect] = placed_lines_per_page.get(page_idx, [])
 
     score_x = rect.x1 + 3
-    if score_x > page.rect.width - 70:
-        score_x = min(max(rect.x0, 50), page.rect.width - 70)
+    placement_anchored_to_value = False
+
+    # Step 1 — line has a value column further right than the rect:
+    # place score AFTER the value on the same line (best clarity).
+    value_x = _find_value_x_on_line(page, rect)
+    if value_x is not None and value_x > rect.x1 + 5:
+        proposed = value_x + 3
+        if proposed < page.rect.width - 25:
+            score_x = proposed
+            placement_anchored_to_value = True
+        else:
+            # No room to the right of the value — place ABOVE it.
+            score_x = min(max(value_x - 25, 50), page.rect.width - 70)
+            score_y = max(rect.y0 - (score_font + 2), 10)
+            placement_anchored_to_value = True
+
+    # Step 2 — rect itself reaches the right margin (full-line evidence
+    # including the value). Default rect.x1 + 3 would push off-page.
+    elif score_x > page.rect.width - 25:
+        score_x = min(max(rect.x1 - 30, 50), page.rect.width - 70)
+        score_y = max(rect.y0 - (score_font + 2), 10)
+        placement_anchored_to_value = True
 
     def _score_box(x: float, y: float) -> fitz.Rect:
         return fitz.Rect(x, y - (score_font + 1), x + 52, y + 3)
 
     placed_box = _score_box(max(score_x, 50), score_y)
     if any(placed_box.intersects(b) for b in nearby_boxes):
-        candidates_x = [
-            max(rect.x0 - 40, 50),
-            min(rect.x1 + 18, page.rect.width - 70),
-        ]
+        # When value-anchored, keep alternatives in the value column region
+        # so stacked labels (two criteria on same line) stay near the value
+        # rather than jumping back to the descriptive-text side.
+        if placement_anchored_to_value:
+            candidates_x = [
+                max(score_x - 25, 50),
+                min(score_x + 25, page.rect.width - 70),
+            ]
+        else:
+            candidates_x = [
+                max(rect.x0 - 40, 50),
+                min(rect.x1 + 18, page.rect.width - 70),
+            ]
         found = False
         for cx in candidates_x:
             cb = _score_box(cx, score_y)
@@ -259,6 +326,12 @@ def place_score_near_anchor(
     draw_underline: bool = True,
     # FIX-1: draw_underline=False when anchor is a question/sub-question heading label.
     # Headings should only receive a score mark, never an underline.
+    use_fragments: bool = True,
+    use_number_first: bool = True,
+    # use_fragments=False  \u2192 search the WHOLE evidence string (no ; / \n / | splitting).
+    # use_number_first=False \u2192 skip hybrid number+context. With both off,
+    #   placement is driven by exact substring match of the full evidence,
+    #   which avoids landing on the wrong occurrence of a shared number.
 ) -> bool:
     """Resolve *anchor_text* in the PDF and place a score label nearby.
 
@@ -274,7 +347,12 @@ def place_score_near_anchor(
 
     logger.debug(f"    [placement] Searching for anchor: '{evidence_clean[:60]}'...")
 
-    candidate_fragments = _build_candidate_fragments(evidence_clean)
+    if use_fragments:
+        candidate_fragments = _build_candidate_fragments(evidence_clean)
+    else:
+        # Numerical mode: keep the evidence intact so each criterion anchors
+        # to its specific working line, not a sub-string shared with others.
+        candidate_fragments = [evidence_clean]
 
     rect, page_num = None, -1
     used_anchor = evidence_clean
@@ -292,6 +370,7 @@ def place_score_near_anchor(
                 redirect_headings=False,
                 min_y_per_page=min_y_per_page,
                 max_y_per_page=max_y_per_page,
+                use_number_first=use_number_first,
             )
             if rect and page_num != -1:
                 break

@@ -26,7 +26,9 @@
       "Bash(cp database/question_loader.py src/database/question_loader.py)",
       "Bash(cp student_assignment_extraction.py src/extraction/student_assignment_extraction.py)",
       "Bash(cp question_pdf.py dev/question_pdf.py)",
-      "Bash(cp rubric_extraction.py dev/rubric_extraction.py)"
+      "Bash(cp rubric_extraction.py dev/rubric_extraction.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python render_annotations.py)",
+      "Bash(echo \"EXIT=$?\")"
     ]
   }
 }

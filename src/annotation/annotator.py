@@ -31,13 +31,297 @@ from .annotator_text import (
     _normalize_text_for_match, _strip_llm_artifacts,
     _tokenize, _line_key, _build_anchor_variations, _build_candidate_fragments,
 )
-from .annotator_rect import _draw_underline_for_rect
+from .annotator_rect import _draw_underline_for_rect, _is_heading_like, _iter_page_lines
 from .annotator_match import resolve_anchor_rect, _rank_pages_for_anchor
 from .annotator_draw import (
     _safe_float, _fmt_mark_value, _place_score_label,
     _place_ticks, place_score_near_anchor, add_main_score, add_popup_for_comment,
     place_not_required_marker, compute_subq_y_bounds, _strip_subq_prefix,
 )
+
+
+# ── Strict numerical evidence finder ──────────────────────────────────────────
+
+
+def _try_tabular_row_match(
+    doc,
+    evidence_text: str,
+    ranked_pages: List[int],
+    min_y_per_page: Optional[dict],
+    max_y_per_page: Optional[dict],
+) -> Tuple[List["fitz.Rect"], int]:
+    """SOCIE / multi-column table fallback for strict matching.
+
+    The LLM frequently emits evidence like "<row label> <column header>
+    <value>" — joining tokens that live on different physical PDF lines
+    in a tabular layout (label on line A, values on line B, column header
+    "Total" on a separate header row). Strict literal search misses every
+    time.
+
+    This fallback extracts the row label's alphabetic prefix (stopping at
+    the first number, uppercase abbreviation, or known column-header word
+    like "Total"), then searches the PDF strictly for progressively shorter
+    versions of that prefix. When the matched label line carries no
+    numeric content (the row wraps across two lines), it ALSO returns the
+    nearest data line below — so both lines get underlined and the score
+    lands on the numeric line via the existing _pick_best_rect_for_score.
+
+    Returns ([label_rect, data_rect], page_num) for a wrapped row,
+    ([single_rect], page_num) for a row that fits on one line, or
+    ([], -1) when no usable row label is found.
+    """
+    # Pull the row label from the start of the evidence.
+    label_words: List[str] = []
+    for w in evidence_text.split():
+        if re.search(r"\d", w):
+            break
+        if w.lower().strip(".,") in {"total", "subtotal", "sub-total"}:
+            break
+        stripped = w.strip(".,()/:")
+        if stripped.isupper() and len(stripped) >= 2:
+            break  # column-header abbreviation (NCI, OCI, FX, …)
+        label_words.append(w)
+
+    if not label_words:
+        return [], -1
+
+    def _outside(page_num: int, rect) -> bool:
+        if min_y_per_page:
+            lo = min_y_per_page.get(page_num)
+            if lo is not None and rect.y0 < lo:
+                return True
+        if max_y_per_page:
+            hi = max_y_per_page.get(page_num)
+            if hi is not None and rect.y0 > hi:
+                return True
+        return False
+
+    def _line_text_at(page, rect) -> str:
+        for line_text, line_rect in _iter_page_lines(page):
+            if line_rect.intersects(rect):
+                return line_text
+        return ""
+
+    def _has_numeric(text: str) -> bool:
+        return bool(re.search(r"\d", text or ""))
+
+    def _looks_like_column_header(text: str) -> bool:
+        # A multi-column header row has many alpha tokens and no numbers.
+        # Rejecting these prevents matching "retained earnings" against the
+        # SOCIE header row and stamping the mark on the wrong data row.
+        if re.search(r"\d", text or ""):
+            return False
+        words = [w for w in (text or "").split() if len(w) >= 3 and w[0].isalpha()]
+        return len(words) >= 4
+
+    def _find_data_rects_for_row(page, label_rect, max_gap_below: float = 18.0):
+        # Returns all data-column rects that belong to the row anchored by
+        # label_rect. Two cases:
+        #   (a) Single-line row, multi-column layout — PyMuPDF treats each
+        #       column word at the same y as a separate "line". The values
+        #       sit at the same y as the label.
+        #   (b) Wrapped row — the label is on physical line A, the values
+        #       on physical line B just below (typical SOCIE gap ~13 px).
+        # We collect same-y rects first; only if none exist do we look below.
+        label_y_mid = (label_rect.y0 + label_rect.y1) / 2
+        same_y: List["fitz.Rect"] = []
+        for lt, lr in _iter_page_lines(page):
+            if not _has_numeric(lt):
+                continue
+            line_y_mid = (lr.y0 + lr.y1) / 2
+            if abs(line_y_mid - label_y_mid) <= 3.0:
+                same_y.append(lr)
+        if same_y:
+            return same_y
+        # No same-y values — look just below for a continuation line.
+        best, best_gap = None, max_gap_below
+        for lt, lr in _iter_page_lines(page):
+            if not _has_numeric(lt):
+                continue
+            gap = lr.y0 - label_rect.y1
+            if 0 < gap <= best_gap:
+                best_gap = gap
+                best = lr
+        return [best] if best is not None else []
+
+    for prefix_len in range(len(label_words), 0, -1):
+        prefix = " ".join(label_words[:prefix_len])
+        if len(prefix) < 6:
+            break
+        for page_num in ranked_pages:
+            page = doc[page_num - 1]
+            try:
+                hits = _page_search(page, prefix)
+            except Exception:
+                hits = []
+            for label_rect in hits or []:
+                if _outside(page_num, label_rect):
+                    continue
+                line_text = _line_text_at(page, label_rect)
+                if line_text and _is_heading_like(line_text):
+                    continue
+                if line_text and _looks_like_column_header(line_text):
+                    continue
+                # Find all data-column rects for the row (same-y OR below-y).
+                data_rects = _find_data_rects_for_row(page, label_rect)
+                if not data_rects and not _has_numeric(line_text):
+                    # No values found anywhere for this row — skip this hit.
+                    continue
+                # Filter out any data rect that falls outside the question's
+                # Y bounds (defensive — shouldn't normally happen).
+                data_rects = [r for r in data_rects if not _outside(page_num, r)]
+                return [label_rect] + data_rects, page_num
+
+    return [], -1
+
+
+def _find_evidence_strict(
+    doc,
+    evidence_text: str,
+    allowed_pages: List[int],
+    placed_marks: set,
+    page_token_sets: Optional[dict] = None,
+    min_y_per_page: Optional[dict] = None,
+    max_y_per_page: Optional[dict] = None,
+) -> Tuple[List["fitz.Rect"], int]:
+    """Numerical-mode evidence resolver. Returns (list_of_rects, page_num).
+
+    Three strict tiers (no fuzzy / token-overlap matching anywhere):
+      1. Literal substring search across surface-form variants (GBP↔£,
+         USD↔$, percent↔%).
+      2. Normalized-line fallback that strips stray backticks and collapses
+         whitespace on both sides — rescues PDF font/glyph artifacts.
+      3. Tabular row fallback for SOCIE-style evidence where the LLM joined
+         a row label with column headers and values from different physical
+         lines. Returns label + data line for wrapped rows so both lines
+         get underlined and the score lands on the numeric line.
+
+    Single-line matches return [rect]; wrapped tabular matches return
+    [label_rect, data_rect]. No match returns ([], -1).
+    """
+    if not evidence_text:
+        return [], -1
+
+    variants = _build_anchor_variations(evidence_text)
+    ranked_pages = _rank_pages_for_anchor(
+        page_token_sets or {}, list(allowed_pages), evidence_text
+    )
+
+    def _outside(page_num: int, rect) -> bool:
+        if min_y_per_page:
+            lo = min_y_per_page.get(page_num)
+            if lo is not None and rect.y0 < lo:
+                return True
+        if max_y_per_page:
+            hi = max_y_per_page.get(page_num)
+            if hi is not None and rect.y0 > hi:
+                return True
+        return False
+
+    def _line_text_at(page, rect) -> str:
+        for line_text, line_rect in _iter_page_lines(page):
+            if line_rect.intersects(rect):
+                return line_text
+        return ""
+
+    # NOTE on duplicates: we deliberately do NOT skip already-claimed lines
+    # via placed_marks. When the LLM awards marks for two criteria pointing
+    # at the same student line, both score labels must appear on the PDF —
+    # _place_score_label handles visual offset to keep them readable.
+    # Skipping here would either (a) drop the second criterion's mark, or
+    # (b) push it onto the next occurrence of the evidence on another page,
+    # which is a worse outcome (misplacement instead of co-located stack).
+    for variant in variants:
+        for page_num in ranked_pages:
+            page = doc[page_num - 1]
+            try:
+                hits = _page_search(page, variant)
+            except Exception:
+                hits = []
+            for rect in hits or []:
+                if _outside(page_num, rect):
+                    continue
+                line_text = _line_text_at(page, rect)
+                if line_text and _is_heading_like(line_text):
+                    continue
+                return [rect], page_num
+
+    # Tier 2 fallback: normalized-line containment.
+    # When the literal substring search fails on every variant, scan page
+    # lines with stray backticks stripped and runs of whitespace collapsed
+    # on BOTH sides. Still requires the evidence to be a contiguous substring
+    # of the cleaned line — no token overlap, no word clustering. This
+    # rescues PDF lines like "NCI post-acq'n profits `   3,850" where a font
+    # artifact (stray backtick) prevents an exact match.
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").replace("`", " ")).strip().lower()
+
+    ev_norm = _norm(evidence_text)
+    if len(ev_norm) >= 10:
+        for page_num in ranked_pages:
+            page = doc[page_num - 1]
+            for line_text, line_rect in _iter_page_lines(page):
+                if _outside(page_num, line_rect):
+                    continue
+                if _is_heading_like(line_text):
+                    continue
+                if ev_norm in _norm(line_text):
+                    return [line_rect], page_num
+
+    # Tier 3 fallback: tabular row label (SOCIE / multi-column tables).
+    rects, page_num = _try_tabular_row_match(
+        doc, evidence_text, ranked_pages, min_y_per_page, max_y_per_page,
+    )
+    if rects:
+        return rects, page_num
+
+    return [], -1
+
+
+# ── Best-rect picker for the score label ─────────────────────────────────────
+
+def _pick_best_rect_for_score(
+    doc,
+    page_rects: List[Tuple[int, "fitz.Rect"]],
+) -> Tuple[int, "fitz.Rect"]:
+    """Choose the rect best suited to anchor the criterion's score label.
+
+    Priority tiers (the score should land on the most "value-bearing" line):
+      3  — both number and alphabetic text (a typical accounting row like
+           "Dr NCI 450" — the value sits alongside the label).
+      2  — number only (the value-column line in a wrapped tabular row,
+           where the label is on a separate physical line in the PDF and
+           PyMuPDF treats each column word as its own "line").
+      1  — alphabetic only (label line — score should NOT land here when
+           a value-bearing line is also available).
+      0  — empty.
+
+    Within a tier, the longer line wins (more content = clearer anchor).
+    """
+    def _score(item: Tuple[int, "fitz.Rect"]) -> Tuple[int, int]:
+        page_num, rect = item
+        page = doc[page_num - 1]
+        line_text = ""
+        try:
+            for lt, lr in _iter_page_lines(page):
+                if lr.intersects(rect):
+                    line_text = lt
+                    break
+        except Exception:
+            line_text = ""
+        has_digit = bool(re.search(r"\d", line_text))
+        has_alpha = bool(re.search(r"[A-Za-z]", line_text))
+        if has_digit and has_alpha:
+            tier = 3
+        elif has_digit:
+            tier = 2
+        elif has_alpha:
+            tier = 1
+        else:
+            tier = 0
+        return (tier, len(line_text))
+
+    return max(page_rects, key=_score)
 
 
 # ── Main annotation function ───────────────────────────────────────────────────
@@ -654,37 +938,28 @@ def annotate_pdf(
         # STANDARD PER-CRITERION ANNOTATION MODE
         # ══════════════════════════════════════════════════════════════════════
         else:
+            # Numerical mode rules:
+            #   • Underline EVERY entry in evidence_list that resolves to a rect.
+            #   • Place exactly ONE score label per criterion, on the first
+            #     resolved evidence line.
+            #   • Never fall back to the criterion text as an anchor — the
+            #     criterion text often shares words with the student's section
+            #     headings and was causing scores to land on headings.
             for idx, item in enumerate(displayed_breakdown, 1):
                 marks = float(item.get('marks_awarded', 0))
                 raw_evidence = item.get('evidence_list')
                 if isinstance(raw_evidence, list):
-                    evidence_candidates = [
+                    evidence_lines = [
                         str(x).strip() for x in raw_evidence
                         if x is not None and str(x).strip()
                     ]
                 else:
                     evidence = (item.get('evidence', '') or '').strip()
-                    evidence_candidates = [
+                    evidence_lines = [
                         p.strip() for p in re.split(r"\s*;\s*", evidence)
                         if p and p.strip()
                     ]
                 criterion_name = item.get('criterion', '').strip()
-
-                from .annotator_rect import _is_heading_like
-                criterion_anchor = ""
-                if (
-                    criterion_name
-                    and not _is_heading_like(criterion_name)
-                    and len(_normalize_text_for_match(criterion_name)) >= 6
-                ):
-                    criterion_anchor = criterion_name
-
-                anchor_candidates: list[str] = []
-                for ev in evidence_candidates[:3]:
-                    if _is_informative_anchor(ev):
-                        anchor_candidates.append(ev)
-                if criterion_anchor and _is_informative_anchor(criterion_anchor):
-                    anchor_candidates.append(criterion_anchor)
 
                 _item_reason = str(item.get('reason', '') or '')
                 is_of = item.get('is_of_mark', False) or bool(
@@ -699,52 +974,68 @@ def annotate_pdf(
                 else:
                     score_label = _fmt_mark_value(marks)
 
-                success = False
-                used_anchor = ""
-                for anchor in anchor_candidates[:3]:
-                    used_anchor = anchor
-                    logger.debug(f"  Criterion {idx}: {criterion_name} ({marks}pts)")
-                    logger.debug(f"    Anchor: {anchor[:80]}...")
-                    success = place_score_near_anchor(
-                        doc, anchor, score_label,
-                        allowed_pages, placed_lines_per_page, placed_marks,
-                        unplaced_items,
+                logger.debug(f"  Criterion {idx}: {criterion_name} ({marks}pts)")
+
+                # Defensive: if any evidence string contains a newline, split
+                # so each physical line gets its own underline. Most LLM output
+                # already uses separate evidence_list entries, but this catches
+                # the case where it joins lines with "\n" inside one string.
+                evidence_parts: list[str] = []
+                for ev in evidence_lines:
+                    for part in re.split(r"\n+", ev):
+                        part = part.strip()
+                        if part:
+                            evidence_parts.append(part)
+
+                # Resolve each evidence part via strict exact-substring search.
+                # Headings and out-of-bounds rects are rejected.
+                # The strict finder may return MULTIPLE rects for one evidence
+                # entry when a tabular row wraps across two physical PDF lines
+                # (label line + data line). Each rect gets its own underline;
+                # _pick_best_rect_for_score later anchors the score on the
+                # number-bearing line.
+                resolved: list[tuple[int, fitz.Rect]] = []
+                for ev in evidence_parts:
+                    if not _is_informative_anchor(ev):
+                        logger.debug(f"    Evidence skipped (not informative): {ev[:60]}")
+                        continue
+                    rects, page_num = _find_evidence_strict(
+                        doc, ev, allowed_pages,
+                        placed_marks=placed_marks,
                         page_token_sets=page_token_sets,
-                        line_score_accumulator=line_score_accumulator,
                         min_y_per_page=min_y_per_page,
                         max_y_per_page=max_y_per_page,
-                        draw_underline=True,  # Evidence lines should be underlined
                     )
-                    if success:
-                        break
-
-                if success:
-                    annotation_mapping['criterion_scores_placed'] += 1
-                else:
-                    if anchor_candidates:
+                    if rects and page_num > 0:
+                        for rect in rects:
+                            _draw_underline_for_rect(doc[page_num - 1], rect)
+                            placed_marks.add(_line_key(page_num, rect.y0))
+                            resolved.append((page_num, rect))
+                        n = len(rects)
                         logger.debug(
-                            f"    [placement] ✗ All anchors failed. "
-                            f"Last tried: '{used_anchor[:60]}'"
+                            f"    ✓ Underlined evidence on page {page_num} "
+                            f"({n} line{'s' if n != 1 else ''}): '{ev[:60]}'"
                         )
-                criteria_count += 1
+                    else:
+                        logger.debug(f"    ✗ Evidence not found: '{ev[:60]}'")
 
-            # Place one combined score label per resolved line
-            for entry in line_score_accumulator.values():
-                try:
-                    entry_page_num = int(entry.get("page_num"))
-                    entry_page_idx = int(entry.get("page_idx"))
-                    entry_rect = entry.get("rect")
-                    marks_list = entry.get("marks") or []
-                    total = sum(float(m) for m in marks_list)
-                except Exception:
-                    continue
-                if not entry_rect or entry_page_num <= 0:
-                    continue
-                entry_page = doc[entry_page_num - 1]
-                _place_score_label(
-                    entry_page, entry_rect, entry_page_idx,
-                    placed_lines_per_page, _fmt_mark_value(total),
-                )
+                if resolved:
+                    best_page, best_rect = _pick_best_rect_for_score(doc, resolved)
+                    _place_score_label(
+                        doc[best_page - 1], best_rect, best_page - 1,
+                        placed_lines_per_page, score_label,
+                    )
+                    annotation_mapping['criterion_scores_placed'] += 1
+                    logger.debug(
+                        f"    ✓ Score '{score_label}' placed on page {best_page} "
+                        f"(underlined {len(resolved)} evidence line{'s' if len(resolved) != 1 else ''})"
+                    )
+                else:
+                    unplaced_items.append((score_label, (evidence_parts[0] if evidence_parts else '')[:50]))
+                    logger.debug(
+                        f"    ✗ Criterion unplaced — no evidence line matched"
+                    )
+                criteria_count += 1
 
             logger.info(
                 f"✓ Placed {annotation_mapping['criterion_scores_placed']} of "
@@ -824,41 +1115,15 @@ def annotate_pdf(
                     else:
                         logger.info(f"  ✗ NR not found in PDF: '{nr_kp or nr_text[:60]}'")
 
-        # ── Fallback: margin notes for unplaced high-value items ──────────────
-        def _label_numeric_val(s: str) -> float:
-            """Parse numeric value from label that may have 'OF ' prefix."""
-            s = s.strip()
-            if s.upper().startswith("OF "):
-                s = s[3:].strip()
-            return _safe_float(s)
-
+        # ── Unplaced items: log only, no margin notes ────────────────────────
+        # Placing "Marks given below: X.XXpt (…)" in the margin was confusing
+        # because it pollutes the question/answer area with content that has
+        # no spatial relationship to where the actual evidence was supposed
+        # to be marked. We now only surface unplaced items in the mapping JSON.
         if unplaced_items:
-            high_value = [
-                (score, ev) for score, ev in unplaced_items
-                if isinstance(score, str) and score.strip()
-                and _label_numeric_val(score) >= 0.25
-            ]
-            if high_value:
-                logger.warning(
-                    f"Fallback: placing {len(high_value)} high-value items in margin"
-                )
-                fallback_page_obj = doc[allowed_pages[0] - 1]
-                y_pos = 80
-                for score, evidence in high_value[:5]:
-                    fallback_page_obj.insert_text(
-                        (fallback_page_obj.rect.width - 280, y_pos),
-                        f"Marks given below: {score}pt",
-                        fontsize=8,
-                        color=(0.8, 0.4, 0),
-                    )
-                    y_pos += 14
-                    fallback_page_obj.insert_text(
-                        (fallback_page_obj.rect.width - 280, y_pos),
-                        f"  ({evidence[:30]})",
-                        fontsize=7,
-                        color=(0.8, 0.4, 0),
-                    )
-                    y_pos += 16
+            logger.warning(
+                f"{len(unplaced_items)} item(s) unplaced — see mapping JSON for details"
+            )
 
         # ── Feedback comments ──────────────────────────────────────────────────
         all_comments = grades_doc.get('comments', [])

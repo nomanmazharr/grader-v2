@@ -769,9 +769,15 @@ class StudentGrader:
                 toks = [w for w in re.findall(r"[a-z]{4,}", d) if w not in stop]
                 return set(toks)
 
+            # Categories that explicitly mark a criterion as a primary marking point.
+            # When set, we never heuristically flag the criterion as a "broad section heading"
+            # — the rubric author has told us it's a real criterion to grade against.
+            PRIMARY_CATEGORIES = {"calculation", "narrative", "journal"}
+
             # Identify "broad" candidates.
             broad_idxs: list[int] = []
             broad_startswith_verb: set[int] = set()
+            forced_drop_idxs: set[int] = set()  # category=="section_header" → unconditional drop
             token_sets: list[set[str]] = []
             for i, it in enumerate(criteria):
                 desc = str((it or {}).get("description", "") or "").strip()
@@ -781,6 +787,19 @@ class StudentGrader:
                 token_sets.append(toks)
 
                 if not desc or marks_num is None:
+                    continue
+
+                # Trust the explicit `category` marker when present.
+                # - "section_header" → unconditionally drop (the author has declared this is
+                #   metadata defining the section cap, not a scoring criterion).
+                # - Any other set category ("calculation", "narrative", "journal") → never
+                #   flag as broad. It's an explicit primary criterion regardless of its
+                #   description length or marks.
+                explicit_category = str((it or {}).get("category", "") or "").strip().lower()
+                if explicit_category == "section_header":
+                    forced_drop_idxs.add(i)
+                    continue
+                if explicit_category in PRIMARY_CATEGORIES:
                     continue
 
                 dnorm = _norm_desc_key(desc)
@@ -805,11 +824,12 @@ class StudentGrader:
                     if starts:
                         broad_startswith_verb.add(i)
 
-            if not broad_idxs:
+            if not broad_idxs and not forced_drop_idxs:
                 return criteria
 
             # Decide which broad criteria have enough overlapping micro-criteria to justify dropping.
-            drop: set[int] = set()
+            # Start with the explicitly-tagged section_header criteria (always drop those).
+            drop: set[int] = set(forced_drop_idxs)
             for i in broad_idxs:
                 toks_i = token_sets[i]
                 if not toks_i:
@@ -3277,6 +3297,46 @@ class StudentGrader:
         allowed_criteria = self._allowed_criteria_last_run or set()
         rubric_max_map = self._criterion_max_map_last_run or {}
 
+        # Build a normalized lookup so paraphrased / truncated LLM output can
+        # still resolve back to the canonical rubric criterion text.  Without
+        # this, long narrative criteria (~1000+ chars) that the LLM trims when
+        # echoing back fail the `criterion not in allowed_criteria` exact-match
+        # check and their marks are silently dropped from the breakdown.
+        def _norm_crit_key(s: str) -> str:
+            if not isinstance(s, str):
+                return ""
+            t = s.replace(" ", " ").replace("–", "-").replace("—", "-")
+            t = re.sub(r"\s+", " ", t).strip().lower()
+            return t
+
+        _norm_to_canonical: dict[str, str] = {}
+        # List of (normalized_key, canonical_text) for bidirectional prefix matching:
+        #   - LLM truncates canonical to its title  -> canon_nk.startswith(llm_nk)
+        #   - LLM extends canonical with extra text -> llm_nk.startswith(canon_nk)
+        _canonical_norm_pairs: list[tuple[str, str]] = []
+        for _canon in allowed_criteria:
+            _nk = _norm_crit_key(_canon)
+            if not _nk:
+                continue
+            if _nk not in _norm_to_canonical:
+                _norm_to_canonical[_nk] = _canon
+            _canonical_norm_pairs.append((_nk, _canon))
+        _dropped_out_of_rubric: list[str] = []  # collected for an INFO summary
+
+        # Minimum normalized length required to attempt prefix matching.
+        # Set just high enough that two distinct rubric criteria sharing a
+        # short common prefix (e.g., "Profitability - ", "Pre-IPO - ")
+        # cannot both match a single LLM-returned string.
+        _PREFIX_MATCH_MIN_LEN = 20
+
+        # Length of the distinctive leading prefix used for the third matching
+        # layer (LLM and canonical share a long leading prefix but diverge
+        # mid-string because the LLM paraphrased the middle/end of a long
+        # rubric description). Set long enough that the prefix uniquely
+        # identifies one rubric criterion in normal rubrics, short enough to
+        # tolerate minor wording variations in the leading title sentence.
+        _SHARED_LEADING_PREFIX_LEN = 40
+
         _STOPWORDS = {
             "the",
             "a",
@@ -4028,9 +4088,61 @@ class StudentGrader:
             # sub-questions, not rubric criteria.
             if not criterion:
                 continue
-            if allowed_criteria and criterion not in allowed_criteria and not self._criteria_were_synthesized and not self._holistic_grading:
-                logger.debug(f"Skipping out-of-rubric criterion: '{criterion}'")
-                continue
+            if allowed_criteria and not self._criteria_were_synthesized and not self._holistic_grading:
+                if criterion not in allowed_criteria:
+                    # Try normalized whole-string match (case + whitespace insensitive).
+                    nk = _norm_crit_key(criterion)
+                    canonical = _norm_to_canonical.get(nk)
+                    if canonical is None and len(nk) >= _PREFIX_MATCH_MIN_LEN:
+                        # Bidirectional prefix match: handle BOTH
+                        #   (a) LLM truncated a long canonical to just its title
+                        #       -> canon_nk.startswith(nk)
+                        #   (b) LLM appended extra commentary after the canonical
+                        #       -> nk.startswith(canon_nk)
+                        # If exactly one rubric criterion matches, accept it.
+                        # If multiple match, pick the one whose normalized
+                        # length is closest to the LLM's text (best-fit) so
+                        # ambiguity tends to land on the right criterion.
+                        _matches: list[str] = []
+                        for _canon_nk, _canon_full in _canonical_norm_pairs:
+                            if _canon_nk.startswith(nk) or nk.startswith(_canon_nk):
+                                _matches.append(_canon_full)
+                        if len(_matches) == 1:
+                            canonical = _matches[0]
+                        elif len(_matches) > 1:
+                            canonical = min(
+                                _matches,
+                                key=lambda c: abs(len(_norm_crit_key(c)) - len(nk)),
+                            )
+                    if canonical is None and len(nk) >= _SHARED_LEADING_PREFIX_LEN:
+                        # Shared-leading-prefix fallback: handles the common case
+                        # where the LLM echoes the first ~40 chars of the rubric
+                        # criterion verbatim (the distinctive title) and then
+                        # PARAPHRASES the middle/end of the long description.
+                        # Neither startswith direction catches this, but two
+                        # strings sharing a long distinctive leading prefix are
+                        # the same criterion in practice.
+                        _llm_head = nk[:_SHARED_LEADING_PREFIX_LEN]
+                        _matches = [
+                            c for _ck, c in _canonical_norm_pairs
+                            if _ck.startswith(_llm_head)
+                        ]
+                        if len(_matches) == 1:
+                            canonical = _matches[0]
+                        elif len(_matches) > 1:
+                            canonical = min(
+                                _matches,
+                                key=lambda c: abs(len(_norm_crit_key(c)) - len(nk)),
+                            )
+                    if canonical is not None:
+                        # Rewrite to canonical so downstream lookups (rubric_max_map,
+                        # category map, position map) all hit.
+                        criterion = canonical
+                        item["criterion"] = canonical
+                    else:
+                        _dropped_out_of_rubric.append(criterion[:90])
+                        logger.debug(f"Skipping out-of-rubric criterion: '{criterion}'")
+                        continue
 
             if not self._holistic_grading and not self._is_valid_criterion(criterion):
                 logger.debug(f"Skipping invalid criterion: '{criterion}'")
@@ -4730,6 +4842,13 @@ class StudentGrader:
 
         # Debug logs
         logger.info(f"Raw LLM breakdown count: {len(main_grade.get('breakdown', []))}")
+        if _dropped_out_of_rubric:
+            logger.info(
+                f"Dropped {len(_dropped_out_of_rubric)} LLM-returned criteria that did not "
+                f"match any rubric criterion (even via normalized/prefix lookup):"
+            )
+            for _txt in _dropped_out_of_rubric[:20]:
+                logger.info(f"  out-of-rubric: '{_txt}...'")
         logger.info(f"Saved breakdown count: {len(normalized_breakdown)}")
         logger.info(f"Calc sum (post-check): {sum_awarded_calc}")
         logger.info(f"Question max marks used: {total_max}")
