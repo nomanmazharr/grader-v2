@@ -119,6 +119,91 @@ def _line_text_for_rect(page, rect: fitz.Rect) -> str:
     return ""
 
 
+def _text_under_rect(page, rect: fitz.Rect, words=None) -> str:
+    """Return the text of the words whose CENTRES fall inside *rect*.
+
+    search_for() rects carry loose vertical bounds — a rect sitting on one
+    line routinely overlaps the next line's ascenders — so
+    page.get_textbox() bleeds words in from neighbouring lines and cannot
+    be used to measure what a hit actually covers.  Testing the centre of
+    each word bbox instead keeps the extraction tight to the matched
+    fragment.  Pass *words* to reuse a cached _page_words() result across
+    repeated calls on the same page.
+    """
+    if not rect:
+        return ""
+    if words is None:
+        words = _page_words(page)
+    picked: list[tuple[float, float, str]] = []
+    for w in words:
+        wr = fitz.Rect(w[:4])
+        cx = (wr.x0 + wr.x1) / 2
+        cy = (wr.y0 + wr.y1) / 2
+        if rect.x0 - 1 <= cx <= rect.x1 + 1 and rect.y0 - 1 <= cy <= rect.y1 + 1:
+            picked.append((wr.y0, wr.x0, w[4]))
+    picked.sort()
+    return re.sub(r"\s+", " ", " ".join(t for _, _, t in picked)).strip()
+
+
+# Guards for _group_wrapped_hits. A phrase realistically wraps over a
+# handful of lines; the cap stops a mis-measured fragment from swallowing
+# the rest of the page's hits into one group.
+_MAX_WRAP_LINES = 4
+# Fraction of the needle that must be covered before a hit counts as
+# complete. Slack absorbs glyph/whitespace differences between the search
+# variant and the PDF's own rendering.
+_WRAP_COVERAGE = 0.9
+
+
+def _group_wrapped_hits(page, needle: str, hits: list) -> list[list[fitz.Rect]]:
+    """Group a flat ``search_for()`` result into logical occurrences.
+
+    PyMuPDF returns ONE rect per PHYSICAL LINE, so a phrase that wraps
+    arrives as several consecutive rects that are indistinguishable in
+    shape from several separate occurrences of a shorter phrase:
+
+        needle wraps over 2 lines  -> [Rect(y=88), Rect(y=103)]   ONE hit
+        short needle appears twice -> [Rect(y=88), Rect(y=148)]   TWO hits
+
+    There is no grouping flag on the API (verified on PyMuPDF 1.26.7), so
+    we disambiguate by measuring the text each rect actually covers.  A
+    rect whose words already account for the whole needle is a complete
+    standalone occurrence; a rect covering only part of it is a fragment,
+    so we keep absorbing following rects — which must sit lower on the
+    page — until the needle's length is accounted for.
+
+    Returns a list of groups, each a list of one or more rects in reading
+    order.  Callers underline every rect of a group so wrapped evidence
+    gets an underline beneath each physical line it spans.
+    """
+    if not hits:
+        return []
+    target_len = len(re.sub(r"\s+", " ", (needle or "")).strip())
+    if target_len <= 0:
+        return [[r] for r in hits]
+
+    words = _page_words(page)
+    groups: list[list[fitz.Rect]] = []
+    i = 0
+    total = len(hits)
+    while i < total:
+        group = [hits[i]]
+        covered = len(_text_under_rect(page, hits[i], words))
+        i += 1
+        while (
+            i < total
+            and covered < target_len * _WRAP_COVERAGE
+            and len(group) < _MAX_WRAP_LINES
+            and hits[i].y0 > group[-1].y0 + 1  # strictly a later line
+        ):
+            group.append(hits[i])
+            # +1 for the space the line break stands in for.
+            covered += 1 + len(_text_under_rect(page, hits[i], words))
+            i += 1
+        groups.append(group)
+    return groups
+
+
 def _box_overlaps_page_text(page, box: fitz.Rect) -> bool:
     """Return True if *box* overlaps any word bounding box on the page."""
     if not box:

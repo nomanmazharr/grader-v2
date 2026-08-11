@@ -41,6 +41,39 @@ def _normalize_text_for_match(text: str) -> str:
     return cleaned
 
 
+def _normalize_symbols_for_match(text: str) -> str:
+    """Canonicalize math/currency glyphs, units and separators for tolerant
+    substring matching.
+
+    The LLM and the student PDF frequently pick different surface forms for the
+    same value, which defeats a literal search. Folding BOTH sides the same way
+    lets a containment check still locate the line instead of dropping it:
+      • ×/✕/⨯ folded to ascii "x"       (model writes "x", PDF renders "×")
+      • ÷ folded to "/"                 (division glyph vs slash)
+      • £/$/€ made optional            (model drops or adds the symbol)
+      • –/—/− unified to plain "-"      (dash / minus glyph mismatch)
+      • "(1,234)" ≡ "-1,234" ≡ "1,234"  (accounting negatives: parens & minus dropped)
+      • 14 million ≡ 14m, 5 thousand ≡ 5k, 2 billion ≡ 2bn  (magnitude words)
+      • 1,250,000 ≡ 1 250 000 ≡ 1250000 (thousands separators)
+
+    This is the shared engine behind both the numerical Tier-2 line-scan and the
+    holistic symbol-insensitive containment strategy.
+    """
+    s = (text or "").replace("`", " ").lower()
+    s = re.sub(r"[×✕⨯]", "x", s)
+    s = re.sub(r"[–—−]", "-", s)
+    s = s.replace("÷", "/")
+    s = re.sub(r"[£$€]", " ", s)
+    s = re.sub(r"[()\-]", " ", s)
+    s = s.replace(",", "")
+    s = re.sub(r"\bmillions?\b|\bmn\b", "m", s)
+    s = re.sub(r"\bbillions?\b", "bn", s)
+    s = re.sub(r"\bthousands?\b", "k", s)
+    s = re.sub(r"(?<=\d)\s+(?=(?:bn|[mk])\b)", "", s)
+    s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _split_comment_arrow(comment: str) -> Optional[tuple[str, str]]:
     """Split 'anchor → feedback' comment into (anchor, feedback) tuple."""
     if not comment or not isinstance(comment, str):
@@ -101,6 +134,61 @@ def _build_anchor_variations(text: str) -> list[str]:
         variants.append(re.sub(r"\bUSD\s*(?=\d)", "$", base))
     if re.search(r"\$\s*(?=\d)", base):
         variants.append(re.sub(r"\$\s*(?=\d)", "USD", base))
+
+    # Currency-symbol-STRIPPED variant. The LLM frequently drops or adds a
+    # leading currency symbol (£/$/€) relative to what the student PDF renders.
+    # Removing the symbol lets the literal search still hit the number, since
+    # search_for matches "3,850" as a substring of "£3,850" (and vice-versa).
+    if re.search(r"[£$€]", base):
+        stripped = re.sub(r"\s*[£$€]\s*", " ", base)
+        variants.append(re.sub(r"\s+", " ", stripped).strip())
+
+    # Dash / minus unification. The LLM interchanges hyphen-minus, en-dash,
+    # em-dash and the Unicode minus with whatever glyph the PDF uses. Emit a
+    # variant with all of them collapsed to a plain hyphen-minus.
+    if re.search(r"[–—−]", base):
+        variants.append(re.sub(r"[–—−]", "-", base))
+
+    # Multiplication-sign variants. The LLM commonly writes "175,000 x £80"
+    # with an ascii "x" while the PDF renders the Unicode "×" (or vice-versa),
+    # which blocks the literal search. Emit both surface forms of a lone,
+    # whitespace-surrounded multiplication operator (never touches the "x"
+    # inside words like "tax" or "box").
+    if re.search(r"[×✕⨯]", base):
+        variants.append(re.sub(r"[×✕⨯]", "x", base))
+    if re.search(r"(?<=\s)[xX](?=\s)", base):
+        variants.append(re.sub(r"(?<=\s)[xX](?=\s)", "×", base))
+
+    # Division-sign variants — "÷" (U+00F7) vs a plain slash "/".
+    if "÷" in base:
+        variants.append(base.replace("÷", "/"))
+    if re.search(r"(?<=\s)/(?=\s)", base):
+        variants.append(re.sub(r"(?<=\s)/(?=\s)", "÷", base))
+
+    # Units / magnitude variants — the LLM and the PDF disagree on whether a
+    # magnitude is spelled out ("14 million") or abbreviated ("14m"). Emit both
+    # the contracted and expanded surface forms so the literal search matches
+    # either. Only fires on a magnitude word/letter attached to a number, so
+    # ordinary prose is untouched.
+    _units = [(r"millions?|mn", "m", "million"),
+              (r"billions?", "bn", "billion"),
+              (r"thousands?", "k", "thousand")]
+    contracted = base
+    for word_re, short, _long in _units:
+        contracted = re.sub(
+            rf"(\d[\d.,]*)\s*(?:{word_re})\b", rf"\g<1>{short}",
+            contracted, flags=re.IGNORECASE,
+        )
+    if contracted != base:
+        variants.append(contracted)
+    expanded = base
+    for _word_re, short, long in _units:
+        expanded = re.sub(
+            rf"(\d[\d.,]*)\s*{short}\b", rf"\g<1> {long}",
+            expanded, flags=re.IGNORECASE,
+        )
+    if expanded != base:
+        variants.append(expanded)
 
     out: list[str] = []
     seen: set[str] = set()

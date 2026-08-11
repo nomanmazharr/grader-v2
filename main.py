@@ -15,11 +15,32 @@ import nest_asyncio
 
 nest_asyncio.apply()
 
+from bson import ObjectId
+
 from logging_config import logger
 from extraction.student_assignment_extraction import extract_assignment_pipeline
 from grading.grade import grade_student
+from grading.grade_csv import build_breakdown_csv
 from annotation.annotator import annotate_pdf
+from database.mongodb import get_collection
 from errors import classify_error
+
+
+def _build_grades_csv(grades_id: str) -> Optional[str]:
+    """Fetch the saved grade doc and render its marks breakdown as CSV text.
+
+    Best-effort: the CSV is a verification aid, so a failure here must never
+    fail the grading run — it just yields no CSV.
+    """
+    try:
+        grades_doc = get_collection("student_grades").find_one({"_id": ObjectId(grades_id)})
+        if not grades_doc:
+            logger.warning(f"[CSV] No grade doc for _id={grades_id}")
+            return None
+        return build_breakdown_csv(grades_doc)
+    except Exception as e:
+        logger.warning(f"[CSV] Failed to build breakdown CSV: {e}")
+        return None
 
 
 QuestionType = Literal["numerical", "theoretical"]
@@ -62,10 +83,12 @@ async def grade_from_db_async(
     output_dir: str,
     question_num: str,
     question_type: str = "numerical",
-) -> Tuple[bool, str, Optional[str]]:
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """Grade a student PDF using a pre-saved model answer from MongoDB.
 
-    Returns (success, message, annotated_pdf_path).
+    Returns (success, message, annotated_pdf_path, grades_csv_text).
+    The CSV is produced as soon as grading succeeds, so it is returned even
+    when annotation later fails — that is precisely when it is most useful.
     """
     start_time = datetime.now()
     logger.info("=" * 70)
@@ -77,7 +100,7 @@ async def grade_from_db_async(
         student_pdf_path, student_pages, student_name, question_num
     )
     if not s_ok or not student_answers_id:
-        return False, "Student answer extraction failed", None
+        return False, "Student answer extraction failed", None, None
 
     loop = asyncio.get_running_loop()
     try:
@@ -95,10 +118,14 @@ async def grade_from_db_async(
     except Exception as e:
         clean_msg, show_tb = classify_error(e)
         logger.error(f"[Grading] {clean_msg}", exc_info=show_tb)
-        return False, clean_msg, None
+        return False, clean_msg, None, None
 
     if not grades_id:
-        return False, "Grading returned no result", None
+        return False, "Grading returned no result", None, None
+
+    # Build the CSV now — independent of annotation, so it survives an
+    # annotation failure below.
+    grades_csv = _build_grades_csv(grades_id)
 
     try:
         annotation_ok, annotated_pdf = annotate_pdf(
@@ -111,7 +138,7 @@ async def grade_from_db_async(
     except Exception as e:
         clean_msg, show_tb = classify_error(e)
         logger.error(f"[Annotation] {clean_msg}", exc_info=show_tb)
-        return False, clean_msg, None
+        return False, clean_msg, None, grades_csv
 
     duration = (datetime.now() - start_time).total_seconds()
     status = "SUCCESS" if annotation_ok else "PARTIAL (graded, annotation failed)"
@@ -119,7 +146,7 @@ async def grade_from_db_async(
     logger.info("=" * 70 + "\n")
 
     msg = "Grading and annotation complete" if annotation_ok else "Annotation failed"
-    return annotation_ok, msg, annotated_pdf
+    return annotation_ok, msg, annotated_pdf, grades_csv
 
 
 def grade_from_db(
@@ -130,7 +157,7 @@ def grade_from_db(
     output_dir: str,
     question_num: str,
     question_type: str = "numerical",
-) -> Tuple[bool, str, Optional[str]]:
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """Sync entry point for the production grading pipeline."""
     return asyncio.run(
         grade_from_db_async(

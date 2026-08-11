@@ -157,7 +157,7 @@ def main():
             status.info("Extracting student answers, grading and annotating...")
             progress.progress(20)
 
-            ok, message, annotated_path = grade_from_db(
+            ok, message, annotated_path, grades_csv = grade_from_db(
                 model_answers_id=model_answers_id,
                 student_pdf_path=student_path,
                 student_pages=student_pages,
@@ -168,28 +168,61 @@ def main():
             )
             progress.progress(100)
 
-            if ok:
-                status.success("Grading complete!")
-                st.success(message)
-                if annotated_path and os.path.exists(annotated_path):
-                    with open(annotated_path, "rb") as f:
-                        st.download_button(
-                            "Download Annotated PDF",
-                            f.read(),
-                            file_name=f"{student_name}_annotated.pdf",
-                            mime="application/pdf",
-                        )
-                else:
-                    st.warning("Grading succeeded but annotated PDF not found.")
-                    if annotated_path:
-                        st.caption(f"Expected path: {annotated_path}")
-            else:
-                status.error(f"Failed: {message}")
+            # Read the PDF bytes now and stash everything in session_state.
+            # Rendering the download buttons from session_state (outside this
+            # block) means clicking one button — which triggers a Streamlit
+            # rerun — does not make the other button disappear.
+            annotated_bytes = None
+            if annotated_path and os.path.exists(annotated_path):
+                with open(annotated_path, "rb") as f:
+                    annotated_bytes = f.read()
+
+            st.session_state.grade_result = {
+                "ok": ok,
+                "message": message,
+                "annotated_bytes": annotated_bytes,
+                "annotated_path": annotated_path,
+                "grades_csv": grades_csv,
+                "student_name": student_name,
+                "question_num": question_num,
+            }
 
         except Exception as e:
             status.error(f"Unexpected error: {e}")
             st.code(traceback.format_exc())
             progress.empty()
+
+    # ── Results (rendered from session_state so downloads survive reruns) ──────
+    result = st.session_state.get("grade_result")
+    if result:
+        if result["ok"]:
+            st.success(result["message"])
+        else:
+            st.error(f"Failed: {result['message']}")
+
+        if result["annotated_bytes"] is not None:
+            st.download_button(
+                "Download Annotated PDF",
+                result["annotated_bytes"],
+                file_name=f"{result['student_name']}_annotated.pdf",
+                mime="application/pdf",
+                key="download_pdf",
+            )
+        elif result["ok"]:
+            st.warning("Grading succeeded but annotated PDF not found.")
+            if result["annotated_path"]:
+                st.caption(f"Expected path: {result['annotated_path']}")
+
+        # Grades CSV — available whenever grading succeeded, even if
+        # annotation failed, so marks can be verified independently.
+        if result["grades_csv"]:
+            st.download_button(
+                "Download Grades CSV",
+                result["grades_csv"],
+                file_name=f"{result['student_name']}_Q{result['question_num']}_grades.csv",
+                mime="text/csv",
+                key="download_csv",
+            )
 
 
 if __name__ == "__main__":

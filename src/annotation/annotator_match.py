@@ -17,6 +17,7 @@ from .annotator_ocr import _page_search, _page_words, _page_dict
 from .annotator_text import (
     _normalize_text_for_match, _strip_llm_artifacts,
     _tokenize, _build_anchor_variations, _line_key,
+    _normalize_symbols_for_match,
 )
 from .annotator_rect import (
     _iter_page_lines, _expand_rect_to_line, _expand_rect_to_row,
@@ -568,6 +569,34 @@ def resolve_anchor_rect(
                     if redirected is not None:
                         return redirected, page_num
                     return chosen, page_num
+
+        # Strategy 2b: symbol-insensitive line containment.
+        # Rescues anchors that differ from the PDF only by currency/math glyphs,
+        # units or separators (£ dropped, "x" vs "×", "/" vs "÷", "14 million"
+        # vs "14m", "(1,234)" vs "-1,234"). Canonicalises both sides and requires
+        # the anchor to be a contiguous substring of the line — more precise than
+        # the token-overlap match below, so it runs first.
+        anchor_norm = _normalize_symbols_for_match(anchor_text)
+        if len(anchor_norm) >= 6:
+            for line_text, line_rect in _iter_page_lines(page):
+                if _outside_boundary(page_num, line_rect):
+                    continue
+                if _is_heading_like(line_text):
+                    continue
+                if anchor_norm not in _normalize_symbols_for_match(line_text):
+                    continue
+                mark_key = _line_key(page_num, line_rect.y0)
+                if skip_duplicates and mark_key in placed_marks:
+                    continue
+                logger.debug(
+                    f"    [symbol-contain] '{evidence_preview}' → NORMALIZED "
+                    f"CONTAINMENT on page {page_num}"
+                )
+                chosen = _expand_rect_to_line(page, line_rect) if expand_to_line else line_rect
+                redirected = _maybe_redirect(page, chosen)
+                if redirected is not None:
+                    return redirected, page_num
+                return chosen, page_num
 
         # Strategy 3: token-level fuzzy line match
         best_line = _find_best_line_match(page, anchor_text, required_number=num)

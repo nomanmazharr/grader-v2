@@ -121,6 +121,34 @@ def _find_value_x_on_line(page, rect: fitz.Rect) -> Optional[float]:
         return None
 
 
+def _rect_contains_number(page, rect: fitz.Rect) -> bool:
+    """True when the anchor rect itself covers text that contains a digit.
+
+    Used by _place_score_label to decide whether to keep the score label
+    adjacent to the anchor (rect already IS a value) vs push it to the
+    rightmost value on the line (rect is a label pointing at a value).
+
+    Prevents "floating scores past all columns" on table rows where the
+    anchor is one specific numeric cell — the score belongs next to THAT
+    cell, not at the end of the whole row.
+    """
+    try:
+        # Widen the intersect window slightly to account for glyph vs bbox
+        # rounding — otherwise very tight rects sometimes miss all words.
+        probe = fitz.Rect(rect.x0 - 0.5, rect.y0 - 0.5, rect.x1 + 0.5, rect.y1 + 0.5)
+        for w in _page_words(page):
+            wx0, wy0, wx1, wy1, text, *_ = w
+            word_rect = fitz.Rect(wx0, wy0, wx1, wy1)
+            if not word_rect.intersects(probe):
+                continue
+            t = (text or "").strip()
+            if any(c.isdigit() for c in t):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _place_score_label(
     page,
     rect: fitz.Rect,
@@ -151,23 +179,32 @@ def _place_score_label(
     score_x = rect.x1 + 3
     placement_anchored_to_value = False
 
+    # If the anchor rect ITSELF contains a numeric value, keep the score
+    # right after that rect — don't push it to the end of the row. Prevents
+    # "floating scores" on wide table rows where the anchor is one specific
+    # cell (e.g. `18,150,000.00`) but the rightmost numeric word is a
+    # different cell (e.g. `15,400,000.00` in the "post acq" column).
+    anchor_is_value = _rect_contains_number(page, rect)
+
     # Step 1 — line has a value column further right than the rect:
     # place score AFTER the value on the same line (best clarity).
-    value_x = _find_value_x_on_line(page, rect)
-    if value_x is not None and value_x > rect.x1 + 5:
-        proposed = value_x + 3
-        if proposed < page.rect.width - 25:
-            score_x = proposed
-            placement_anchored_to_value = True
-        else:
-            # No room to the right of the value — place ABOVE it.
-            score_x = min(max(value_x - 25, 50), page.rect.width - 70)
-            score_y = max(rect.y0 - (score_font + 2), 10)
-            placement_anchored_to_value = True
+    # Skip when anchor rect already IS a numeric cell — see above.
+    if not anchor_is_value:
+        value_x = _find_value_x_on_line(page, rect)
+        if value_x is not None and value_x > rect.x1 + 5:
+            proposed = value_x + 3
+            if proposed < page.rect.width - 25:
+                score_x = proposed
+                placement_anchored_to_value = True
+            else:
+                # No room to the right of the value — place ABOVE it.
+                score_x = min(max(value_x - 25, 50), page.rect.width - 70)
+                score_y = max(rect.y0 - (score_font + 2), 10)
+                placement_anchored_to_value = True
 
     # Step 2 — rect itself reaches the right margin (full-line evidence
     # including the value). Default rect.x1 + 3 would push off-page.
-    elif score_x > page.rect.width - 25:
+    if score_x > page.rect.width - 25 and not placement_anchored_to_value:
         score_x = min(max(rect.x1 - 30, 50), page.rect.width - 70)
         score_y = max(rect.y0 - (score_font + 2), 10)
         placement_anchored_to_value = True
@@ -182,13 +219,27 @@ def _place_score_label(
         # rather than jumping back to the descriptive-text side.
         if placement_anchored_to_value:
             candidates_x = [
+                min(score_x + 20, page.rect.width - 70),
+                min(score_x + 40, page.rect.width - 70),
                 max(score_x - 25, 50),
-                min(score_x + 25, page.rect.width - 70),
+                max(score_x - 45, 50),
+            ]
+        elif anchor_is_value:
+            # Rect is a value cell — try positions just right of the rect
+            # (progressively further) before falling back to left / above.
+            # Keeps stacked labels on the SAME visual row rather than
+            # shifting to the next row (which looks like a floating mark).
+            candidates_x = [
+                min(rect.x1 + 20, page.rect.width - 70),
+                min(rect.x1 + 40, page.rect.width - 70),
+                min(rect.x1 + 60, page.rect.width - 70),
+                max(rect.x0 - 40, 50),
             ]
         else:
             candidates_x = [
                 max(rect.x0 - 40, 50),
                 min(rect.x1 + 18, page.rect.width - 70),
+                min(rect.x1 + 38, page.rect.width - 70),
             ]
         found = False
         for cx in candidates_x:
@@ -200,8 +251,27 @@ def _place_score_label(
                 break
 
         if not found:
-            for _ in range(5):
-                score_y = min(score_y + (score_font + 2), page.rect.height - 10)
+            # BEFORE shifting Y (which can push labels to the next row and
+            # look like floating marks with no anchor), try placing ABOVE
+            # the rect first — teacher-style "score sits above the value"
+            # when there's no room to the right.
+            above_y = max(rect.y0 - (score_font + 2), 10)
+            above_box = _score_box(max(score_x, 50), above_y)
+            if not any(above_box.intersects(b) for b in nearby_boxes):
+                score_y = above_y
+                placed_box = above_box
+                found = True
+
+        if not found:
+            # Last resort: shift DOWN, but only a tiny amount — half a font
+            # height (~5px) — so the label stays visually attached to the
+            # anchor rect's row. Larger shifts turn stacked labels into
+            # "floating" orphans on the next physical row.
+            for _shift in range(3):
+                score_y = min(
+                    score_y + (score_font * 0.5 + 1),
+                    page.rect.height - 10,
+                )
                 cb = _score_box(max(score_x, 50), score_y)
                 if not any(cb.intersects(b) for b in nearby_boxes):
                     placed_box = cb
@@ -767,6 +837,55 @@ def add_popup_for_comment(
             # not bleed visually into the first line of the next question.
             if q_max_y < page.rect.height - 20:
                 y = min(y, q_max_y - 15)
+
+            # FIX-3: keep the note icon on the SAME visual row (same y) but
+            # place it on EMPTY horizontal space, not on top of text. The
+            # default `target_rect.x1 + 6` sits right after the anchor value
+            # which often overlaps the next column of text on wide table
+            # rows (e.g. "add back nci 6,975,000" note icon landing on top
+            # of the value "6,975,000.00" or on the goodwill row below).
+            # Slide the icon rightward on the same row until it's clear of
+            # any word-word bounding box.
+            try:
+                _ICON_W, _ICON_H = 14.0, 14.0
+                _row_y_min = float(target_rect.y0) - 3
+                _row_y_max = float(target_rect.y1) + 3
+                row_word_boxes: list[fitz.Rect] = []
+                for w in _page_words(page):
+                    wx0, wy0, wx1, wy1, wt, *_ = w
+                    if wy1 < _row_y_min or wy0 > _row_y_max:
+                        continue
+                    if not (wt or "").strip():
+                        continue
+                    row_word_boxes.append(fitz.Rect(wx0, wy0, wx1, wy1))
+
+                def _icon_box(cx: float, cy: float) -> fitz.Rect:
+                    return fitz.Rect(
+                        cx - _ICON_W / 2, cy - _ICON_H / 2,
+                        cx + _ICON_W / 2, cy + _ICON_H / 2,
+                    )
+
+                _proposed = _icon_box(x, y)
+                if any(_proposed.intersects(wb) for wb in row_word_boxes):
+                    # Slide right in small steps until we hit clear space
+                    # (or the page's right margin).
+                    _step = 8.0
+                    _limit = page.rect.width - _ICON_W - 4
+                    _cx = x
+                    while _cx < _limit:
+                        _cx += _step
+                        _test = _icon_box(_cx, y)
+                        if not any(_test.intersects(wb) for wb in row_word_boxes):
+                            x = _cx
+                            break
+                    else:
+                        # No clear space on the row's right — fall back to
+                        # the page's right margin, still on the same y.
+                        x = max(page.rect.width - 20, 10)
+            except Exception:
+                # Non-fatal: if we can't compute word boxes, keep the
+                # original x (previous behaviour).
+                pass
         else:
             effective_start = max(120.0, float(page.rect.height) * 0.25, q_min_y + 10)
             y = float(comment_page_y.get(page_num, effective_start))

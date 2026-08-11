@@ -30,8 +30,12 @@ from .annotator_ocr import _init_ocr_cache, _page_search, _page_text, _page_word
 from .annotator_text import (
     _normalize_text_for_match, _strip_llm_artifacts,
     _tokenize, _line_key, _build_anchor_variations, _build_candidate_fragments,
+    _normalize_symbols_for_match,
 )
-from .annotator_rect import _draw_underline_for_rect, _is_heading_like, _iter_page_lines
+from .annotator_rect import (
+    _draw_underline_for_rect, _is_heading_like, _iter_page_lines,
+    _group_wrapped_hits,
+)
 from .annotator_match import resolve_anchor_rect, _rank_pages_for_anchor
 from .annotator_draw import (
     _safe_float, _fmt_mark_value, _place_score_label,
@@ -175,6 +179,405 @@ def _try_tabular_row_match(
     return [], -1
 
 
+_NUMERIC_TOKEN_RE = re.compile(r"[-−]?\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?|[-−]?\d{4,}(?:\.\d+)?")
+
+# Evidence carrying at least this many alphabetic words is treated as PROSE.
+_PROSE_WORD_MIN = 8
+_ALPHA_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def _is_prose_evidence(text: str) -> bool:
+    """True when *text* reads as a sentence rather than a working/table line.
+
+    Target-value narrowing shrinks a rect to the cell holding the criterion's
+    number. That is right for a table row ("Share capital 250,000 250,000
+    250,000") and wrong for a sentence: narrowing "the results up until
+    1 March 20X4 e.g. (9/12) will be consolidated, and the remaining
+    associate" to its `9` glyph leaves a one-character underline beneath a
+    full line of prose. Prose evidence keeps its whole matched span.
+    """
+    return len(_ALPHA_WORD_RE.findall(text or "")) >= _PROSE_WORD_MIN
+
+
+def _header_search_candidates(header: str) -> List[str]:
+    """Ordered literal search strings for a column-header hint.
+
+    Accounting table headers are routinely STACKED over two physical lines:
+
+        Net assets W1   Year end     Disposal      Acq
+                        31 May X4    1 March X4    1 Jan X0
+
+    The model flattens that into a single hint ("Acq 1 Jan X0"), which never
+    appears as contiguous text on any line, so one literal search finds
+    nothing and column disambiguation is lost entirely. Falling back to
+    contiguous word n-grams — longest first — lets the hint still resolve
+    via whichever physical line it does appear on ("1 Jan X0").
+
+    Single-token candidates are kept only when they carry real letters, so a
+    bare "1" or "X0" can never anchor a column.
+    """
+    base = re.sub(r"\s+", " ", (header or "")).strip()
+    if not base:
+        return []
+    tokens = base.split(" ")
+    cands: List[str] = []
+    seen: set[str] = set()
+    for n in range(len(tokens), 0, -1):
+        for i in range(0, len(tokens) - n + 1):
+            gram = " ".join(tokens[i:i + n])
+            if len(gram) < 3:
+                continue
+            if n == 1 and not re.search(r"[A-Za-z]{3}", gram):
+                continue
+            if gram not in seen:
+                seen.add(gram)
+                cands.append(gram)
+    cands.sort(key=len, reverse=True)
+    return cands
+
+
+def _find_column_header_rect(
+    page,
+    column_header: str,
+    target_y: Optional[float] = None,
+    doc=None,
+    allowed_pages: Optional[List[int]] = None,
+) -> Optional["fitz.Rect"]:
+    """Return the RECT of the given column header text, or None if not found.
+
+    Returns the whole rect — not just its x-center — so the caller can use
+    both the center and the LEFT EDGE without re-deriving the header itself.
+    An earlier version returned only the center, forcing the caller to
+    re-search for the left edge; that second search had no idea which PAGE
+    the header was finally found on, so for a multi-page table it matched a
+    different occurrence entirely (e.g. the "acq" inside "Net assets at acq
+    (w1)" at the left margin) and pinned the column to the wrong x.
+
+    Given the LLM's `_column_header` hint (e.g., "acq date" or "Acq"),
+    the annotator finds that header's x-position and prefers value hits at
+    the same column.
+
+    Two disambiguation signals when a header word appears MULTIPLE times
+    on the page (common — e.g. "Disposal" appears in a heading AND in a
+    working section AND as the table column header):
+
+      1. `target_y`: prefer a header hit that sits ABOVE the target value's
+         y-row and is the CLOSEST above (smallest gap). Column headers are
+         always above the data rows they label.
+
+      2. `doc` + `allowed_pages`: if no usable header on the target page
+         (e.g. Amy's PDF where the table header is on page 1 and the fair-
+         value-uplift row on page 2), scan the PREVIOUS allowed pages and
+         return the bottom-most hit (closest to the page-break boundary,
+         i.e. closest to the target row on the next page).
+
+    Returns the rect of the best matching header hit.
+    """
+    if not column_header:
+        return None
+    header = str(column_header).strip()
+    if not header:
+        return None
+
+    # Stacked table headers ("Acq" over "1 Jan X0") never match the model's
+    # flattened hint literally, so fall back to progressively shorter
+    # contiguous n-grams. See _header_search_candidates.
+    candidates = _header_search_candidates(header)
+    if not candidates:
+        return None
+
+    def _hits_on(_page, needle: str) -> List["fitz.Rect"]:
+        try:
+            return _page_search(_page, needle) or []
+        except Exception as e:
+            logger.debug(f"  [col-header] search error for {needle!r}: {e}")
+            return []
+
+    def _via(cand: str) -> str:
+        return "" if cand == header else f" via {cand!r}"
+
+    # STEP 1: Try the target page first, biased by target_y (closest above).
+    # When target_y is provided, ONLY accept hits above it. A "header"
+    # occurrence found BELOW the target row is by definition not the column
+    # header for that row (it's some other text — a working label, an
+    # unrelated paragraph, etc.). If no above-target hit exists on this
+    # page, fall through to cross-page search rather than accepting a
+    # below-target hit.
+    for cand in candidates:
+        hits = _hits_on(page, cand)
+        if not hits:
+            continue
+        if target_y is not None:
+            above = [h for h in hits if h.y1 <= target_y]
+            if not above:
+                # This candidate occurs only BELOW the target row, so it is
+                # not this row's header. Try the next (shorter) candidate
+                # before giving up on the page entirely.
+                logger.debug(
+                    f"  [col-header] {len(hits)} hit(s) for {cand!r} all BELOW "
+                    f"y={target_y:.1f} — trying next candidate"
+                )
+                continue
+            above.sort(key=lambda h: target_y - h.y1)  # smallest gap first
+            hit = above[0]
+            logger.info(
+                f"  [col-header] found {header!r}{_via(cand)} on target page "
+                f"above y={target_y:.1f}: x={hit.x0:.1f}-{hit.x1:.1f} "
+                f"y={hit.y0:.1f}-{hit.y1:.1f} "
+                f"(from {len(above)} above-target hits, {len(hits)} total)"
+            )
+            return hit
+        else:
+            # No target_y bias — legacy first-hit behaviour.
+            hit = hits[0]
+            logger.info(
+                f"  [col-header] found {header!r}{_via(cand)} on target page "
+                f"(first hit): x={hit.x0:.1f}-{hit.x1:.1f} "
+                f"y={hit.y0:.1f}-{hit.y1:.1f} "
+                f"({len(hits)} total hits, no target_y filter)"
+            )
+            return hit
+
+    # STEP 2: Not found on target page — try previous allowed pages.
+    # Column headers on preceding pages are common for tables that span
+    # multiple pages (e.g. Amy's Bauhaus paper — table header on page 1,
+    # fair-value-uplift row on page 2).
+    if doc is not None and allowed_pages:
+        # Determine target page index in allowed_pages (best effort — we
+        # don't know it directly here; work backwards from the last
+        # allowed page).
+        # Simpler: iterate ALL allowed pages EXCEPT the current one, and
+        # pick the header hit whose page appears BEFORE the current page.
+        target_page_num = None
+        try:
+            target_page_num = page.number + 1  # 1-indexed
+        except Exception:
+            pass
+        for other_pnum in sorted(allowed_pages, reverse=True):
+            if target_page_num is not None and other_pnum >= target_page_num:
+                continue
+            try:
+                other_page = doc[other_pnum - 1]
+            except Exception:
+                continue
+            for cand in candidates:
+                other_hits = _hits_on(other_page, cand)
+                if not other_hits:
+                    continue
+                # Bottom-most hit is closest to next page's top → most
+                # relevant header for the target row on the next page.
+                other_hits.sort(key=lambda h: h.y1, reverse=True)
+                hit = other_hits[0]
+                logger.info(
+                    f"  [col-header] fallback to page {other_pnum} for "
+                    f"{header!r}{_via(cand)}: x={hit.x0:.1f}-{hit.x1:.1f} "
+                    f"y={hit.y0:.1f}-{hit.y1:.1f} "
+                    f"(bottom-most of {len(other_hits)} hits)"
+                )
+                return hit
+
+    logger.info(f"  [col-header] NOT FOUND: {header!r}")
+    return None
+
+
+def _narrow_rect_to_target_variants(
+    page,
+    rect: "fitz.Rect",
+    target_variants: List[str],
+    column_header: Optional[str] = None,
+    doc=None,
+    allowed_pages: Optional[List[int]] = None,
+) -> Optional["fitz.Rect"]:
+    """Return a narrower rect covering any of *target_variants* on the same
+    line as *rect*, or None if none is found within the rect's row span.
+
+    Column-header disambiguation (when *column_header* is set): if the
+    target value appears MULTIPLE times within the rect (e.g. the value
+    250,000 appears in both the disposal-date and acq-date columns of a
+    tabular row), the annotator prefers the hit whose x-position aligns
+    with the column header supplied by the model. Model-side info; no
+    heuristic guessing.
+
+    Fallback (no *column_header* or header not found): first occurrence
+    within the rect wins.
+    """
+    if not rect or not target_variants:
+        return None
+    y_min = float(rect.y0) - 2
+    y_max = float(rect.y1) + 2
+    # Resolve the column header's x-position (if provided) once up front.
+    # Pass the target row's y (rect.y0 = top of the value row) so the
+    # header lookup prefers hits ABOVE that y — the actual table header,
+    # not another occurrence of the same word elsewhere on the page.
+    # Also pass doc + allowed_pages so headers on the PREVIOUS page
+    # (multi-page tables) can be located.
+    column_x: Optional[float] = None
+    column_header_rect: Optional["fitz.Rect"] = None
+    if column_header:
+        column_header_rect = _find_column_header_rect(
+            page, column_header,
+            target_y=float(rect.y0),
+            doc=doc, allowed_pages=allowed_pages,
+        )
+        if column_header_rect is not None:
+            column_x = float(
+                (column_header_rect.x0 + column_header_rect.x1) / 2.0
+            )
+    # Expand each variant with common accounting decoration.
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for v in target_variants:
+        s = str(v).strip()
+        if not s:
+            continue
+        candidates = [s]
+        if not s.endswith(".00"):
+            candidates.append(s + ".00")
+        # Negative forms (accounting PDFs often use `-1,234` or `−1,234`
+        # rather than `(1,234)` parens).
+        if not s.startswith(("-", "−")):
+            candidates.extend(["-" + s, "−" + s])
+            if not s.endswith(".00"):
+                candidates.extend(["-" + s + ".00", "−" + s + ".00"])
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                expanded.append(c)
+    # Try longest variants first — a "18,150,000.00" match is more specific
+    # than a "18,150" match that might be a substring of another value.
+    expanded.sort(key=len, reverse=True)
+    for cand in expanded:
+        try:
+            hits = _page_search(page, cand)
+        except Exception:
+            hits = []
+        # Y-range check only — do NOT require the hit to fall inside the
+        # rect's x-range. When PyMuPDF's search_for matches a multi-word
+        # string like "land 400000 400000 0", it can return MULTIPLE
+        # rects (one per word, spaced across the row because the cells
+        # are separated by whitespace/tabs). The caller's `rect` is often
+        # just the label rect (x=74-96 for "land"), while the target
+        # value lives further right (x=250-360 for the 400000 cells).
+        # Restricting hits to the label rect's x-range would falsely
+        # reject the value cells. The Y-range check keeps us on the same
+        # visual row, and the column_header hint (below) picks the
+        # correct COLUMN among same-row hits.
+        in_range_hits: list["fitz.Rect"] = []
+        for hit in hits or []:
+            if hit.y0 >= y_min and hit.y1 <= y_max:
+                in_range_hits.append(hit)
+        if not in_range_hits:
+            continue
+        # Column-header disambiguation. Preferred rule: pick the value hit
+        # whose LEFT edge sits AT OR TO THE RIGHT OF the header's left edge,
+        # minimising the gap. This handles the typical accounting layout
+        # where the header word is LEFT-justified in its column while
+        # numeric values are RIGHT-justified — x-center comparison fails
+        # because the header's center lies BETWEEN two value columns.
+        #
+        # Example (Amy's Bauhaus paper):
+        #   Header "Disposal" x=320-360 (left-justified).
+        #   Value cells for row: 250,000 at x_center 289 (year-end col),
+        #     427 (disposal col), 500 (acq col).
+        #   x_center-distance would pick 289 (closest to 340 header center)
+        #     — WRONG (year-end col).
+        #   Left-edge rule: values with x0 >= 320-tol are 409 and 482;
+        #     closest left-edge to 320 is 409 → correct disposal col value.
+        #
+        # Fallback (no value has left >= header left, e.g., right-justified
+        # header) — fall back to x-center distance so we still return SOME
+        # hit rather than nothing.
+        if column_x is not None and column_header and len(in_range_hits) > 1:
+            # Left edge comes straight off the rect _find_column_header_rect
+            # already chose. Re-searching for it here was the bug behind the
+            # 400,000 mis-column: this search only ever looked at the TARGET
+            # page, so when the header lived on a PREVIOUS page (multi-page
+            # table) it silently matched a different occurrence — the "acq"
+            # inside "Net assets at acq (w1)" at x=141.5 — and every value in
+            # the row counted as "right of header", handing the column to the
+            # leftmost (Year end) cell.
+            if column_header_rect is not None:
+                header_left_x = float(column_header_rect.x0)
+            else:
+                header_left_x = column_x - 15  # rough fallback offset
+
+            _tol = 3.0  # tolerance so values very slightly left of header are still considered
+            right_of_header = [
+                h for h in in_range_hits if h.x0 >= header_left_x - _tol
+            ]
+            if right_of_header:
+                right_of_header.sort(key=lambda r: r.x0 - header_left_x)
+                chosen = right_of_header[0]
+                logger.info(
+                    f"  [col-narrow] variant={cand!r} -> picked LEFT-EDGE-aligned "
+                    f"x={chosen.x0:.1f}-{chosen.x1:.1f} (header_left={header_left_x:.1f}, "
+                    f"{len(right_of_header)}/{len(in_range_hits)} value(s) to right of header)"
+                )
+                return chosen
+            # No value has left >= header left — fall back to x-center distance.
+            in_range_hits.sort(
+                key=lambda r: abs(((r.x0 + r.x1) / 2.0) - column_x)
+            )
+            chosen = in_range_hits[0]
+            logger.info(
+                f"  [col-narrow] variant={cand!r} -> fallback x-center picked "
+                f"x={chosen.x0:.1f}-{chosen.x1:.1f} (closest to col_x={column_x:.1f}, "
+                f"header_left={header_left_x:.1f}, no value.left >= header.left)"
+            )
+            return chosen
+        # Default: first (leftmost) occurrence — deterministic when no
+        # column disambiguation info is available.
+        if len(in_range_hits) > 1:
+            logger.info(
+                f"  [col-narrow] variant={cand!r} -> {len(in_range_hits)} in-range hits but "
+                f"no column_x hint; returning FIRST (leftmost) at x={in_range_hits[0].x0:.1f}"
+            )
+        return in_range_hits[0]
+    return None
+
+
+def _narrow_rect_to_evidence_value(
+    page,
+    line_rect: "fitz.Rect",
+    evidence_text: str,
+) -> Optional["fitz.Rect"]:
+    """Return a narrower rect covering just the most distinctive numeric
+    token from *evidence_text* on the given line, or None if none found.
+
+    Used by Tier-2's normalized-line containment fallback so the underline
+    doesn't span the entire table row when the evidence itself references
+    only a specific value. Extracts the LONGEST numeric token from the
+    evidence (typically the amount, e.g. `18,800,000` or `-11,725,000.00`)
+    and searches the page for it, returning a rect that lies on the same
+    line as *line_rect* if found.
+    """
+    if not evidence_text or not line_rect:
+        return None
+    # Find all numeric tokens; prefer the longest (most distinctive) one.
+    tokens = _NUMERIC_TOKEN_RE.findall(evidence_text)
+    if not tokens:
+        return None
+    tokens_sorted = sorted(set(tokens), key=lambda t: -len(t))
+    y_min = float(line_rect.y0) - 2
+    y_max = float(line_rect.y1) + 2
+    for tok in tokens_sorted:
+        # Try the token as-is and also with a leading '-' variant since PDFs
+        # sometimes render minus as a different glyph.
+        candidates = [tok]
+        if tok.startswith(("-", "−")):
+            candidates.append(tok.lstrip("-−"))
+        for cand in candidates:
+            try:
+                hits = _page_search(page, cand)
+            except Exception:
+                hits = []
+            for hit in hits or []:
+                # Same physical line as line_rect?
+                if hit.y0 >= y_min and hit.y1 <= y_max:
+                    return hit
+    return None
+
+
 def _find_evidence_strict(
     doc,
     evidence_text: str,
@@ -183,8 +586,14 @@ def _find_evidence_strict(
     page_token_sets: Optional[dict] = None,
     min_y_per_page: Optional[dict] = None,
     max_y_per_page: Optional[dict] = None,
-) -> Tuple[List["fitz.Rect"], int]:
-    """Numerical-mode evidence resolver. Returns (list_of_rects, page_num).
+) -> Tuple[List["fitz.Rect"], int, bool]:
+    """Numerical-mode evidence resolver.
+
+    Returns (list_of_rects, page_num, is_wrapped) where *is_wrapped* is
+    True only when Tier 1 resolved the evidence to a single occurrence
+    that spans several physical lines. The caller uses that flag to keep
+    the fragments together — target-value narrowing must not shrink one
+    fragment to a lone number and let the sibling fragments be dropped.
 
     Three strict tiers (no fuzzy / token-overlap matching anywhere):
       1. Literal substring search across surface-form variants (GBP↔£,
@@ -197,10 +606,10 @@ def _find_evidence_strict(
          get underlined and the score lands on the numeric line.
 
     Single-line matches return [rect]; wrapped tabular matches return
-    [label_rect, data_rect]. No match returns ([], -1).
+    [label_rect, data_rect]. No match returns ([], -1, False).
     """
     if not evidence_text:
-        return [], -1
+        return [], -1, False
 
     variants = _build_anchor_variations(evidence_text)
     ranked_pages = _rank_pages_for_anchor(
@@ -238,13 +647,22 @@ def _find_evidence_strict(
                 hits = _page_search(page, variant)
             except Exception:
                 hits = []
-            for rect in hits or []:
-                if _outside(page_num, rect):
+            if not hits:
+                continue
+            # search_for() emits one rect per PHYSICAL LINE, so a phrase
+            # that wraps arrives as several consecutive rects. Group them
+            # back into logical occurrences and return the WHOLE first
+            # acceptable one. Returning only hits[0] underlined just the
+            # opening fragment of a wrapped sentence ("Given these…") and
+            # silently dropped every continuation line.
+            for group in _group_wrapped_hits(page, variant, hits):
+                anchor = group[0]
+                if _outside(page_num, anchor):
                     continue
-                line_text = _line_text_at(page, rect)
+                line_text = _line_text_at(page, anchor)
                 if line_text and _is_heading_like(line_text):
                     continue
-                return [rect], page_num
+                return list(group), page_num, len(group) > 1
 
     # Tier 2 fallback: normalized-line containment.
     # When the literal substring search fails on every variant, scan page
@@ -253,8 +671,14 @@ def _find_evidence_strict(
     # of the cleaned line — no token overlap, no word clustering. This
     # rescues PDF lines like "NCI post-acq'n profits `   3,850" where a font
     # artifact (stray backtick) prevents an exact match.
-    def _norm(s: str) -> str:
-        return re.sub(r"\s+", " ", (s or "").replace("`", " ")).strip().lower()
+    # Symbol-insensitive normalizer. The LLM and the PDF frequently disagree
+    # on currency symbols, sign glyphs and thousands separators, which blocks
+    # the literal search above and drops the whole line. Canonicalising both
+    # sides the same way lets the containment check still land the mark:
+    # Symbol-insensitive canonicaliser (shared with holistic mode) — folds
+    # currency/math glyphs, units and separators so a value differing only in
+    # surface form still matches. See _normalize_symbols_for_match for details.
+    _norm = _normalize_symbols_for_match
 
     ev_norm = _norm(evidence_text)
     if len(ev_norm) >= 10:
@@ -266,39 +690,194 @@ def _find_evidence_strict(
                 if _is_heading_like(line_text):
                     continue
                 if ev_norm in _norm(line_text):
-                    return [line_rect], page_num
+                    # Try to narrow the whole-line rect to just the most
+                    # distinctive numeric portion of the evidence — teacher-
+                    # style underline sits under the value, not across the
+                    # entire table row. Falls back to line_rect if no numeric
+                    # substring found or its bbox isn't recoverable.
+                    narrowed_rect = _narrow_rect_to_evidence_value(
+                        page, line_rect, evidence_text
+                    )
+                    return [narrowed_rect or line_rect], page_num, False
 
     # Tier 3 fallback: tabular row label (SOCIE / multi-column tables).
     rects, page_num = _try_tabular_row_match(
         doc, evidence_text, ranked_pages, min_y_per_page, max_y_per_page,
     )
     if rects:
-        return rects, page_num
+        # Tabular matches are label+value rects on DIFFERENT rows, not a
+        # wrapped phrase — narrowing is meant to apply there, so False.
+        return rects, page_num, False
 
-    return [], -1
+    return [], -1, False
 
 
 # ── Best-rect picker for the score label ─────────────────────────────────────
 
+_JOURNAL_DIR_RE = re.compile(r"^\s*(dr|cr)\b", flags=re.IGNORECASE)
+_LINE_DEBIT_RE = re.compile(r"^\s*(?:dr\b|debit\b)", flags=re.IGNORECASE)
+_LINE_CREDIT_RE = re.compile(r"^\s*(?:cr\b|credit\b)", flags=re.IGNORECASE)
+# Working-line prefixes that identify a NON-journal context. When a journal
+# criterion (Dr/Cr) has a rect resolving to a line starting with any of
+# these, the rect is rejected — teacher never marks a "Cr net assets 18,800"
+# journal on the "less net assets -18,800,000" line of the disposal working.
+_LINE_WORKING_RE = re.compile(
+    r"^\s*(?:less\b|more\b|add\b|plus\b|minus\b|total\b|sub[-\s]?total\b|"
+    r"balance\b|proceeds\b|reserves\b|goodwill\b|nci\b(?!\s+at\s+disposal)|"
+    r"share\b|land\b|profit\b|loss\b|fair\s+value\b|consideration\b|"
+    r"b/f\b|c/f\b|opening\b|closing\b|at\s+acq\b|at\s+disposal\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _filter_rects_by_criterion_context(
+    doc,
+    resolved_pending: List[Tuple[int, "fitz.Rect", str]],
+    criterion_desc: str,
+) -> List[Tuple[int, "fitz.Rect"]]:
+    """Reject resolved rects whose line context doesn't match the criterion.
+
+    For JOURNAL criteria (description mentions Dr/Cr/debit/credit):
+      - Accept lines starting with the SAME direction verb
+        (Dr → debit/dr; Cr → credit/cr).
+      - Reject lines starting with WORKING keywords (less/more/add/total/
+        proceeds/reserves/...) — these are working-area lines, not journal
+        entries. Prevents a "Cr net assets 18,800" journal criterion
+        anchoring on "less net assets -18,800,000" in disposal w3.
+      - If NO rects survive the strict filter (all rejected), fall back to
+        returning the original list so the mark doesn't disappear entirely
+        — better to place with a warning than lose the annotation.
+
+    For non-journal criteria: pass everything through unchanged.
+    """
+    if not resolved_pending:
+        return []
+    if not criterion_desc:
+        return [(p, r) for p, r, _ev in resolved_pending]
+
+    desc_l = criterion_desc.lower()
+    is_journal = any(k in desc_l for k in (" dr ", "\tdr ", "dr:", " cr ", "cr:", "debit ", "credit "))
+    # Also accept criteria starting with Dr/Cr as the first token.
+    is_journal = is_journal or bool(re.match(r"^\s*(?:dr|cr|debit|credit)\b", desc_l))
+    if not is_journal:
+        return [(p, r) for p, r, _ev in resolved_pending]
+
+    wants_debit = "dr " in desc_l or "debit " in desc_l or desc_l.startswith(("dr ", "debit "))
+    wants_credit = "cr " in desc_l or "credit " in desc_l or desc_l.startswith(("cr ", "credit "))
+
+    def _line_at(page, rect: "fitz.Rect") -> str:
+        try:
+            for lt, lr in _iter_page_lines(page):
+                if lr.intersects(rect):
+                    return lt
+        except Exception:
+            return ""
+        return ""
+
+    kept: list[tuple[int, "fitz.Rect"]] = []
+    for page_num, rect, _ev in resolved_pending:
+        page = doc[page_num - 1]
+        line_text = _line_at(page, rect)
+        if not line_text:
+            # No line context recoverable → keep (defensive).
+            kept.append((page_num, rect))
+            continue
+        # Reject working-line contexts for journal criteria.
+        if _LINE_WORKING_RE.match(line_text):
+            continue
+        # If we want a specific direction, require the line to match it.
+        if wants_debit and _LINE_DEBIT_RE.match(line_text):
+            kept.append((page_num, rect))
+            continue
+        if wants_credit and _LINE_CREDIT_RE.match(line_text):
+            kept.append((page_num, rect))
+            continue
+        # Line doesn't start with a direction verb OR a working keyword — allow
+        # it through (may be a Dr/Cr line the regex missed, or an in-line ref).
+        if not _LINE_DEBIT_RE.match(line_text) and not _LINE_CREDIT_RE.match(line_text):
+            kept.append((page_num, rect))
+
+    # Fallback: if the strict filter dropped everything, keep the originals
+    # so the mark still lands somewhere rather than disappearing.
+    if not kept and resolved_pending:
+        logger.debug(
+            "  [belonging] All rects rejected for criterion "
+            f"'{criterion_desc[:50]}' — falling back to un-filtered list"
+        )
+        return [(p, r) for p, r, _ev in resolved_pending]
+
+    return kept
+
+
+_AGGREGATE_LINE_RE = re.compile(
+    r"^\s*(?:total|gain\s+on\s+disposal|loss\s+on\s+disposal|net\s+total|"
+    r"grand\s+total|sub[-\s]?total|balance|final|answer)\b",
+    flags=re.IGNORECASE,
+)
+
+
 def _pick_best_rect_for_score(
     doc,
     page_rects: List[Tuple[int, "fitz.Rect"]],
+    criterion_desc: str = "",
 ) -> Tuple[int, "fitz.Rect"]:
     """Choose the rect best suited to anchor the criterion's score label.
 
-    Priority tiers (the score should land on the most "value-bearing" line):
-      3  — both number and alphabetic text (a typical accounting row like
-           "Dr NCI 450" — the value sits alongside the label).
-      2  — number only (the value-column line in a wrapped tabular row,
-           where the label is on a separate physical line in the PDF and
-           PyMuPDF treats each column word as its own "line").
-      1  — alphabetic only (label line — score should NOT land here when
-           a value-bearing line is also available).
-      0  — empty.
-
-    Within a tier, the longer line wins (more content = clearer anchor).
+    Priority order (higher wins):
+      A. direction_match — for journal criteria (description mentions "Dr <acct>
+         <amt>" or "Cr <acct> <amt>"), lines that START with the SAME direction
+         verb (debit/credit) win. Prevents e.g. #29 "Dr NCI 6,975" landing on
+         "add back nci 6,975,000" in a working when the actual journal has
+         "debit nci 6,975,000".
+      B. aggregate_line_boost — for AGGREGATE criteria (description mentions
+         "gain on disposal", "compute", "aggregate", "total") lines that START
+         with "total"/"gain on disposal"/etc. win over lines that just happen
+         to reference an INPUT number. Prevents e.g. #23 (gain on disposal
+         computed) landing on "sales proceeds 200000*100" because 200000
+         appears in the criterion — instead lands on the "total 10,450"
+         line which is the actual gain figure.
+      C. matching_num — line contains a distinctive number (≥4 digits, or a
+         comma-grouped thousands value) that ALSO appears in the criterion
+         description.
+      D. earlier_position — the earlier the rect appears in the evidence
+         list (as passed by the caller), the higher — the LLM tends to put
+         the primary evidence FIRST. Small tie-breaker.
+      E. tier — 3 (digit + alpha), 2 (digit only), 1 (alpha only), 0 (empty).
+      F. line length — longer line = more context = clearer anchor.
     """
-    def _score(item: Tuple[int, "fitz.Rect"]) -> Tuple[int, int]:
+    # Extract distinctive numbers from criterion description.
+    crit_nums: set[str] = set()
+    if criterion_desc:
+        # Distinctive numbers only: comma-grouped thousands OR bare ≥4-digit.
+        # Skip small standalone integers (25, 35, 100) which appear too widely.
+        for m in re.finditer(r"\d{1,3}(?:,\d{3})+", criterion_desc):
+            crit_nums.add(m.group(0).replace(",", ""))
+        for m in re.finditer(r"\b\d{4,}\b", criterion_desc):
+            crit_nums.add(m.group(0))
+
+    # Detect the criterion's journal direction (Dr → debit lines, Cr → credit).
+    # Journal criteria in the rubric read like "…Dr NCI at disposal 6,975, Cr
+    # Disposal of subsidiary 6,975"; we prefer the debit direction unless the
+    # description leads with Cr.
+    desc_l = criterion_desc.lower() if criterion_desc else ""
+    crit_wants_debit = "dr " in desc_l or "debit " in desc_l
+    crit_wants_credit = " cr " in desc_l or "credit " in desc_l
+    # Journal detection: only true when the criterion is CLEARLY a journal
+    # entry (starts with Dr/Cr or has "journal" in it). Avoids treating a
+    # gain-on-disposal working criterion that merely quotes "Cr P&L" as an
+    # example format as a full journal criterion.
+    is_journal_crit = bool(re.match(r"^\s*(?:dr|cr|debit|credit)\b", desc_l)) or "journal" in desc_l
+
+    # Detect aggregate/computation criteria — these prefer TOTAL lines over
+    # INPUT lines. Keywords: "computed", "aggregate", "gain on disposal",
+    # "final", "total".
+    is_aggregate_crit = bool(re.search(
+        r"\b(?:computed|aggregate|gain\s+on\s+disposal|loss\s+on\s+disposal|"
+        r"final\s+figure|total\s+value|working\s+total)\b",
+        desc_l,
+    ))
+
+    def _score(item: Tuple[int, "fitz.Rect"], index: int) -> Tuple[int, int, int, int, int, int]:
         page_num, rect = item
         page = doc[page_num - 1]
         line_text = ""
@@ -309,6 +888,30 @@ def _pick_best_rect_for_score(
                     break
         except Exception:
             line_text = ""
+        # Direction match: for journal criteria only, boost the line starting
+        # with the SAME direction verb the criterion mentions.
+        direction_match = 0
+        if is_journal_crit and line_text:
+            if crit_wants_debit and _LINE_DEBIT_RE.match(line_text):
+                direction_match = 1
+            if crit_wants_credit and _LINE_CREDIT_RE.match(line_text):
+                direction_match = 1
+        # Aggregate-line boost: for aggregate/computation criteria, prefer
+        # lines starting with "total"/"gain on disposal"/etc.
+        aggregate_boost = 0
+        if is_aggregate_crit and line_text and _AGGREGATE_LINE_RE.match(line_text):
+            aggregate_boost = 1
+        # Normalise the line for number matching.
+        line_digits = re.sub(r"[,\s]+", "", line_text)
+        has_matching_num = 0
+        if crit_nums:
+            for n in crit_nums:
+                if n and n in line_digits:
+                    has_matching_num = 1
+                    break
+        # Earlier evidence position wins as small tie-breaker (LLM tends to
+        # list the primary evidence first).
+        earlier_bonus = max(0, 100 - index)
         has_digit = bool(re.search(r"\d", line_text))
         has_alpha = bool(re.search(r"[A-Za-z]", line_text))
         if has_digit and has_alpha:
@@ -319,9 +922,12 @@ def _pick_best_rect_for_score(
             tier = 1
         else:
             tier = 0
-        return (tier, len(line_text))
+        return (direction_match, aggregate_boost, has_matching_num, earlier_bonus, tier, len(line_text))
 
-    return max(page_rects, key=_score)
+    return max(
+        enumerate(page_rects),
+        key=lambda idx_item: _score(idx_item[1], idx_item[0]),
+    )[1]
 
 
 # ── Main annotation function ───────────────────────────────────────────────────
@@ -940,11 +1546,19 @@ def annotate_pdf(
         else:
             # Numerical mode rules:
             #   • Underline EVERY entry in evidence_list that resolves to a rect.
-            #   • Place exactly ONE score label per criterion, on the first
-            #     resolved evidence line.
+            #   • Place exactly ONE score label per criterion, on the criterion's
+            #     "best" evidence rect. _pick_best_rect_for_score prefers rects
+            #     whose line contains a distinctive number that also appears in
+            #     the criterion description (e.g., a "Dr NCI 6,975" criterion
+            #     lands on the 6,975 line, not on the "credit profit on
+            #     disposal 10,450" line).
             #   • Never fall back to the criterion text as an anchor — the
             #     criterion text often shares words with the student's section
             #     headings and was causing scores to land on headings.
+            # NOTE: the grader (grade.py:_apply_line_evidence_dedup) already
+            # deduplicates evidence-sharing across criteria and revokes marks
+            # from criteria that lose all their evidence, so displayed items
+            # here should not collide on the same line.
             for idx, item in enumerate(displayed_breakdown, 1):
                 marks = float(item.get('marks_awarded', 0))
                 raw_evidence = item.get('evidence_list')
@@ -962,8 +1576,14 @@ def annotate_pdf(
                 criterion_name = item.get('criterion', '').strip()
 
                 _item_reason = str(item.get('reason', '') or '')
+                # OF-marker detection: match "OF" as a standalone word anywhere
+                # in the reason (case-sensitive to avoid "of the year" false
+                # positives). Previously required "OF" at the START of the
+                # reason, but the LLM's newer outputs put OF mid-sentence
+                # (e.g., "Cr Net assets (OF 18,800) and Cr Goodwill 11,725
+                # both present.").
                 is_of = item.get('is_of_mark', False) or bool(
-                    re.match(r'^OF[\s\-–]', _item_reason, re.IGNORECASE)
+                    re.search(r'\bOF\b', _item_reason)
                 )
                 if marks == 0 and "Marks given above" in _item_reason:
                     score_label = "Marks given above"
@@ -976,51 +1596,203 @@ def annotate_pdf(
 
                 logger.debug(f"  Criterion {idx}: {criterion_name} ({marks}pts)")
 
-                # Defensive: if any evidence string contains a newline, split
-                # so each physical line gets its own underline. Most LLM output
-                # already uses separate evidence_list entries, but this catches
-                # the case where it joins lines with "\n" inside one string.
-                evidence_parts: list[str] = []
+                # An evidence string containing a newline describes ONE phrase
+                # the student wrote across two physical lines. Search the
+                # JOINED form first — Tier 1's wrap grouper resolves it to a
+                # single multi-line occurrence, which guarantees the underlines
+                # are adjacent parts of the same sentence. Only if the joined
+                # form resolves nowhere do we fall back to searching each line
+                # independently (the previous behaviour), which can otherwise
+                # scatter the halves onto unrelated occurrences.
+                # Each entry is [joined_form, *per_line_fallbacks].
+                evidence_candidates: list[list[str]] = []
                 for ev in evidence_lines:
-                    for part in re.split(r"\n+", ev):
-                        part = part.strip()
-                        if part:
-                            evidence_parts.append(part)
+                    parts = [p.strip() for p in re.split(r"\n+", ev) if p.strip()]
+                    if not parts:
+                        continue
+                    joined = re.sub(r"\s+", " ", " ".join(parts)).strip()
+                    evidence_candidates.append(
+                        [joined] + parts if len(parts) > 1 else [joined]
+                    )
 
                 # Resolve each evidence part via strict exact-substring search.
                 # Headings and out-of-bounds rects are rejected.
-                # The strict finder may return MULTIPLE rects for one evidence
-                # entry when a tabular row wraps across two physical PDF lines
-                # (label line + data line). Each rect gets its own underline;
-                # _pick_best_rect_for_score later anchors the score on the
-                # number-bearing line.
-                resolved: list[tuple[int, fitz.Rect]] = []
-                for ev in evidence_parts:
+                # Two-pass: first RESOLVE all rects, then FILTER to only those
+                # that semantically BELONG to this criterion (direction match,
+                # value match, section context) before drawing anything. This
+                # prevents the annotator from placing a `Cr net assets` mark
+                # on a `less net assets` working-line just because both share
+                # the same amount.
+                resolved_pending: list[tuple[int, fitz.Rect, str]] = []
+                # Rects whose matched span must be kept WHOLE — never narrowed
+                # to a target value, never dropped by the narrowed-page rule.
+                # Two sources:
+                #   • fragments of ONE wrapped phrase (narrowing one fragment
+                #     would let the drop rule delete its siblings, leaving a
+                #     wrapped sentence underlined only under a lone number);
+                #   • prose evidence (a sentence the student wrote — narrowing
+                #     "…e.g. (9/12) will be consolidated…" to its `9` glyph
+                #     leaves a one-character underline under a full line).
+                keep_whole_keys: set[tuple[int, int, int]] = set()
+
+                def _rect_key(page_num: int, rect: "fitz.Rect") -> tuple[int, int, int]:
+                    return (
+                        page_num,
+                        int(round(rect.y0 * 10)),
+                        int(round(rect.x0 * 10)),
+                    )
+
+                def _resolve(ev: str) -> bool:
+                    """Resolve one evidence string; record rects. True if found."""
                     if not _is_informative_anchor(ev):
                         logger.debug(f"    Evidence skipped (not informative): {ev[:60]}")
-                        continue
-                    rects, page_num = _find_evidence_strict(
+                        return False
+                    rects, page_num, is_wrapped = _find_evidence_strict(
                         doc, ev, allowed_pages,
                         placed_marks=placed_marks,
                         page_token_sets=page_token_sets,
                         min_y_per_page=min_y_per_page,
                         max_y_per_page=max_y_per_page,
                     )
-                    if rects and page_num > 0:
-                        for rect in rects:
-                            _draw_underline_for_rect(doc[page_num - 1], rect)
-                            placed_marks.add(_line_key(page_num, rect.y0))
-                            resolved.append((page_num, rect))
-                        n = len(rects)
+                    if not (rects and page_num > 0):
+                        return False
+                    _is_prose = _is_prose_evidence(ev)
+                    for rect in rects:
+                        resolved_pending.append((page_num, rect, ev))
+                        if is_wrapped or _is_prose:
+                            keep_whole_keys.add(_rect_key(page_num, rect))
+                    if is_wrapped:
                         logger.debug(
-                            f"    ✓ Underlined evidence on page {page_num} "
-                            f"({n} line{'s' if n != 1 else ''}): '{ev[:60]}'"
+                            f"    ↩ Evidence wraps {len(rects)} physical lines: "
+                            f"'{ev[:60]}'"
                         )
+                    if _is_prose:
+                        logger.debug(
+                            f"    ¶ Prose evidence — narrowing skipped: '{ev[:60]}'"
+                        )
+                    return True
+
+                for candidates in evidence_candidates:
+                    if _resolve(candidates[0]):
+                        continue
+                    # Joined form found nothing — fall back to per-line search.
+                    found_any = False
+                    for part in candidates[1:]:
+                        found_any = _resolve(part) or found_any
+                    if not found_any:
+                        logger.debug(
+                            f"    ✗ Evidence not found: '{candidates[0][:60]}'"
+                        )
+
+                # BELONGING CHECK: filter resolved rects to those that actually
+                # match the criterion's context. Currently checks journal
+                # direction (Dr/Cr) — a Cr-criterion should NOT anchor on a
+                # line that starts with "less"/"more"/"add" (a working line);
+                # only on lines that start with "cr"/"credit" (a journal line).
+                # For non-journal criteria this is a no-op.
+                filtered: list[tuple[int, fitz.Rect]] = _filter_rects_by_criterion_context(
+                    doc, resolved_pending, criterion_name
+                )
+
+                # TARGET-VALUE NARROWING (model-side driven, no unit guessing):
+                # For each resolved rect, shrink it to just the cell that
+                # contains this criterion's target value. The target and its
+                # surface-form variants are ALWAYS provided by the model
+                # side (grade.py) via `_target_value` and
+                # `_target_value_variants` — the annotator never assumes a
+                # unit (thousands vs raw). Sources on the model side:
+                #   • Rubric `of_value.value` (origin criteria)
+                #   • Rubric `of_produces` (aggregate-component criteria)
+                #   • sum(subset) (aggregate recovery / merged entries)
+                # If neither field is populated the annotator falls back to
+                # the wide rect (previous behaviour) — no narrowing lost,
+                # no wrong-place hallucination.
+                target_variants: list[str] = []
+                _stashed_variants = item.get("_target_value_variants")
+                if isinstance(_stashed_variants, list):
+                    for v in _stashed_variants:
+                        s = str(v).strip()
+                        if s and s not in target_variants:
+                            target_variants.append(s)
+
+                # Model-provided column-header hint for tabular disambiguation
+                # (e.g., "acq date" vs "disposal date" when the same value
+                # appears in multiple columns of the row). None → annotator
+                # falls back to first-hit within the matched rect.
+                _col_hint_raw = item.get("_column_header")
+                _column_header_hint: Optional[str] = None
+                if _col_hint_raw is not None:
+                    _stripped = str(_col_hint_raw).strip()
+                    _column_header_hint = _stripped or None
+
+                # Narrow each rect; track which ones actually got narrowed
+                # so we can drop label-only rects when a value rect exists.
+                # This prevents `_pick_best_rect_for_score` from landing the
+                # score on a table row's LABEL cell when the same row also
+                # contains the target VALUE cell — teacher marks the value,
+                # not the label.
+                narrowed_rects: list[tuple[int, fitz.Rect]] = []
+                unnarrowed_rects: list[tuple[int, fitz.Rect]] = []
+                for page_num, rect in filtered:
+                    page = doc[page_num - 1]
+                    narrowed = None
+                    # Prose and wrapped fragments are never narrowed. Narrowing
+                    # matches on the row's Y-BAND ONLY (not the rect's
+                    # x-range — see _narrow_rect_to_target_variants), so a
+                    # sentence collapses onto whatever number happens to share
+                    # its visual row. The underline must span the phrase the
+                    # student actually wrote; _pick_best_rect_for_score still
+                    # positions the score label.
+                    if target_variants and _rect_key(page_num, rect) not in keep_whole_keys:
+                        narrowed = _narrow_rect_to_target_variants(
+                            page, rect, target_variants,
+                            column_header=_column_header_hint,
+                            doc=doc, allowed_pages=allowed_pages,
+                        )
+                    if narrowed is not None:
+                        narrowed_rects.append((page_num, narrowed))
                     else:
-                        logger.debug(f"    ✗ Evidence not found: '{ev[:60]}'")
+                        unnarrowed_rects.append((page_num, rect))
+
+                # Drop label / non-value rects when at least one rect on the
+                # same page got narrowed to a target value — the value rects
+                # are the canonical anchors. Rects on OTHER pages (no
+                # narrowed match there) are still kept so cross-page
+                # evidence still gets some underline coverage.
+                # Keep-whole rects are exempt from the drop: they are prose, or
+                # continuation lines of the SAME sentence — not competing
+                # label/value candidates — so a narrowed rect elsewhere on the
+                # page must not silently remove them.
+                narrowed_pages = {p for p, _r in narrowed_rects}
+                resolved: list[tuple[int, fitz.Rect]] = list(narrowed_rects) + [
+                    (p, r) for p, r in unnarrowed_rects
+                    if p not in narrowed_pages or _rect_key(p, r) in keep_whole_keys
+                ]
+                # Defensive: if narrowing dropped everything for some reason,
+                # fall back to the full filtered list to keep the mark visible.
+                if not resolved:
+                    resolved = list(filtered)
+
+                # Draw underlines only for rects that survived the belonging
+                # check. phrase_only=True: underline only the matched phrase
+                # (not the whole row) — teacher-style narrow underline.
+                for page_num, rect in resolved:
+                    _draw_underline_for_rect(doc[page_num - 1], rect, phrase_only=True)
+                    placed_marks.add(_line_key(page_num, rect.y0))
 
                 if resolved:
-                    best_page, best_rect = _pick_best_rect_for_score(doc, resolved)
+                    logger.debug(
+                        f"    ✓ Underlined {len(resolved)} line"
+                        f"{'s' if len(resolved) != 1 else ''} for criterion "
+                        f"(rejected {len(resolved_pending) - len(resolved)} "
+                        f"context-mismatch rect"
+                        f"{'s' if len(resolved_pending) - len(resolved) != 1 else ''})"
+                    )
+
+                if resolved:
+                    best_page, best_rect = _pick_best_rect_for_score(
+                        doc, resolved, criterion_name,
+                    )
                     _place_score_label(
                         doc[best_page - 1], best_rect, best_page - 1,
                         placed_lines_per_page, score_label,
@@ -1028,10 +1800,14 @@ def annotate_pdf(
                     annotation_mapping['criterion_scores_placed'] += 1
                     logger.debug(
                         f"    ✓ Score '{score_label}' placed on page {best_page} "
-                        f"(underlined {len(resolved)} evidence line{'s' if len(resolved) != 1 else ''})"
+                        f"(underlined {len(resolved)} evidence line"
+                        f"{'s' if len(resolved) != 1 else ''})"
                     )
                 else:
-                    unplaced_items.append((score_label, (evidence_parts[0] if evidence_parts else '')[:50]))
+                    unplaced_items.append((
+                        score_label,
+                        (evidence_candidates[0][0] if evidence_candidates else '')[:50],
+                    ))
                     logger.debug(
                         f"    ✗ Criterion unplaced — no evidence line matched"
                     )

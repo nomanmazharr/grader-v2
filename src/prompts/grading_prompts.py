@@ -41,12 +41,26 @@ Full marks:
 copy whatever phrase the student actually wrote — never substitute the
 canonical or model-answer term.
 
-Partial marks (use 0.25 increments, do not exceed max_possible):
-• Correct method / formula / approach but wrong final figure or minor arithmetic error → ~50% of max.
-• Journal entry with correct accounts and amount but wrong Dr/Cr direction → ~50% of max.
-• Journal entry with correct direction and amount but slightly wrong account name → ~50% of max.
+Partial marks (0.25 increments, cap at max_possible):
+• Detailed rules for journals and numeric criteria are in "ACCOUNTING-SPECIFIC RULES" below.
 • Narrative criterion mostly satisfied but one component missing → proportion of max.
 • If max_possible = 1 and the student is clearly addressing the criterion but incompletely → 0.5 marks.
+• MIXED narrative + calc criteria — if a single criterion bundles a TREATMENT-IDENTIFICATION (narrative) with a SPECIFIC FIGURE/FORMULA (numerical), and the student correctly identifies the treatment but omits the figure/formula, award partial credit based on the split spelled out in the criterion description. Do NOT award 0 just because the specific figure is missing when the treatment concept is clearly named.
+
+  Rule for SPLIT-MARKS criteria (CRITICAL): when the criterion description explicitly states how the marks are split — e.g. "here use equity accounting method holds 0.5 marks and 0.5 for 630k figure", or "0.25 for the formula, 0.25 for the figure" — you MUST follow the split verbatim. Do NOT under-award by giving only a quarter when the description says half.
+    • Award the FULL portion of the split for EACH sub-element the student demonstrated, regardless of the other sub-elements.
+    • Award 0 only for the sub-elements that are ABSENT from the student's answer.
+    • Sum the awarded sub-portions to get the final marks_awarded (never exceed max_possible).
+
+  Worked example — CORRECT interpretation of an explicit split (real under-award to avoid):
+    Criterion: "For 1 March to 31 May 20X4 use equity accounting method; show £630,000 (£7.2m × 3/12 × 35%) in consolidated P&L from associate; here use equity accounting method holds 0.5 marks and 0.5 for 630k figure" (max 1)
+    Student writes: "This is an associate instead of a subsidiary and should therefore be accounted for using the equity method" — identifies the correct treatment (equity method) but does NOT compute £630k.
+    → Award 0.5/1 (NOT 0.25). The description explicitly says "equity accounting method holds 0.5 marks" — the student demonstrated this sub-element in full. The remaining 0.5 for £630k is 0 because the figure is missing. Total = 0.5.
+
+  Worked example — WITHOUT an explicit split (fall back to proportional partial):
+    Criterion: "Compute goodwill on consolidation using cost + NCI − net assets" (max 1)
+    Student shows only the formula but no final number.
+    → Award ~0.25–0.5/1 based on how much of the working is present. The criterion doesn't spell out a split, so use judgement.
 
 Zero:
 • The criterion topic is absent from the entire answer.
@@ -59,43 +73,207 @@ Avoid double-counting:
 • If marks have already been awarded for a calculation in an earlier criterion, do NOT award again for the same calculation in a later criterion.
 
 DUPLICATE POINTS (CRITICAL):
-• If the student writes the SAME calculation, journal, or narrative point twice (e.g. repeated for emphasis, copied above and below, or restated in another section), award marks ONLY ONCE.
-• Use the FIRST occurrence as the evidence for that criterion (so the score + underline land on the first one).
-• For the DUPLICATE occurrence, do NOT add it as evidence on any criterion. Instead, emit a COMMENT in the format:
+• Same calculation / journal / narrative point written twice → credit ONLY the first occurrence. Use the FIRST occurrence as the evidence (so the tick lands on it).
+• For the DUPLICATE occurrence, do NOT add it as evidence anywhere. Instead emit a comment:
   "<5-10 word verbatim quote from the duplicate> → Marks already given above for this point. <one-sentence improvement>."
   (use "below" if the duplicate is earlier than the primary occurrence).
-• Two genuinely DISTINCT calculations that happen to share wording (e.g. two different journal entries with the same account name but different amounts) are NOT duplicates — keep them separate.
+• Marks follow the WORK, not the conclusion. Award at the location where the student actually performs the calculation or writes the journal; later references to the same result earn nothing extra.
+• A working (e.g. W2: NCI at disposal = £6,975,000) and a subsequent journal that USES that figure (Dr NCI 6,975,000) are NOT duplicates — each is a distinct skill, each criterion earns its own marks.
+• Two DISTINCT calculations that happen to share wording (different amounts, different accounts) are NOT duplicates — keep them separate.
 
-"Marks given above / below" — working vs. subsequent use:
-• When a student calculates a figure in a WORKING (e.g. W2: NCI at disposal = £6,975,000) and then USES that same figure in a subsequent journal entry (e.g. Dr NCI 6,975,000), the journal entry criterion earns its OWN separate marks — this is a different skill (knowing which account to debit/credit) and is NOT a duplicate.
-• However, if the student merely RE-STATES the same calculation a second time without adding new working (e.g. writes the NCI build-up twice in different sections), award marks ONLY for the FIRST occurrence and comment "Marks given above" on the second.
-• The rule of thumb: marks follow the WORK, not the conclusion. Award at the location where the student actually performs the calculation or writes the journal. Later references to the same result get no extra marks.
+SAME VALUE, DIFFERENT WORKING CONTEXT → BOTH CRITERIA EARN THEIR MARKS (CRITICAL — do NOT confuse this with the duplicate rule above):
+Many rubrics deliberately assess the SAME numeric value at MULTIPLE DIFFERENT points in the working. For example:
+  • Share capital 250 is assessable BOTH at acquisition date (in the goodwill-at-acquisition working) AND at disposal date (in the net-assets-at-disposal working).
+  • NCI at acquisition 3,125 is assessable BOTH in the goodwill working (Cost + NCI − net assets) AND separately in the NCI-at-disposal build-up.
+  • Reserves 2,750 (acq-date), Land 400, and other figures may each appear at multiple working sections in the model answer.
+When a criterion carries `of_component_of: OFX` in the rubric, that tag identifies the WORKING SECTION the criterion belongs to. Two criteria with DIFFERENT `of_component_of` values (e.g., #5 = OF1 for net assets at acq, #12 = OF12 for net assets at disposal) are testing DIFFERENT SKILLS at DIFFERENT POINTS in the answer — they are NOT duplicates.
+
+Rule: if the student's answer shows the required value in BOTH working contexts (e.g., a `disposal date | acq date | post acq` table with 250 in both the disposal and acq columns), award BOTH criteria their full marks. Do NOT emit "Marks given above" across different `of_component_of` groups.
+
+Only emit "Marks given above" when the two criteria are in the SAME working section (same `of_component_of`, or when neither has an OF group and the criteria describe conceptually identical points).
+
+COLUMN-HEADER HINT FOR TABULAR DATA (MANDATORY when same value appears in multiple columns):
+
+When the student's answer contains a TABLE ROW where the SAME numeric value appears in MULTIPLE COLUMNS (e.g. `share cap | 250,000 | 250,000 | 0` — 250,000 in both disposal-date and acq-date columns), you MUST tell the annotator WHICH column your target is in.
+
+Do this by adding a field `_column_header` to the breakdown item, containing the EXACT column-header text from the student's PDF (e.g., "acq date", "disposal date", "post acq").
+
+The annotator uses this to disambiguate: it finds the header's x-position on the page, then picks the value hit whose x-position aligns with that column.
+
+When to emit `_column_header`:
+  • The criterion targets a specific value AND the same value appears in >1 column of the student's row.
+  • Skip when the value is unique on the row (annotator's default first-hit rule is fine).
+  • Skip for non-tabular criteria.
+
+Examples (from the Bauhaus MM table with columns `disposal date | acq date | post acq`):
+
+  Student wrote:
+    net assets w2 | disposal date | acq date | post acq
+    share cap | 250,000 | 250,000 | 0
+    reserves w4 | 18,150,000.00 | 2,750,000 | 15,400,000.00
+    land | 400000 | 400000 | 0
+
+  Criterion "Share capital (500,000 x 50p) = 250" (target = 250,000 in ACQ DATE column):
+    evidence_list = ["share cap | 250,000 | 250,000 | 0"]
+    _column_header = "acq date"
+
+  Criterion "Net assets at disposal — share-capital component £0.25m" (target = 250,000 in DISPOSAL DATE column):
+    evidence_list = ["share cap | 250,000 | 250,000 | 0"]
+    _column_header = "disposal date"
+
+  Criterion "Reserves = 2,750" (target = 2,750,000 in ACQ DATE column — but unique on row):
+    evidence_list = ["reserves w4 | 18,150,000.00 | 2,750,000 | 15,400,000.00"]
+    _column_header = "acq date"   (optional here since the value is unique, but harmless to include)
+
+  Criterion "[Combined] Net assets at disposal" merged (target = 18,150,000.00 in DISPOSAL DATE column, unique):
+    evidence_list = ["reserves w4 | 18,150,000.00 | 2,750,000 | 15,400,000.00"]
+    _column_header = "disposal date"
+
+  Criterion "Fair value adjustment (land) = 400" (target = 400000 in ACQ DATE column):
+    evidence_list = ["land | 400000 | 400000 | 0"]
+    _column_header = "acq date"
+
+Why this works: the annotator finds "acq date" (or "disposal date") on the page, gets its x-center, then among all matches of the target value on the row, picks the one closest to the column's x-center.
+
+`_column_header` VALUE RULES:
+  • Copy the header text VERBATIM from the student's PDF (case-sensitive-ish; searching handles minor case differences).
+  • Do NOT invent column names that don't exist in the student's text.
+  • Do NOT include pipe delimiters — just the header words (e.g. "acq date", NOT "| acq date |").
+  • If you can't find a clear header for the target column, leave `_column_header` unset — the annotator will fall back to first-hit.
+
+
+EVIDENCE FOR NARRATIVE CRITERIA — SINGLE STATEMENT, NO WORKINGS (MANDATORY):
+When a criterion's `category` in the rubric is "narrative" (or the criterion description is a treatment-identification / classification / accounting-principle statement), you MUST follow these rules WITHOUT EXCEPTION:
+
+  (1) `evidence_list` MUST CONTAIN EXACTLY ONE ITEM: the student's narrative sentence that demonstrates the concept.
+  (2) DO NOT include ANY numerical working, formula line, or calculation step in the `evidence_list` for a narrative criterion — even as a "supporting" second item.
+  (3) DO NOT put a working/formula line FIRST and a narrative statement second. The annotator uses `evidence_list[0]` as the primary anchor; if you put a working first, the mark lands on the wrong region of the page.
+  (4) If the student demonstrates the concept in multiple sentences, pick the SINGLE most explicit narrative sentence and put ONLY that.
+
+  Why this matters: the annotator draws the underline + score label on `evidence_list[0]`. For a narrative criterion, teacher would underline the STATEMENT (not the working). A different criterion (the numerical one) is responsible for underlining the working. Mixing them causes double-marks on the same working line and no mark on the narrative line.
+
+  CANONICAL EXAMPLE — Bauhaus MM Question 1:
+    Criterion #8 (category: narrative): "When Bauhaus sells 40%... MM becomes an associate. As such MM should be treated as a subsidiary for the first nine months, with revenue and costs pro-rated for that period."
+
+    Student wrote (paragraph 1):  "This is an associate instead of a subsidiary and should therefore be accounted for using the equity method rather than with a full consolidation"
+    Student wrote (working line): "profit for 9 months  5,400,000.00  7200000/12*9"
+
+    CORRECT evidence_list:
+      ["This is an associate instead of a subsidiary and should therefore be accounted for using the equity method"]
+
+    WRONG evidence_list (do NOT do this — this is what the previous run produced):
+      ["profit for 9 months 7200000/12*9",
+       "profit for 9 months 5,400,000.00 7200000/12*9",
+       "This is an associate instead of a",
+       "subsidiary"]
+    The working line "profit for 9 months 5,400,000.00" belongs to the SEPARATE criterion "MM contributes £5.4 million (£7.2m × 9/12)" (category: narrative too, but its narrative CONCEPT is "5.4m contribution", so evidence = the working line that shows 5.4m). Every criterion gets its OWN evidence — never share a working line across two criteria.
+
+  Rule of thumb:
+    • Criterion IDENTIFIES/CLASSIFIES a treatment / principle → evidence is the STUDENT'S NARRATIVE SENTENCE.
+    • Criterion COMPUTES a specific figure / applies a formula → evidence is the WORKING LINE with that figure.
+    • Two criteria = two separate evidence anchors. Never share.
 
 "Own figure" (OF) rule (CRITICAL):
-• If a student calculated an earlier value incorrectly, but then uses that wrong value correctly in a subsequent CALCULATION (correct method/formula, just wrong input from their earlier error), award FULL marks for that calculation criterion.
-• In UK professional exams (ICAEW/ACCA style), own-figure for CALCULATIONS earns the full mark — the method is what is tested, and the student is NOT penalised twice for one wrong input.
-• For JOURNAL entries with wrong am6ounts (but correct direction and accounts): award ~50% because the journal amount is the assessable element (not just a downstream figure).
-• The student should NOT be penalised twice for the same mistake — once in the original criterion and again in every downstream criterion that depends on it.
-• Example: if the student got net assets wrong in W1, but then correctly uses their own wrong net assets figure in the disposal calculation with the right formula, award FULL marks for the disposal criterion.
-• LABELLING (CRITICAL): Whenever OF applies, you MUST write "OF" (or "OF marks") explicitly in the breakdown reason field. e.g. "OF – correct method using own figure from W1, wrong input value". This makes it clear to the student that their method was correct.
-• Example: formula is A/B. Student uses 6/2 → same figures as model answer → full marks. Student uses 3/4 → correct method (division), wrong figures carried from earlier error → FULL OF marks for that step, reason must say "OF – correct formula applied to own figure".
+When a student's earlier working produced a wrong value and they then use THAT SAME wrong value in a downstream criterion:
+• CALCULATION downstream → award FULL marks if the method/formula matches the model answer. UK professional-exam convention: the method is what's tested; students are not penalised twice for one wrong input.
+• JOURNAL downstream → award FULL max marks if:
+    - Direction (Dr / Cr) matches the rubric, AND
+    - Account name matches (or is equivalent — e.g. "Investment in associate" ≡ "Investment"), AND
+    - Amount is EITHER correct OR is the student's own OF (a value they carried from a prior working, even if that prior working was mathematically or methodologically wrong).
+  Rationale: the student was already penalised at the ORIGIN where the wrong figure was computed. Do NOT penalise again in the downstream journal. This is UK professional-exam convention — same as full-marks OF for calculations. When you award OF, LABEL it in the reason field (e.g. "OF – correct journal entry using own figure 4,700 from NCI working") AND emit a targeted comment (see "Comments" rules below) telling the student what the CORRECT figure should have been (e.g. "Please consider using the carrying amount of the non-controlling interest at disposal (£6.975 million)").
+  Downgrade to 0 only when direction is reversed (Dr where Cr required, or vice-versa) OR the account is fundamentally different (posted to Revenue instead of NCI, etc.).
 
-"Own figure" LIMITATIONS (equally CRITICAL):
-• Own-figure credit requires the student to use the SAME METHOD or FORMULA as the model answer, just with a wrong input value from an earlier error.
-• Do NOT apply own-figure when the student uses a FUNDAMENTALLY DIFFERENT METHOD to arrive at their figure, even if the account name or line item is the same.
-• Example where own-figure does NOT apply: model answer calculates NCI at disposal as "NCI at acquisition + 25% of post-acquisition profits" but student calculates NCI as "fair value per share x NCI%" — this is a wrong method, not merely a wrong input. Award 0.
-• Example where own-figure DOES apply: student uses the correct NCI build-up formula but plugs in their own wrong post-acquisition profit figure from an earlier error. Award ~50%, reason must say "OF marks".
+• COMPOUND JOURNAL CRITERIA — do NOT require every listed line (CRITICAL):
+  Some journal criteria bundle multiple line items in a single criterion, e.g. "Eliminate goodwill: Cr Goodwill on consolidation 11,725, Dr Disposal of subsidiary 11,725" or "Recognise sale proceeds: Dr Suspense 20,000, Cr Disposal 34,000, Dr Investment 14,000". For these criteria:
+    - Award FULL max marks when the student's answer contains the SUBSTANTIVE account entries (Goodwill, NCI, Net assets, Suspense, Investment, etc.) at the correct direction and amount.
+    - Do NOT require the balancing/aggregating side (typically "Disposal of subsidiary" account combining multiple lines). Students commonly write ONE consolidated disposal journal that captures the substantive Dr/Cr accounts against a combined "gain on disposal" or suspense line — this is acceptable.
+    - Example: rubric criterion tests "Cr Goodwill 11,725, Dr Disposal of subsidiary 11,725". Student writes only "Cr Goodwill 11,725" (correct direction and amount) without a separate "Dr Disposal of subsidiary 11,725" line → award FULL 0.5. Reason: substantive entry present, balancing side is a bookkeeping artefact.
+• DIFFERENT METHOD → award 0. OF requires the SAME formula shape with a wrong input, not a fundamentally different calculation. E.g. model = "NCI-at-acq + 25% × post-acq profits" vs student = "FV per share × NCI%" → not OF, award 0.
+• LABEL every OF award in the reason field: e.g. "OF – correct method using own figure from W1, wrong input value". This tells the student their method was right.
+• The student must NOT be penalised twice for the same mistake — once in the original criterion and again in every downstream that depends on it.
 
-Share-based payment (SBP) "own figure" — wrong fair value input:
-• The correct grant-date FV for equity-settled options is the FV at the date of GRANT (e.g. £24 per option). The exercise price (e.g. £210) is WRONG as an FV input.
-• If a student uses the correct SBP formula structure (N_employees × N_options × FV × proportion/vesting) but substitutes the exercise price for the grant-date FV, this is an OWN FIGURE scenario — correct method, wrong input.
-• Award FULL marks for each SBP calculation criterion where the formula structure is correct but the FV used is the exercise price. Label the reason as "OF – correct formula, wrong fair value (used exercise price instead of grant-date FV)".
-• Do NOT award OF marks if the student uses a completely different formula structure (e.g. total proceeds ÷ vesting period), only if the formula has the right shape but wrong FV input.
+OF METADATA in the rubric (use these fields when they exist):
+
+Sub-answer level:
+    of_definitions — dict of `OF# → {{value, unit, label}}` for OFs whose origin is a
+                     working total that isn't a criterion in the rubric
+                     (e.g. OF1 = 3,400 = "Total" line of the net-assets-at-acquisition
+                     working, which carries no marks and is therefore not a criterion).
+                     Read these definitions to know the canonical value/label of every
+                     OF referenced anywhere.
+
+Per-criterion:
+    of_ids         — LIST (0, 1, or 2 entries). If this criterion is the ORIGIN where
+                     the OF value is derived, its OF ID(s) appear here. Two OFs can
+                     share one origin criterion when the WAS-done / SHOULD-be working
+                     packs two figures into one line (e.g. #25 is origin of OF8 and OF11).
+    of_value       — numeric value derived here (e.g. 3125). Only on origin criteria.
+    of_value_unit  — scale (e.g. "GBP000" = thousands).
+    of_value_label — human-readable label (e.g. "NCI at acquisition").
+    of_source_ids  — upstream OFs this criterion USES as inputs (e.g. ["OF1", "OF7"]).
+                     Any criterion whose figure depends on an OF value (whether that OF
+                     was derived on another criterion or lives only in of_definitions).
+
+How to use these fields when grading:
+• Exactly ONE criterion per OF holds it in `of_ids` (that's the origin), OR the OF lives
+  in `of_definitions` (virtual origin — no criterion holds it). Every other criterion
+  that references that OF value carries it in `of_source_ids`, NOT of_ids.
+• When a criterion has `of_source_ids` populated, its expected value depends on those
+  upstream OFs. If the student computed a DIFFERENT value for any upstream OF earlier
+  and then plugged their own value here with the right formula, apply the OF rule above.
+• Use `of_value_label` (from either the origin criterion or `of_definitions`) to locate
+  the student's own version of each upstream OF (e.g. label = "Net assets at acquisition"
+  → look for the student's W1 net-assets figure).
+• Virtual-origin OFs (defined only in `of_definitions`) are derived by the student
+  implicitly through the component criteria — e.g. OF1 = 3,400 is the sum of share
+  capital + reserves + FV adjustment; treat the student's OF1 value as the sum of
+  whatever they wrote for each component.
+• If a criterion has `exact_match: true`, OF is DISABLED — the exact expected value
+  must appear.
 
 Surface-level identification vs demonstrated understanding:
 • Do NOT award full marks for merely identifying or restating what went wrong (e.g. "Andrea incorrectly added the PAT") without the student ALSO demonstrating the correct treatment through workings, calculations, or journal entries.
 • A criterion that requires explaining the correct treatment needs evidence of HOW it should be corrected, not just THAT it was wrong.
 • If the student only identifies the issue but provides no corrective working or journal, award at most ~50% of the criterion's marks.
+
+Context & progression awareness (CRITICAL — do NOT confuse this with STEP 1):
+STEP 1 tells you to SEARCH the whole answer. This rule tells you what to do AFTER you find a match: check WHETHER the student actually DID the work for that criterion, or merely referenced its output while doing something else.
+
+LOCATION DOES NOT MATTER. ORDER DOES NOT MATTER. Only the work matters.
+• If the student properly does criterion 1's working — shows the derivation, states the amount with the correct method — award criterion 1's marks. It does NOT matter whether they wrote it before, after, or physically inside their answer to a later criterion. Real markers routinely credit workings written out of order.
+• If the student merely NAMES the criterion's answer or drops a number/keyword in passing while working on a different criterion — DO NOT retroactively award the referenced criterion. A number-drop or passing reference is not "doing the working".
+
+Decision test — for each candidate match ask:
+  "Does the student show enough here to DERIVE the criterion's answer (formula, inputs, arithmetic, or a clear statement of the method with the correct amount)?"
+  YES → award the criterion, regardless of location or order.
+  NO (just a mention, keyword bleed, or referenced output with no derivation) → 0 for the referenced criterion.
+
+Example (student SKIPS, then references — DO NOT credit the referenced criterion):
+  Rubric: (2) NCI at acq = 125,000 × £25 = 3,125.
+  Student writes only under criterion 4: "using the NCI figure of 3,125 built up earlier..."
+  There is no working, no formula, no derivation for the NCI-at-acq step — only the output. Criterion 2 gets 0.
+
+Example (student SHIFTS ORDER but still does the work — award it):
+  Same rubric criterion 2. Student's page 3 (inside their criterion-4 write-up) contains: "NCI at acquisition = 125,000 × £25 = 3,125."
+  The student HAS done the working, just in a different location. Award criterion 2 in full.
+
+Also blocks "lucky overlap" — where a word or number the student wrote for a different reason happens to match a criterion's keyword. If the surrounding sentence is clearly about a different criterion AND the student never derives the matched value, the match doesn't count.
+
+Sub-component criteria — evidence must belong to the criterion's PARENT CALCULATION (CRITICAL):
+Rubrics often break a single working into sub-marks — one per input to a calculation (e.g., "£7.2m annual profit", "9/12 apportionment", "25% NCI stake" — three sub-marks for a single £1,350 line item). When a criterion description names its parent calculation (e.g., "From the working '25% × £7.2m × 9/12 = 1,350'"), the student's evidence must show that PARENT calculation actually being performed — not just contain the sub-component number in an UNRELATED calculation.
+
+Decision test: Does the student's evidence produce the parent calculation's RESULT? YES → award the sub-component. NO (the student used those inputs to compute a DIFFERENT value) → award 0.
+
+Worked example (this is a real over-award to avoid):
+  Criterion: "NCI share of profits until 1 March 20X4 — annual profit £7.2m. From the working '25% × £7.2m × 9/12 = 1,350'."
+  Student writes: `profit for 9 months 7,200,000 / 12 × 9 = 5,400,000` (this produces 5,400 — the 9-MONTH PROFIT CONTRIBUTION, NOT the £1,350 NCI SHARE).
+  The student never applied 25% here. The parent calculation (25% × 7.2 × 9/12 = 1,350) is MISSING the crucial 25% step — the student computed a different quantity.
+  → Award 0 for this sub-component. The £7.2m and 9/12 appear, but not in service of the £1,350 NCI-share calculation the criterion is testing.
+
+Rule of thumb: if a sub-component's parent calc would produce value X but the student's working produces a different value Y, the sub-component belongs to Y's criterion (not X's). Never credit sub-components for a parent calc the student did not perform.
+
+One-student-working-earns-one-credit (CRITICAL):
+When a student wrote a calculation or narrative ONCE, credit AT MOST ONE criterion for it. Multiple rubric criteria may all reference the same numbers (e.g., a 9-month profit derivation is an input to a subsidiary contribution criterion AND a balance-sheet component criterion AND several NCI sub-mark criteria). But the student who wrote `7.2m × 9/12 = 5.4m` ONCE has demonstrated ONE piece of accounting work — a real marker awards ONE mark. Do NOT award every criterion whose expected values happen to appear inside that single working. Pick the criterion the working MOST DIRECTLY demonstrates, credit that, and set the others to 0 (they can still earn marks if the student SEPARATELY performed their specific work).
 
 Totals:
 • score MUST equal the exact sum of marks_awarded values in breakdown.
@@ -107,61 +285,19 @@ ACCOUNTING-SPECIFIC RULES
 Journal entries:
 • Full marks: correct Dr/Cr direction + correct (or equivalent) account name + correct amount.
 • Partial (~50%): correct accounts + amount but wrong direction; OR correct direction + amount but slightly wrong account.
-• "Own figure" (~50%): correct Dr/Cr direction + correct account name but WRONG amount, where the student shows a clear working that derived their own (incorrect) figure. Award ~50% of max because the student demonstrated the correct journal structure and method, even though the underlying calculation was wrong.
 • Zero: completely wrong account AND wrong direction, or amount differs with no working shown at all.
+• OF: see "Own figure" rule above — journal with wrong amount from an earlier OF error → ~50%.
 
 Numeric / calculation criteria:
 • Full marks: student states the correct number, OR shows a correct working that arrives at it (even if the final number is not explicitly restated).
-• Partial (~50%): student uses the correct formula/method but makes one wrong input or arithmetic error.
-• "Own figure" (~50%): student arrives at a wrong number but shows a clear, logical working that uses the correct method/approach. The error stems from an earlier mistake (e.g. using their own wrong sub-total). Award ~50% because the method is correct even though the figure is wrong.
-• Accept numbers presented without commas or with slightly different
-formatting (e.g. 3125000 = 3,125,000) WHEN DECIDING IF THE CRITERION IS
-MET. The evidence string you return must still preserve the student's
-exact formatting — commas, decimal points, currency symbols and operators
-as the student wrote them.
+• Partial (~50%): student uses the correct formula/method but makes one wrong input or arithmetic error unrelated to OF.
+• OF: see "Own figure" rule above — correct method with a wrong OF input from an earlier working → FULL marks.
 
 Narrative / theory criteria (category = "narrative") — MEANING over wording:
-These are explanation / discussion / policy-recommendation / commentary
-criteria (e.g. ratio analysis commentary, dividend-policy recommendation,
-Balanced Scorecard KPI suggestions, comparison of financing sources). For
-these, the assessable element is the IDEA the student conveys, NOT the
-exact phrasing the rubric uses.
-
-• Grade by MEANING. If the student conveys the same idea as the rubric
-  using different words, award the marks. Example: rubric example is
-  "profitability rose due to sales growth"; student writes "all
-  profitability ratios increased as sales increased" — SAME MEANING,
-  award the marks.
-• Rubric examples are ILLUSTRATIVE, not exhaustive. The phrasing inside
-  parentheses or after "e.g." is a sample of what would earn the mark,
-  not a checklist of required words. Equivalent ideas in different words
-  also earn the mark.
-• When the criterion has a tiered AWARD GUIDE (e.g. "2.0 / 1.5 / 1.0 / 0.5"
-  thresholds), pick the tier that best matches the SUBSTANCE of the
-  student's content. If the substance meets a higher tier, award the
-  higher tier even if the student's wording differs from the rubric
-  example. Do NOT default to the lower side of a range purely because
-  the wording is different.
-• Accept all of these as meaning-equivalent:
-   - synonyms and paraphrasing (e.g., "deleverage" / "reduce gearing"
-     / "lower debt level" are the same idea);
-   - alternative examples illustrating the same principle (e.g., the
-     student names a different but valid pharma KPI than the rubric);
-   - imperfect English / grammar / spelling — judge the underlying
-     meaning, not the language quality;
-   - statements that combine multiple themes into one sentence (count
-     each distinct theme towards the tier even if compressed).
-• Down-tier ONLY when the student:
-   - misses a required theme/component of the criterion, OR
-   - actively contradicts the model answer (e.g., recommends paying
-     dividends when residual policy is required), OR
-   - is so vague that you cannot identify what cause-effect link or
-     idea they are claiming.
-• Do NOT down-tier solely because: (a) the student didn't quote
-  specific numbers, (b) the student's phrasing differs from the
-  rubric's example, or (c) the student used fewer words than the
-  model answer. Number-specific scoring belongs in the numeric
-  criteria, not here.
+• Grade by MEANING. Synonyms, paraphrasing, alternative valid examples, and combined ideas earn the mark if the substance matches. Imperfect English / grammar / spelling → judge meaning, not language quality.
+• Rubric text after "e.g." or inside parentheses is ILLUSTRATIVE, not a required checklist.
+• If a tiered AWARD GUIDE exists ("2.0 / 1.5 / 1.0 / 0.5"), pick the tier the student's SUBSTANCE meets — do not down-tier for wording alone or for missing numbers (number-specific scoring lives in numeric criteria).
+• Down-tier ONLY when: (a) a required theme is missing, (b) the student contradicts the model answer, or (c) the point is too vague to identify the cause-effect link.
 
 ═══════════════════════════════════════════════════
 EVIDENCE RULES
@@ -177,6 +313,11 @@ Grading is by MEANING; evidence is for PDF annotation only.
   award, you MUST award 0.
 
 EVIDENCE INTEGRITY — actions that produce invalid evidence (NEVER do these):
+0. Number formatting: for the SCORING DECISION accept student numbers
+   without commas or with slightly different formatting (e.g. 3125000 ≡
+   3,125,000). But the evidence string MUST preserve the student's EXACT
+   formatting — commas, decimals, currency symbols, and operators as
+   they wrote them. Never re-format numbers into the evidence you return.
 1. Do NOT add labels, year tags, headings, or context words that are
    not literally in the student's writing for that row.
 2. Do NOT substitute mathematical operators. Keep × / x / ÷ / − exactly
@@ -259,28 +400,48 @@ comments is an array of strings. Each string MUST follow this EXACT format:
 
 "[<top_level_sub_question>] <5–10 word verbatim quote from student> → <sentence 1>. <sentence 2>."
 
-STRICT QUOTA — ONE comment per major sub-section, AT MOST.
-• The bracketed prefix must be the TOP-LEVEL sub-section identifier ("1.1", "1.2",
-  "(a)", "(b)", etc.) — NEVER a per-criterion or fine-grained label.
-• If a sub-section has multiple criteria where marks were lost, write ONE
-  consolidated comment that covers the most important gap. Do NOT emit one
-  comment per missed criterion.
-• If a sub-section is fully credited, omit it from comments entirely.
-• Aim for AT MOST one comment per major sub-section in the question. For a
-  question with 4 sub-sections, that means at most 4 comments total.
+Comments are SPARSE and TARGETED — only on things the student ACTUALLY WROTE that need correction or explanation. A real teacher's annotations do not touch:
+  – lines the student wrote correctly (no praise notes),
+  – rubric items the student skipped entirely (the empty breakdown row already says "not attempted"),
+  – general observations about missing sections.
+They only appear next to specific student writing that is WRONG (with the correct figure/approach) or was awarded OF (with the correct figure noted). Follow that discipline strictly.
 
-The comment should explain what the student got wrong or missed in that sub-section overall, giving the student a clear understanding of the gap.
+WHEN TO EMIT A COMMENT — only if BOTH conditions hold:
+  (A) The comment quotes something the STUDENT ACTUALLY WROTE (an existing line/phrase in {chunks}), AND
+  (B) That specific writing is WRONG in some way OR received OF credit.
 
-Rules:
-• The quote MUST be copied character-for-character from {chunks}.
+Concretely, emit a comment ONLY for:
+• Every OF award — quote the student's line (their OF value in context) and tell them the correct figure. Example (real teacher note on an OF-marked Dr NCI 4,700): "[1] Dr NCI 4,700,000 → OF marks awarded for using your own figure. Please consider using the carrying amount of the non-controlling interest at disposal (£6.975 million)."
+• A student line that received PARTIAL credit and where the wrong element is fixable with one specific correction — quote the line, say what's wrong, name the correct figure or method. Do NOT emit a partial-credit comment when the reason is just "one of several components missing"; only when the STUDENT'S WRITING itself contains a specific fixable error.
+• A student line that got 0 because the student wrote it INCORRECTLY (wrong direction on a journal, wrong method) — quote the wrong line and give the fix. Do NOT emit when the criterion scored 0 because the student did not write anything for it.
+
+DO NOT EMIT A COMMENT FOR:
+• Fully-correct criteria (marks_awarded == max_possible AND no OF flag). The tick is enough.
+• Criteria the student did not attempt (evidence empty, marks 0). Silence is the message — teacher does not annotate empty space.
+• "Missing an item" observations that don't quote actual student writing. If the student didn't write it, there's nothing to annotate.
+• Praise, structural suggestions, or general study advice.
+• Meta-observations like "ensure X is shown line by line" when the student did show it. Only comment on what is genuinely wrong in the student's writing.
+
+RULE OF THUMB: If you cannot point to specific WRONG text the student wrote, do not emit a comment. Teacher's paper style — she writes marginal notes ONLY on lines that are wrong or OF-credited, never on blank space or correct lines.
+
+WHAT NOT TO DO WITHIN A COMMENT:
+• Do NOT reveal the model answer in full. Give the CORRECT FIGURE, or the CORRECT METHOD/APPROACH, but not the full step-by-step model workings.
+
+FORMAT RULES (for each comment string):
+• Prefix `[<sub-question>]` must be the TOP-LEVEL sub-section identifier ("1", "1.1", "(a)", "(b)"). Use the SAME prefix across multiple comments in the same sub-section — the prefix identifies the section, not the criterion.
+• Quote MUST be copied character-for-character from {chunks} — this is the anchor for the annotator.
 • Do NOT mention page numbers, line numbers, or "above/below".
-• After the arrow (→): EXACTLY TWO short sentences — Sentence 1: state the issue; Sentence 2: give one actionable improvement.
-• No praise-only comments. Do NOT reveal or reference the model answer.
+• After the arrow (→): EXACTLY TWO short sentences — Sentence 1: state the specific issue; Sentence 2: give one actionable improvement, ideally naming the correct figure or method.
 • No bullet points, numbering, or line breaks inside a comment string.
-• NEVER use administrative/guardrail phrases (e.g. "Marks revoked …"). Put those in breakdown[i].reason instead.
+• NEVER use administrative / guardrail phrases (e.g. "Marks revoked …"). Put those in breakdown[i].reason instead.
+
+Examples of a good targeted comment set for a disposal-journal section (per-line specific, not one general note):
+  "[1] Dr NCI 4,700,000 → OF marks awarded for using your own figure. Please consider using the carrying amount of the non-controlling interest at disposal (£6.975 million)."
+  "[1] Cr Net assets 18,800,000 → OF marks awarded on your own figure. The correct de-recognised net assets at disposal should be £18.4 million (time-apportioned)."
+  "[1] Cr Gain on disposal 8,175,000 → The gain has been posted incorrectly. Show the disposal-of-subsidiary account elimination separately and derive the correct £10.85 million gain."
 
 ═══════════════════════════════════════════════════
-OUTPUT FORMAT — return ONLY this valid JSON, nothing else
+OUTPUT FORMAT — return ONLY valid JSON, nothing else
 ═══════════════════════════════════════════════════
 {{
   "grades": [
@@ -310,251 +471,6 @@ OUTPUT FORMAT — return ONLY this valid JSON, nothing else
   ]
 }}
 """
-
-# GRADE_PROMPT_TEMPLATE = """
-# You are an experienced exam marker. Grade the student's answer holistically against ALL provided marking criteria.
-
-# Be objective. Award marks only where there is clear evidence in the student's answer.
-# Evaluate the ENTIRE student answer (all parts/pages) as one continuous document — never restrict your search to a single sub-part.
-
-# ═══════════════════════════════════════════════════
-# STEP 1 — READ THE WHOLE ANSWER FIRST
-# ═══════════════════════════════════════════════════
-# Before scoring anything, read the ENTIRE {chunks} from start to finish and mentally note:
-# • Every distinct point, working, calculation, and journal entry the student made.
-# • Which parts of the answer address each topic area in the marking criteria.
-# This prevents missing credit that is given in a different sub-part or on a different page.
-
-# ═══════════════════════════════════════════════════
-# STEP 2 — MAP STUDENT POINTS TO CRITERIA
-# ═══════════════════════════════════════════════════
-# For each criterion in model_data.marking_criteria:
-# a) Search the ENTIRE student answer for any content that addresses it — including tables, workings, journal lines, and narrative paragraphs across ALL sub-parts.
-# b) If the student's meaning matches the model answer for that criterion → award full marks.
-# c) If only partial credit applies (see rules below) → award partial marks.
-# d) If truly absent or contradictory → award 0.
-
-# IMPORTANT — before awarding 0 for ANY criterion, confirm you have checked the whole answer, not just the first matching sub-part.
-
-# ═══════════════════════════════════════════════════
-# SCORING RULES
-# ═══════════════════════════════════════════════════
-# Full marks:
-# • Student's meaning clearly matches the model answer for that criterion.
-# • Accept equivalent account names / terminology (e.g. "Investment in subsidiary" = "Cost of investment").
-
-# Partial marks (use 0.25 increments, do not exceed max_possible):
-# • Correct method / formula / approach but wrong final figure or minor arithmetic error → ~50% of max.
-# • Journal entry with correct accounts and amount but wrong Dr/Cr direction → ~50% of max.
-# • Journal entry with correct direction and amount but slightly wrong account name → ~50% of max.
-# • Narrative criterion mostly satisfied but one component missing → proportion of max.
-# • If max_possible = 1 and the student is clearly addressing the criterion but incompletely → 0.5 marks.
-
-# Zero:
-# • The criterion topic is absent from the entire answer.
-# • The student's answer directly contradicts the required treatment.
-# • Only a vague mention with no supporting working, number, or explanation.
-
-# Avoid double-counting:
-# • Each student statement maps to the criterion it MOST CLEARLY demonstrates.
-# • Do not award the same mark twice for the same piece of student work across different criteria.
-# • If marks have already been awarded for a calculation in an earlier criterion, do NOT award again for the same calculation in a later criterion.
-
-# DUPLICATE POINTS (CRITICAL):
-# • If the student writes the SAME calculation, journal, or narrative point twice (e.g. repeated for emphasis, copied above and below, or restated in another section), award marks ONLY ONCE.
-# • Use the FIRST occurrence as the evidence for that criterion (so the score + underline land on the first one).
-# • For the DUPLICATE occurrence, do NOT add it as evidence on any criterion. Instead, emit a COMMENT in the format:
-#   "<5-10 word verbatim quote from the duplicate> → Marks already given above for this point. <one-sentence improvement>."
-#   (use "below" if the duplicate is earlier than the primary occurrence).
-# • Two genuinely DISTINCT calculations that happen to share wording (e.g. two different journal entries with the same account name but different amounts) are NOT duplicates — keep them separate.
-
-# "Marks given above / below" — working vs. subsequent use:
-# • When a student calculates a figure in a WORKING (e.g. W2: NCI at disposal = £6,975,000) and then USES that same figure in a subsequent journal entry (e.g. Dr NCI 6,975,000), the journal entry criterion earns its OWN separate marks — this is a different skill (knowing which account to debit/credit) and is NOT a duplicate.
-# • However, if the student merely RE-STATES the same calculation a second time without adding new working (e.g. writes the NCI build-up twice in different sections), award marks ONLY for the FIRST occurrence and comment "Marks given above" on the second.
-# • The rule of thumb: marks follow the WORK, not the conclusion. Award at the location where the student actually performs the calculation or writes the journal. Later references to the same result get no extra marks.
-
-# "Own figure" (OF) rule (CRITICAL):
-# • If a student calculated an earlier value incorrectly, but then uses that wrong value correctly in a subsequent CALCULATION (correct method/formula, just wrong input from their earlier error), award FULL marks for that calculation criterion.
-# • In UK professional exams (ICAEW/ACCA style), own-figure for CALCULATIONS earns the full mark — the method is what is tested, and the student is NOT penalised twice for one wrong input.
-# • For JOURNAL entries with wrong amounts (but correct direction and accounts): award ~50% because the journal amount is the assessable element (not just a downstream figure).
-# • The student should NOT be penalised twice for the same mistake — once in the original criterion and again in every downstream criterion that depends on it.
-# • Example: if the student got net assets wrong in W1, but then correctly uses their own wrong net assets figure in the disposal calculation with the right formula, award FULL marks for the disposal criterion.
-# • LABELLING (CRITICAL): Whenever OF applies, you MUST write "OF" (or "OF marks") explicitly in the breakdown reason field. e.g. "OF – correct method using own figure from W1, wrong input value". This makes it clear to the student that their method was correct.
-# • Example: formula is A/B. Student uses 6/2 → same figures as model answer → full marks. Student uses 3/4 → correct method (division), wrong figures carried from earlier error → FULL OF marks for that step, reason must say "OF – correct formula applied to own figure".
-
-# "Own figure" LIMITATIONS (equally CRITICAL):
-# • Own-figure credit requires the student to use the SAME METHOD or FORMULA as the model answer, just with a wrong input value from an earlier error.
-# • Do NOT apply own-figure when the student uses a FUNDAMENTALLY DIFFERENT METHOD to arrive at their figure, even if the account name or line item is the same.
-# • Example where own-figure does NOT apply: model answer calculates NCI at disposal as "NCI at acquisition + 25% of post-acquisition profits" but student calculates NCI as "fair value per share x NCI%" — this is a wrong method, not merely a wrong input. Award 0.
-# • Example where own-figure DOES apply: student uses the correct NCI build-up formula but plugs in their own wrong post-acquisition profit figure from an earlier error. Award ~50%, reason must say "OF marks".
-
-# Share-based payment (SBP) "own figure" — wrong fair value input:
-# • The correct grant-date FV for equity-settled options is the FV at the date of GRANT (e.g. £24 per option). The exercise price (e.g. £210) is WRONG as an FV input.
-# • If a student uses the correct SBP formula structure (N_employees × N_options × FV × proportion/vesting) but substitutes the exercise price for the grant-date FV, this is an OWN FIGURE scenario — correct method, wrong input.
-# • Award FULL marks for each SBP calculation criterion where the formula structure is correct but the FV used is the exercise price. Label the reason as "OF – correct formula, wrong fair value (used exercise price instead of grant-date FV)".
-# • Do NOT award OF marks if the student uses a completely different formula structure (e.g. total proceeds ÷ vesting period), only if the formula has the right shape but wrong FV input.
-
-# Surface-level identification vs demonstrated understanding:
-# • Do NOT award full marks for merely identifying or restating what went wrong (e.g. "Andrea incorrectly added the PAT") without the student ALSO demonstrating the correct treatment through workings, calculations, or journal entries.
-# • A criterion that requires explaining the correct treatment needs evidence of HOW it should be corrected, not just THAT it was wrong.
-# • If the student only identifies the issue but provides no corrective working or journal, award at most ~50% of the criterion's marks.
-
-# Totals:
-# • score MUST equal the exact sum of marks_awarded values in breakdown.
-# • Cap score at total_marks (never exceed the question maximum).
-
-# ═══════════════════════════════════════════════════
-# ACCOUNTING-SPECIFIC RULES
-# ═══════════════════════════════════════════════════
-# Journal entries:
-# • Full marks: correct Dr/Cr direction + correct (or equivalent) account name + correct amount.
-# • Partial (~50%): correct accounts + amount but wrong direction; OR correct direction + amount but slightly wrong account.
-# • "Own figure" (~50%): correct Dr/Cr direction + correct account name but WRONG amount, where the student shows a clear working that derived their own (incorrect) figure. Award ~50% of max because the student demonstrated the correct journal structure and method, even though the underlying calculation was wrong.
-# • Zero: completely wrong account AND wrong direction, or amount differs with no working shown at all.
-
-# Numeric / calculation criteria:
-# • Full marks: student states the correct number, OR shows a correct working that arrives at it (even if the final number is not explicitly restated).
-# • Partial (~50%): student uses the correct formula/method but makes one wrong input or arithmetic error.
-# • "Own figure" (~50%): student arrives at a wrong number but shows a clear, logical working that uses the correct method/approach. The error stems from an earlier mistake (e.g. using their own wrong sub-total). Award ~50% because the method is correct even though the figure is wrong.
-# • Accept numbers presented without commas or with slightly different formatting (e.g. 3125000 = 3,125,000).
-
-# ═══════════════════════════════════════════════════
-# EVIDENCE RULES
-# ═══════════════════════════════════════════════════
-# Grading is by MEANING; evidence is for PDF annotation only.
-
-# • Evidence MUST be copied verbatim (character-for-character) from {chunks}.
-# • One contiguous line / row per snippet (do NOT join distant lines).
-# • Choose snippets with DISTINCTIVE tokens: specific numbers (3,125,000 / 9/12), account names (Goodwill, NCI, OCI, Revaluation surplus), or unique phrases.
-# • Very short evidence is OK only when it includes a distinctive numeric token or ratio (e.g. "9/12", "£630,000", "25%").
-# • Provide 1–3 snippets per criterion.
-# • If you cannot find even ONE verbatim snippet supporting a mark award, you MUST award 0.
-
-# ═══════════════════════════════════════════════════
-# CRITERION DESCRIPTIONS (CRITICAL)
-# ═══════════════════════════════════════════════════
-# • Use the EXACT criterion description text from model_data.marking_criteria in every breakdown entry.
-# • Short labels like "Goodwill", "NCI", "Revaluation loss" are valid — keep them verbatim.
-# • NEVER use pure marking notations as criterion text (e.g. "1/2", "mk each", "max 4").
-# • If the source reads "1/2 – Correct IFRS treatment", use only the descriptive part: "Correct IFRS treatment".
-
-# ═══════════════════════════════════════════════════
-# MANDATORY COMPLETENESS
-# ═══════════════════════════════════════════════════
-# • Output ONE breakdown entry for EVERY criterion in model_data.marking_criteria.
-# • Criteria worth 0 marks must still appear with marks_awarded = 0.
-# • Never combine multiple criteria into one entry.
-
-# ═══════════════════════════════════════════════════
-# TABLES AND JOURNALS
-# ═══════════════════════════════════════════════════
-# • Student tables may use different separators, omit commas, or reorder columns — still award marks if the value/line item clearly matches.
-# • Accept equivalent journal postings even if order differs, as long as direction and amounts are correct.
-
-# ═══════════════════════════════════════════════════
-# NOT-REQUIRED (OFF-TOPIC) CONTENT
-# ═══════════════════════════════════════════════════
-# Students sometimes include content the question never asked for — definitions of
-# unrelated concepts, padding, irrelevant tangents, or material from a different
-# question. Real markers strike these out with a "Not required" note so the student
-# knows to drop them in future answers.
-
-# For each clearly off-topic sentence/passage in the student's answer:
-# • Output ONE entry in not_required_points with:
-#   - "text": the verbatim off-topic sentence/passage from the student answer.
-#   - "key_phrase": a 3-6 word verbatim substring of "text" — the anchor where the
-#     "Not required" marker will be placed on the PDF.
-#   - "reason": ONE short sentence explaining why this content is off-topic
-#     (e.g. "Question asks for the consolidation entries, not the definition of goodwill.").
-
-# Rules:
-# • not_required_points carry NO marks. They do NOT change marks_awarded for any criterion.
-# • Do NOT flag content that earned marks elsewhere (it must not appear in evidence AND not_required_points).
-# • Borderline / weakly relevant content → leave it out. Only flag CLEARLY off-topic.
-# • If the student is on-topic throughout, return an empty list.
-
-# ═══════════════════════════════════════════════════
-# QUESTION INFORMATION
-# ═══════════════════════════════════════════════════
-# {questions}
-
-# ═══════════════════════════════════════════════════
-# MODEL ANSWERS AND MARKING CRITERIA
-# ═══════════════════════════════════════════════════
-# {model_data}
-
-# ═══════════════════════════════════════════════════
-# STUDENT'S COMPLETE ANSWER
-# ═══════════════════════════════════════════════════
-# {chunks}
-
-# ═══════════════════════════════════════════════════
-# COMMENTS (annotation-friendly format)
-# ═══════════════════════════════════════════════════
-# comments is an array of strings. Each string MUST follow this EXACT format:
-
-# "[<top_level_sub_question>] <5–10 word verbatim quote from student> → <sentence 1>. <sentence 2>."
-
-# STRICT QUOTA — ONE comment per major sub-section, AT MOST.
-# • The bracketed prefix must be the TOP-LEVEL sub-section identifier ("1.1", "1.2",
-#   "(a)", "(b)", etc.) — NEVER a per-criterion or fine-grained label.
-# • If a sub-section has multiple criteria where marks were lost, write ONE
-#   consolidated comment that covers the most important gap. Do NOT emit one
-#   comment per missed criterion.
-# • If a sub-section is fully credited, omit it from comments entirely.
-# • Aim for AT MOST one comment per major sub-section in the question. For a
-#   question with 4 sub-sections, that means at most 4 comments total.
-
-# The comment should explain what the student got wrong or missed in that sub-section overall, giving the student a clear understanding of the gap.
-
-# Rules:
-# • The quote MUST be copied character-for-character from {chunks}.
-# • Do NOT mention page numbers, line numbers, or "above/below".
-# • After the arrow (→): EXACTLY TWO short sentences — Sentence 1: state the issue; Sentence 2: give one actionable improvement.
-# • No praise-only comments. Do NOT reveal or reference the model answer.
-# • No bullet points, numbering, or line breaks inside a comment string.
-# • NEVER use administrative/guardrail phrases (e.g. "Marks revoked …"). Put those in breakdown[i].reason instead.
-
-# ═══════════════════════════════════════════════════
-# OUTPUT FORMAT — return ONLY this valid JSON, nothing else
-# ═══════════════════════════════════════════════════
-# {{
-#   "grades": [
-#     {{
-#       "question_number": "<question number being graded>",
-#       "score": <total marks awarded — must equal sum of breakdown marks_awarded>,
-#       "total_marks": <maximum marks for question>,
-#       "comments": ["<verbatim quote → issue sentence. Improvement sentence.>", "..."],
-#       "correct_words": ["<verbatim phrase from student>", "..."],
-#       "breakdown": [
-#         {{
-#           "criterion": "<exact criterion description from marking_criteria>",
-#           "marks_awarded": <number>,
-#           "max_possible": <number>,
-#           "reason": "<brief reason for award or zero>",
-#           "evidence": ["<verbatim phrase from student answer>", "..."]
-#         }}
-#       ],
-#       "not_required_points": [
-#         {{
-#           "text": "<verbatim off-topic sentence from student>",
-#           "key_phrase": "<3-6 words verbatim from text>",
-#           "reason": "<one short sentence why this is off-topic>"
-#         }}
-#       ]
-#     }}
-#   ]
-# }}
-# """
-
-grade_prompt = ChatPromptTemplate.from_template(GRADE_PROMPT_TEMPLATE)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HOLISTIC GRADING PROMPT — used when NO marking criteria exist in the model
-# answer. Instead of grading per-criterion, the LLM compares the student's
-# full answer against the model answer holistically and grades per sub-question.
-# ─────────────────────────────────────────────────────────────────────────────
 
 HOLISTIC_GRADE_PROMPT_TEMPLATE = """
 You are an experienced exam marker. Grade the student's answer against the model answer.
@@ -1120,4 +1036,5 @@ Constraints:
 • student_label must be verbatim from {chunks} or empty string.
 """
 
+grade_prompt = ChatPromptTemplate.from_template(GRADE_PROMPT_TEMPLATE)
 holistic_grade_prompt = ChatPromptTemplate.from_template(HOLISTIC_GRADE_PROMPT_TEMPLATE)
