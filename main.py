@@ -27,19 +27,64 @@ from errors import classify_error
 
 
 def _build_grades_csv(grades_id: str) -> Optional[str]:
-    """Fetch the saved grade doc and render its marks breakdown as CSV text.
+    """Fetch the saved grade doc, render its marks breakdown as CSV text, and
+    persist the CSV back onto that document.
 
-    Best-effort: the CSV is a verification aid, so a failure here must never
-    fail the grading run — it just yields no CSV.
+    The CSV is stored on the grades document itself (field `breakdown_csv`)
+    rather than on disk or in external storage, so it lives with the record it
+    describes: it can be re-downloaded or audited later without re-running the
+    grader, and it needs no filesystem that survives a container restart.
+
+    Best-effort throughout: the CSV is a verification aid, so neither building
+    nor saving it may fail the grading run.
     """
     try:
-        grades_doc = get_collection("student_grades").find_one({"_id": ObjectId(grades_id)})
+        coll = get_collection("student_grades")
+        grades_doc = coll.find_one({"_id": ObjectId(grades_id)})
         if not grades_doc:
             logger.warning(f"[CSV] No grade doc for _id={grades_id}")
             return None
-        return build_breakdown_csv(grades_doc)
+        csv_text = build_breakdown_csv(grades_doc)
     except Exception as e:
         logger.warning(f"[CSV] Failed to build breakdown CSV: {e}")
+        return None
+
+    try:
+        coll.update_one(
+            {"_id": ObjectId(grades_id)},
+            {"$set": {
+                "breakdown_csv": csv_text,
+                "breakdown_csv_generated_at": datetime.now().isoformat(),
+            }},
+        )
+        logger.info(f"[CSV] Saved breakdown CSV to student_grades/{grades_id} "
+                    f"({len(csv_text):,} chars)")
+    except Exception as e:
+        # Saving is a convenience; the caller still gets the CSV to download.
+        logger.warning(f"[CSV] Built CSV but could not save it to Mongo: {e}")
+
+    return csv_text
+
+
+def _write_grades_csv_file(
+    output_dir: str, student_name: str, question_num: str, csv_text: str
+) -> Optional[str]:
+    """Also drop a .csv next to the annotated PDF for this student.
+
+    Convenience copy only — the authoritative one is on the grades document.
+    Never raises.
+    """
+    try:
+        safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in student_name).strip()
+        dest_dir = os.path.join(output_dir, safe or "student")
+        os.makedirs(dest_dir, exist_ok=True)
+        path = os.path.join(dest_dir, f"{safe or 'student'}_Q{question_num}_grades.csv")
+        with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+            fh.write(csv_text)
+        logger.info(f"[CSV] Wrote {path}")
+        return path
+    except Exception as e:
+        logger.warning(f"[CSV] Could not write CSV file: {e}")
         return None
 
 
@@ -126,6 +171,8 @@ async def grade_from_db_async(
     # Build the CSV now — independent of annotation, so it survives an
     # annotation failure below.
     grades_csv = _build_grades_csv(grades_id)
+    if grades_csv:
+        _write_grades_csv_file(output_dir, student_name, question_num, grades_csv)
 
     try:
         annotation_ok, annotated_pdf = annotate_pdf(

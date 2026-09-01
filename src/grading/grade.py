@@ -129,7 +129,10 @@ def _extract_parent_calc_result(desc: str) -> str | None:
     return None
 
 
-def _apply_parent_calc_verification(normalized_breakdown: list[dict]) -> float:
+def _apply_parent_calc_verification(
+    normalized_breakdown: list[dict],
+    of_source_ids_map: Optional[dict] = None,
+) -> float:
     """Context-aware crediting via parent-calculation verification.
 
     For each criterion with marks > 0 that declares a parent working
@@ -157,6 +160,15 @@ def _apply_parent_calc_verification(normalized_breakdown: list[dict]) -> float:
         if awarded <= 0:
             continue
         crit = str(bd.get("criterion", "") or "")
+        # OWN-FIGURE EXEMPTION. A criterion carrying `of_source_ids` depends on
+        # an upstream figure the student is allowed to get wrong and carry
+        # forward. Verifying such a criterion against the MODEL's parent result
+        # is exactly backwards: the whole point of OF marking is that the
+        # student's result legitimately differs. Without this, a student who
+        # applies the right method to their own earlier (wrong) number is
+        # revoked for the method mark they earned.
+        if of_source_ids_map and of_source_ids_map.get(crit):
+            continue
         parent_result = _extract_parent_calc_result(crit)
         if not parent_result:
             continue  # no parent working declared - not verifiable
@@ -384,18 +396,34 @@ def _find_working_line_for_value(value: int, student_text: str) -> Optional[str]
     6,975,000.00"). Recovered marks anchor here so the visual tick lands on
     the student's working, not on a journal that happens to reference the same
     amount.
+
+    Uses the SAME digit-boundary matching as `_value_present_in_text` so a
+    smaller value doesn't spuriously anchor on a line where it only appears
+    as a substring of a larger unrelated number. Previously `"25" in "250000"`
+    matched, causing an NCI-stake-25% sub-mark to anchor on the share-capital
+    line whose value 250 was never about the 25% stake. Regex demands the
+    variant sit between non-digit / non-comma / non-dot boundaries on the
+    left, and a non-digit boundary on the right — same rule the presence
+    check enforces, so the anchor and the presence check stay in sync.
     """
     if not student_text:
         return None
     variants = _value_variants_for_search(value)
+    # Pre-compile the boundary-aware pattern per variant. Longest-first so
+    # a bare "25" doesn't win over a more-specific "25,000" match on the
+    # same line (a bare "25" match is nearly always coincidental noise).
+    patterns = [
+        re.compile(r"(?<![\d.,])" + re.escape(v) + r"(?!\d)")
+        for v in sorted(variants, key=len, reverse=True)
+    ]
     for line in student_text.split("\n"):
         stripped = line.strip()
         if not stripped:
             continue
         if _JOURNAL_LINE_RE.match(stripped):
             continue
-        for v in variants:
-            if v in stripped:
+        for pat in patterns:
+            if pat.search(stripped):
                 return stripped
     return None
 
@@ -697,6 +725,45 @@ def _apply_aggregate_value_recovery(
                     consumer_evidence = _ev_list
                     break
 
+        # Fix B — anchor-collision guard.
+        # Build the set of student-writing lines that ANOTHER producer in this
+        # SAME aggregate group has already legitimately claimed (i.e., the LLM
+        # awarded that producer marks > 0 directly, not via a prior recovery
+        # pass). If our prospective recovery target's anchor line falls in
+        # that set, skip the award: the line demonstrates the sibling sub-
+        # mark, not this one. Without this, a student who writes ONE working
+        # (say "NCI 3,125,000 =25*(500,000-375,000)") triggers a subset-sum
+        # match on "25" for another OF2 sub-mark (NCI post-acq stake at 25%)
+        # and gets that 0.25 for free — even though they never applied the
+        # 25% stake to post-acquisition profits.
+        # Same-aggregate scope only. Cross-aggregate legitimate co-cites
+        # (e.g. Amber's OF1 reserves 2,750 and OF12 recovered 12,750 both
+        # anchored on the tabular row) must still work.
+        def _norm_anchor(s: str) -> str:
+            # Collapse whitespace / separators AND strip thousands commas so
+            # the student's raw "3125000" matches the LLM's quoted
+            # "3,125,000". Case-fold too.
+            _s = re.sub(r"[\s;|]+", " ", str(s)).strip().lower()
+            return _s.replace(",", "")
+
+        llm_awarded_anchors_in_aggregate: set[str] = set()
+        for _p_idx in producer_indices:
+            _p_bd = normalized_breakdown[_p_idx]
+            try:
+                _p_awarded = float(_p_bd.get("marks_awarded", 0) or 0)
+                _p_maxp = float(_p_bd.get("max_possible", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if _p_awarded <= 0 or _p_maxp <= 0:
+                continue
+            _p_reason = str(_p_bd.get("reason", "") or "").lower()
+            if "aggregate recovery" in _p_reason:
+                continue  # only LLM-direct awards claim a line for this guard
+            for _ev in (_p_bd.get("evidence_list") or []):
+                _ev_norm = _norm_anchor(_ev)
+                if _ev_norm:
+                    llm_awarded_anchors_in_aggregate.add(_ev_norm)
+
         # Award recovery to un-earned producers in the confirmed sub-workings.
         # Sort so INDIVIDUALLY-CONFIRMED sub-workings go first - those get full
         # marks (student directly wrote the value), then subset-only-confirmed
@@ -748,15 +815,31 @@ def _apply_aggregate_value_recovery(
             _reason_l = str(bd.get("reason", "") or "").lower()
             if "marks given above" in _reason_l or "marks given below" in _reason_l:
                 continue
+            # Fix B anchor-collision skip. Compute the prospective anchor for
+            # THIS producer up front. If it collides with a line an LLM-
+            # awarded sibling in the same aggregate already claims, that
+            # sibling captured the student's writing; giving this producer
+            # a mark on the same line double-credits one working.
+            if llm_awarded_anchors_in_aggregate:
+                _crit_here = str(bd.get("criterion", "") or "")
+                _sub_result_here = of_produces_map.get(_crit_here)
+                _subset_here: Optional[frozenset[int]] = None
+                if _sub_result_here is not None:
+                    _subset_here = subset_for_sub_result.get(int(_sub_result_here))
+                _prospective_anchor = (
+                    anchor_line_for_subset.get(_subset_here) if _subset_here else None
+                ) or anchor_line
+                if _prospective_anchor:
+                    _pa_norm = _norm_anchor(_prospective_anchor)
+                    if _pa_norm in llm_awarded_anchors_in_aggregate:
+                        continue  # sibling in same aggregate already claims this line
             # PER-ITEM AWARD:
-            #   • Individually-confirmed sub-working → award FULL max_possible.
-            #     Either its result appears alone in the student's answer, or
-            #     the student COMPUTED it inside an expression (see
-            #     _computed_values_in_text). Both directly demonstrate the
-            #     specific sub-working.
+            #   • Individually-confirmed sub-working (its result appears alone
+            #     in the student's answer) → award FULL max_possible. The
+            #     student directly demonstrated this specific value.
             #   • Only confirmed via subset-sum (e.g. absorbed into an
-            #     aggregated line like 18,150 = 12,750 + 5,400, with no
-            #     working shown) → award 0.25 as shortcut credit.
+            #     aggregated line like 18,150 = 12,750 + 5,400) → award 0.25
+            #     as shortcut credit.
             _confirmed_individually = _idx_is_individually_confirmed(idx)
             if _confirmed_individually:
                 award = maxp
@@ -1228,7 +1311,7 @@ class StudentGrader:
 
         start = min(starts)
 
-        last_curl5555555555555555y = cleaned.rfind("}")
+        last_curly = cleaned.rfind("}")
         last_square = cleaned.rfind("]")
         ends = [i for i in (last_curly, last_square) if i != -1]
         end = max(ends) + 1 if ends else len(cleaned)
@@ -4484,6 +4567,14 @@ class StudentGrader:
                 _norm_to_canonical[_nk] = _canon
             _canonical_norm_pairs.append((_nk, _canon))
         _dropped_out_of_rubric: list[str] = []  # collected for an INFO summary
+        # Canonical criteria already resolved during this pass. Used to break
+        # ties when an LLM-returned string matches SEVERAL rubric criteria:
+        # prefer one nothing has claimed yet, so two different LLM entries
+        # cannot both collapse onto the same criterion and silently discard
+        # the other one's marks. (Seen with two criteria whose normalized text
+        # shares its first 40 chars: "...0.25 for the 'Less net assets..." and
+        # "...0.25 for the 'Less goodwill...".)
+        _claimed_canonicals: set[str] = set()
 
         # Minimum normalized length required to attempt prefix matching.
         # Set just high enough that two distinct rubric criteria sharing a
@@ -5238,31 +5329,6 @@ class StudentGrader:
         evidence_warnings = []
         sum_awarded_calc = 0.0  # debug only
 
-        # Canonical rubric criteria already claimed by an earlier breakdown
-        # entry. The fuzzy matchers below resolve on a SHARED LEADING PREFIX,
-        # and this rubric deliberately contains sibling criteria whose first
-        # 40+ characters are byte-identical — e.g. three criteria all opening
-        # "NCI share of post-acquisition profits (to start of year) — ", and
-        # three more opening "NCI share of profits until 1 March 20X4 — ",
-        # differing only AFTER the dash. For those, _SHARED_LEADING_PREFIX_LEN
-        # matches all three and the tie-break is pure length proximity, so a
-        # paraphrased entry lands on whichever sibling is closest in length.
-        # Without this guard two different entries resolve to the SAME
-        # canonical: one rubric criterion appears twice in the output while
-        # its sibling is never graded at all (the "NCI stake at 25%" criteria
-        # silently vanished this way, so a student who correctly applied 25%
-        # could not be credited for it).
-        _claimed_canonicals: set[str] = set()
-
-        def _prefer_unclaimed(matches: list[str]) -> list[str]:
-            """Drop already-claimed canonicals while alternatives remain.
-
-            Falls back to the full list when every candidate is claimed, so an
-            ambiguous match still resolves rather than dropping the entry.
-            """
-            unclaimed = [m for m in matches if m not in _claimed_canonicals]
-            return unclaimed or matches
-
         for item in main_grade.get("breakdown", []) or []:
             criterion = item.get("criterion", "Unknown")
             criterion = str(criterion or "").strip()
@@ -5276,7 +5342,11 @@ class StudentGrader:
             if not criterion:
                 continue
             if allowed_criteria and not self._criteria_were_synthesized and not self._holistic_grading:
-                if criterion not in allowed_criteria:
+                if criterion in allowed_criteria:
+                    # Exact hit — claim it so a later ambiguous match prefers a
+                    # different criterion rather than collapsing onto this one.
+                    _claimed_canonicals.add(criterion)
+                else:
                     # Try normalized whole-string match (case + whitespace insensitive).
                     nk = _norm_crit_key(criterion)
                     canonical = _norm_to_canonical.get(nk)
@@ -5294,12 +5364,12 @@ class StudentGrader:
                         for _canon_nk, _canon_full in _canonical_norm_pairs:
                             if _canon_nk.startswith(nk) or nk.startswith(_canon_nk):
                                 _matches.append(_canon_full)
-                        _matches = _prefer_unclaimed(_matches)
                         if len(_matches) == 1:
                             canonical = _matches[0]
                         elif len(_matches) > 1:
+                            _pool = [c for c in _matches if c not in _claimed_canonicals] or _matches
                             canonical = min(
-                                _matches,
+                                _pool,
                                 key=lambda c: abs(len(_norm_crit_key(c)) - len(nk)),
                             )
                     if canonical is None and len(nk) >= _SHARED_LEADING_PREFIX_LEN:
@@ -5311,15 +5381,16 @@ class StudentGrader:
                         # strings sharing a long distinctive leading prefix are
                         # the same criterion in practice.
                         _llm_head = nk[:_SHARED_LEADING_PREFIX_LEN]
-                        _matches = _prefer_unclaimed([
+                        _matches = [
                             c for _ck, c in _canonical_norm_pairs
                             if _ck.startswith(_llm_head)
-                        ])
+                        ]
                         if len(_matches) == 1:
                             canonical = _matches[0]
                         elif len(_matches) > 1:
+                            _pool = [c for c in _matches if c not in _claimed_canonicals] or _matches
                             canonical = min(
-                                _matches,
+                                _pool,
                                 key=lambda c: abs(len(_norm_crit_key(c)) - len(nk)),
                             )
                     if canonical is not None:
@@ -5327,19 +5398,11 @@ class StudentGrader:
                         # category map, position map) all hit.
                         criterion = canonical
                         item["criterion"] = canonical
+                        _claimed_canonicals.add(canonical)
                     else:
                         _dropped_out_of_rubric.append(criterion[:90])
                         logger.debug(f"Skipping out-of-rubric criterion: '{criterion}'")
                         continue
-                # Resolved (exactly or fuzzily) to a rubric criterion — claim
-                # it so a later entry can't be steered onto the same one.
-                if criterion in _claimed_canonicals:
-                    logger.warning(
-                        f"Duplicate criterion mapping (all candidates already "
-                        f"claimed): '{criterion[:80]}' — a rubric criterion is "
-                        f"likely ungraded this run"
-                    )
-                _claimed_canonicals.add(criterion)
 
             if not self._holistic_grading and not self._is_valid_criterion(criterion):
                 logger.debug(f"Skipping invalid criterion: '{criterion}'")
@@ -5868,6 +5931,9 @@ class StudentGrader:
         # when the criteria descriptions themselves overlap significantly.
         if normalized_breakdown and not self._holistic_grading:
             try:
+                # Build the index: normalised evidence key → list of criterion
+                # indices that cite it (only those with awarded > 0).
+                _ev_per_idx: dict[int, str] = {}
                 _ev_index: dict[str, list[int]] = {}
                 for _idx, _bd in enumerate(normalized_breakdown):
                     _ev_raw = _bd.get("evidence", "") or ""
@@ -5877,14 +5943,60 @@ class StudentGrader:
                     _ev_key = re.sub(r"[\s;|]+", " ", _ev_raw).strip().lower()
                     if len(_ev_key) < 12:
                         continue
+                    _ev_per_idx[_idx] = _ev_key
                     _ev_index.setdefault(_ev_key, []).append(_idx)
+
+                # Substring-containment merge. The LLM sometimes cites a bare
+                # working line "7200 x 9/12 x 0.25 = 1350" for one criterion
+                # and the SAME line with a narrative prefix ("The profit
+                # attributable to NCI for the year will be ..." + same calc)
+                # for another. Strict equality misses that these are the same
+                # student writing. If key A is fully contained inside key B
+                # after normalisation, merge A's indices into B's group so the
+                # co-crediting is detected. Cap length ratio at 4× so we don't
+                # merge a short common substring into an unrelated long one.
+                _keys_by_len = sorted(_ev_index.keys(), key=len)
+                _absorbed: set[str] = set()
+                for _k_short in _keys_by_len:
+                    if _k_short in _absorbed:
+                        continue
+                    for _k_long in _keys_by_len:
+                        if _k_long is _k_short or _k_long in _absorbed:
+                            continue
+                        if len(_k_long) <= len(_k_short):
+                            continue
+                        if len(_k_long) > len(_k_short) * 4:
+                            continue
+                        if _k_short in _k_long:
+                            _ev_index[_k_long].extend(_ev_index[_k_short])
+                            _absorbed.add(_k_short)
+                            break
+                for _k in _absorbed:
+                    _ev_index.pop(_k, None)
+
+                def _has_component(i: int) -> bool:
+                    _crit = str(normalized_breakdown[i].get("criterion", "") or "")
+                    return bool(self._of_component_of_by_criterion_last_run.get(_crit, ""))
+
                 for _ev_key, _idxs in _ev_index.items():
+                    # De-dupe while preserving order (a criterion could land
+                    # in both its own group and the absorbed-into group).
+                    _seen: set[int] = set()
+                    _idxs = [i for i in _idxs if not (i in _seen or _seen.add(i))]
                     if len(_idxs) < 2:
                         continue
-                    # Sort: keep the one with highest max_possible (most specific criterion).
+                    # Keeper selection. Priority order:
+                    #   1. Aggregate sub-mark (of_component_of set) — student's
+                    #      granular calc lines are what the mark scheme prizes;
+                    #      a wrapper narrative criterion that cites the same
+                    #      line via containment loses to the sub-marks.
+                    #   2. Highest max_possible (existing rule for the case
+                    #      where nothing has of_component_of).
+                    #   3. Highest marks_awarded (tie-break).
                     _idxs_sorted = sorted(
                         _idxs,
                         key=lambda i: (
+                            1 if _has_component(i) else 0,
                             float(normalized_breakdown[i].get("max_possible", 0) or 0),
                             float(normalized_breakdown[i].get("marks_awarded", 0) or 0),
                         ),
@@ -5892,28 +6004,93 @@ class StudentGrader:
                     )
                     _keeper_crit = str(normalized_breakdown[_idxs_sorted[0]].get("criterion", "") or "")
                     _keeper_component = self._of_component_of_by_criterion_last_run.get(_keeper_crit, "")
+                    _keeper_ev = _ev_per_idx.get(_idxs_sorted[0], "")
                     for _dup_idx in _idxs_sorted[1:]:
                         _dup_crit = str(normalized_breakdown[_dup_idx].get("criterion", "") or "").lower()
                         _keep_crit_lower = _keeper_crit.lower()
-                        # Context guard: if the two criteria belong to DIFFERENT
-                        # working sections (different of_component_of), they test
-                        # the same VALUE at different POINTS in the answer - both
-                        # earn their marks (e.g., share cap 250 at acq date AND
-                        # at disposal date). Skip revocation across contexts.
+                        _dup_ev = _ev_per_idx.get(_dup_idx, "")
+                        # Was this pair grouped via SUBSTRING CONTAINMENT rather
+                        # than exact evidence equality? Containment is a stronger
+                        # signal than word overlap — the two criteria demonstrably
+                        # cite the SAME student writing, one just with extra
+                        # narrative wrapping. When true we skip the word-overlap
+                        # gate that guards the exact-equality path.
+                        _via_containment = (
+                            bool(_dup_ev) and bool(_keeper_ev)
+                            and _dup_ev != _keeper_ev
+                            and (_dup_ev in _keeper_ev or _keeper_ev in _dup_ev)
+                        )
+                        # Context guard: aggregate sub-marks (of_component_of set)
+                        # never cross-null each other.
+                        #   • DIFFERENT aggregates → different working contexts
+                        #     testing the same VALUE at different POINTS
+                        #     (e.g., share cap 250 at acq date AND at disposal
+                        #     date). Both keep credit.
+                        #   • SAME aggregate → different sub-marks of the same
+                        #     rolled-up figure, which are DISTINCT sub-workings
+                        #     by construction (each has its own of_produces
+                        #     value like 250, 12,750, 5,400 for OF12). The
+                        #     student legitimately co-cites them on the one
+                        #     aggregated line the mark scheme expects. Both
+                        #     keep credit.
+                        # If only one side is an aggregate sub-mark (or
+                        # neither), fall through to the substring / word-overlap
+                        # checks below.
                         _dup_component = self._of_component_of_by_criterion_last_run.get(
                             str(normalized_breakdown[_dup_idx].get("criterion", "") or ""),
                             "",
                         )
-                        if _keeper_component and _dup_component and _keeper_component != _dup_component:
-                            continue  # different working contexts - both keep credit
-                        # Only zero out when the duplicate criterion describes the SAME concept
-                        # (shares 3+ significant words with the keeper), not a different skill.
+                        if _keeper_component and _dup_component:
+                            continue  # both aggregate sub-marks — never cross-null
+                        # RUBRIC-DECLARED DISTINCTNESS (opt-in).
+                        # The narrative-wrapper guard below exists to revoke a
+                        # high-level criterion that merely restates a
+                        # calculation the sub-marks already credited. But the
+                        # same machinery also fires on two GENUINELY DIFFERENT
+                        # points that happen to share a figure — e.g. the
+                        # narrative "MM contributes £5.4m to profit" against
+                        # the £7.2m × 9/12 component of net assets at disposal,
+                        # or "goodwill initially measured at £2.5m" against the
+                        # '$4m @ 1.6 (2,500)' row of the exchange gain working.
+                        # Mechanically those look identical to the wrapper case,
+                        # so only the rubric author can tell them apart. When a
+                        # description carries an explicit DISAMBIGUATION note
+                        # AND the two criteria sit in different working
+                        # sections, honour it and keep both marks. Rubrics that
+                        # do not use DISAMBIGUATION are unaffected.
+                        _dup_crit_raw = str(
+                            normalized_breakdown[_dup_idx].get("criterion", "") or ""
+                        )
+                        if _keeper_component != _dup_component and (
+                            "disambiguation:" in _keep_crit_lower
+                            or "disambiguation:" in _dup_crit
+                        ):
+                            continue
+                        # JOURNAL vs WORKING never cross-null. A journal
+                        # legitimately re-presents figures derived in a working;
+                        # a marker credits the working line AND the journal
+                        # entry. Only one side being category 'journal' means
+                        # the two are testing different things.
+                        _keeper_cat = (self._criterion_category_map_last_run.get(
+                            _keeper_crit, "") or "").lower()
+                        _dup_cat = (self._criterion_category_map_last_run.get(
+                            _dup_crit_raw, "") or "").lower()
+                        if (_keeper_cat == "journal") != (_dup_cat == "journal"):
+                            continue
+                        # Zero out when EITHER:
+                        #   (a) the pair was grouped via substring containment
+                        #       (dup's evidence sits inside keeper's or vice
+                        #       versa) — same student writing, direct signal, no
+                        #       word-overlap gate needed;
+                        #   (b) the duplicate criterion shares 3+ significant
+                        #       words with the keeper (existing exact-evidence
+                        #       path — protects against random collisions).
                         _dup_words = set(re.findall(r"[a-z]{4,}", _dup_crit))
                         _keep_words = set(re.findall(r"[a-z]{4,}", _keep_crit_lower))
                         _overlap = _dup_words & _keep_words
                         _stop = {"mark", "marks", "amount", "value", "total", "year", "each", "from", "with", "that", "this", "have", "been"}
                         _overlap -= _stop
-                        if len(_overlap) >= 2:
+                        if _via_containment or len(_overlap) >= 2:
                             _dup_marks = float(normalized_breakdown[_dup_idx].get("marks_awarded", 0) or 0)
                             if _dup_marks > 0:
                                 normalized_breakdown[_dup_idx]["marks_awarded"] = 0.0
@@ -5995,7 +6172,10 @@ class StudentGrader:
         # their credit stands on the LLM's original judgement.
         if normalized_breakdown and not self._holistic_grading:
             try:
-                _revoked = _apply_parent_calc_verification(normalized_breakdown)
+                _revoked = _apply_parent_calc_verification(
+                    normalized_breakdown,
+                    of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                )
                 sum_awarded_calc -= _revoked
             except Exception:
                 pass  # Guard must never fail the grader
@@ -6256,19 +6436,6 @@ class StudentGrader:
             for _txt in _dropped_out_of_rubric[:20]:
                 logger.info(f"  out-of-rubric: '{_txt}...'")
         logger.info(f"Saved breakdown count: {len(normalized_breakdown)}")
-        # Rubric criteria the LLM never returned. The breakdown COUNT can match
-        # the rubric count while still missing criteria (a duplicate mapping
-        # takes the missing one's slot), so a count check cannot detect this —
-        # only comparing the claimed set against the rubric can.
-        if allowed_criteria and not self._criteria_were_synthesized and not self._holistic_grading:
-            _ungraded = [c for c in allowed_criteria if c not in _claimed_canonicals]
-            if _ungraded:
-                logger.warning(
-                    f"{len(_ungraded)} rubric criterion/criteria were NOT graded "
-                    f"this run (absent from the LLM breakdown):"
-                )
-                for _txt in sorted(_ungraded)[:20]:
-                    logger.warning(f"  ungraded: '{_txt[:110]}...'")
         logger.info(f"Calc sum (post-check): {sum_awarded_calc}")
         logger.info(f"Question max marks used: {total_max}")
         logger.info(f"Final saved total: {rounded_total}")
