@@ -19,6 +19,7 @@ CSV_COLUMNS = [
     "question",
     "sub_question",     # holistic only — which sub-part
     "student_label",    # holistic only — how the student labelled the part
+    "criterion_id",     # rubric's short id (MM07, TB03 …) — read this, not the prose
     "criterion",        # what is being marked
     "key_phrase",       # holistic only — exact anchor the annotator aims at
     "student_text",     # the student's own words the mark is for (every anchor)
@@ -97,6 +98,7 @@ def build_breakdown_csv(grades_doc: dict) -> str:
                         "question": question,
                         "sub_question": sub_q,
                         "student_label": student_label,
+                        "criterion_id": str(item.get("criterion_id", "") or ""),
                         "criterion": criterion,
                         "key_phrase": str(pt.get("key_phrase", "") or ""),
                         "student_text": str(pt.get("text", "") or ""),
@@ -115,6 +117,7 @@ def build_breakdown_csv(grades_doc: dict) -> str:
                     "question": question,
                     "sub_question": sub_q,
                     "student_label": student_label,
+                    "criterion_id": str(item.get("criterion_id", "") or ""),
                     "criterion": criterion,
                     "student_text": _evidence_text(item),
                     "marks_awarded": _fmt_marks(item.get("marks_awarded")),
@@ -127,6 +130,7 @@ def build_breakdown_csv(grades_doc: dict) -> str:
             writer.writerow({
                 "student": student,
                 "question": question,
+                "criterion_id": str(item.get("criterion_id", "") or ""),
                 "criterion": str(item.get("criterion", "") or ""),
                 "student_text": _evidence_text(item),
                 "marks_awarded": _fmt_marks(item.get("marks_awarded")),

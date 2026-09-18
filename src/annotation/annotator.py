@@ -709,7 +709,108 @@ def _find_evidence_strict(
         # wrapped phrase — narrowing is meant to apply there, so False.
         return rects, page_num, False
 
+    # Tier 4 fallback: near-miss line match.
+    # Every tier above needs the quoted evidence to appear in the PDF, modulo
+    # symbol folding. It sometimes cannot, through no fault of the student: the
+    # grading model silently tidies what it quotes. A student who wrote
+    # "Considersation (375k shares * £32)" is quoted back as
+    # "Consideration (375k shares * £32) 12,000" — a corrected spelling AND a
+    # value pulled in from the next column — and the mark went unplaced.
+    #
+    # Rather than enumerate the ways a quote can drift, accept the single best
+    # near-identical line. Two independent conditions must hold, so this cannot
+    # wander onto an unrelated line: high character-level similarity, AND a
+    # shared multi-digit number, which is what actually identifies a working
+    # line in an accounting script.
+    best = _find_near_miss_line(
+        doc, evidence_text, ranked_pages, min_y_per_page, max_y_per_page,
+    )
+    if best is not None:
+        line_rect, page_num, line_text = best
+        logger.debug(
+            f"Tier 4 near-miss match on page {page_num}: "
+            f"evidence={evidence_text[:60]!r} line={line_text[:60]!r}"
+        )
+        narrowed_rect = None
+        try:
+            narrowed_rect = _narrow_rect_to_evidence_value(
+                doc[page_num - 1], line_rect, evidence_text
+            )
+        except Exception:
+            pass
+        return [narrowed_rect or line_rect], page_num, False
+
     return [], -1, False
+
+
+# Minimum character-level similarity for a Tier 4 near-miss line match.
+# Measured on real drift: a corrected typo plus an appended column value scores
+# 0.91; unrelated lines in the same script sit below 0.65.
+_NEAR_MISS_MIN_RATIO = 0.82
+
+# A number worth matching on. Single digits are far too common in an accounting
+# script to identify a line — same reasoning as the grader's short-token guard.
+_SALIENT_NUM_RE = re.compile(r"\d[\d,.]*\d")
+
+
+def _salient_numbers(text: str) -> set:
+    """Multi-digit numbers in *text*, comma/period stripped, for line identity."""
+    out = set()
+    for m in _SALIENT_NUM_RE.finditer(text or ""):
+        tok = m.group(0).replace(",", "").rstrip(".")
+        if len(tok) >= 2:
+            out.add(tok)
+    return out
+
+
+def _find_near_miss_line(
+    doc,
+    evidence_text: str,
+    ranked_pages: List[int],
+    min_y_per_page: Optional[dict],
+    max_y_per_page: Optional[dict],
+):
+    """Best near-identical line for *evidence_text*, or None.
+
+    Generic by construction: nothing here is tied to a particular paper,
+    student or phrasing. It asks only whether some line reads almost exactly
+    like the quoted evidence and carries one of the same numbers.
+    """
+    import difflib
+
+    target = _normalize_symbols_for_match(evidence_text)
+    if len(target) < 12:
+        return None  # too short to judge similarity safely
+    target_nums = _salient_numbers(evidence_text)
+    if not target_nums:
+        return None  # prose: no independent check available, so don't guess
+
+    best_ratio = 0.0
+    best = None
+    for page_num in ranked_pages:
+        try:
+            page = doc[page_num - 1]
+        except Exception:
+            continue
+        for line_text, line_rect in _iter_page_lines(page):
+            if min_y_per_page:
+                lo = min_y_per_page.get(page_num)
+                if lo is not None and line_rect.y0 < lo:
+                    continue
+            if max_y_per_page:
+                hi = max_y_per_page.get(page_num)
+                if hi is not None and line_rect.y0 > hi:
+                    continue
+            if not (target_nums & _salient_numbers(line_text)):
+                continue
+            ratio = difflib.SequenceMatcher(
+                None, _normalize_symbols_for_match(line_text), target
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio, best = ratio, (line_rect, page_num, line_text)
+    if best is not None and best_ratio >= _NEAR_MISS_MIN_RATIO:
+        return best
+    return None
 
 
 # ── Best-rect picker for the score label ─────────────────────────────────────
@@ -1920,10 +2021,19 @@ def annotate_pdf(
         subq_y_bounds = compute_subq_y_bounds(doc, allowed_pages, sub_ids_in_comments)
         if sub_ids_in_comments:
             pages_with_bounds = sum(1 for sid in sub_ids_in_comments if subq_y_bounds.get(sid))
-            logger.info(
-                f"Sub-question Y bounds resolved: {pages_with_bounds}/{len(sub_ids_in_comments)} "
-                f"sub_ids found in PDF — comments will be constrained to their sub-question region"
-            )
+            if pages_with_bounds:
+                logger.info(
+                    f"Sub-question Y bounds resolved: {pages_with_bounds}/"
+                    f"{len(sub_ids_in_comments)} sub_ids located — comments "
+                    f"constrained to their sub-question region"
+                )
+            else:
+                logger.info(
+                    f"Sub-question Y bounds: none of {len(sub_ids_in_comments)} "
+                    f"sub_id(s) bounded — comments may anchor anywhere in the "
+                    f"question (expected when every comment shares one "
+                    f"sub-question, or no sub-question labels appear in the PDF)"
+                )
 
         comments_placed = 0
         unplaced_comments: list[str] = []

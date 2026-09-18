@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field, ConfigDict
 class GradeBreakdownItem(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
+    criterion_id: Optional[str] = Field(
+        None,
+        description="The criterion_id copied EXACTLY from the marking criteria (e.g. 'TB03'). Always include it when the criterion has one."
+    )
     criterion: str = Field(..., description="Marking criterion or point description")
     marks_awarded: Union[float, int] = Field(..., description="Marks given")
     max_possible: Union[float, int] = Field(..., description="Maximum marks for this item")
@@ -16,7 +20,27 @@ class GradeBreakdownItem(BaseModel):
         default=None,
         description="Optional list of 1-3 verbatim evidence snippets from the student answer"
     )
+    restated_at: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Verbatim student lines where this SAME point is stated a second time but earns "
+            "nothing extra, because the marks were given at the `evidence` line instead. "
+            "Each becomes a 'Marks given above/below' note beside that line. Leave empty "
+            "unless the student genuinely repeats the point somewhere else."
+        )
+    )
     comments_summary: Optional[str] = Field(None, description="Grader comment for this specific item (if any)")
+    criterion_focus: Optional[str] = Field(
+        default=None,
+        description=(
+            "Short phrase (<= 8 words) naming what THIS criterion tests, taken from the "
+            "wording BEFORE 'DISAMBIGUATION'/'CONTEXT' in its description - e.g. "
+            "'revaluation gain to OCI', 'goodwill at closing rate'. Used to verify the "
+            "criterion_id you returned is the one you actually graded. Two criteria in a "
+            "section often quote the SAME figure in opposite roles (a gain earned vs the "
+            "same amount later eliminated), so name the ROLE, not just the number."
+        )
+    )
 
     # Holistic grading fields (only populated when holistic_grading=True on the parent doc)
     sub_question: Optional[str] = Field(None, alias="_sub_question", description="Sub-question identifier (holistic grading)")
@@ -96,3 +120,18 @@ class StudentGradeDocument(BaseModel):
     question_id: Optional[str] = Field(None, description="pac_questions _id")
     model_answer_id: Optional[str] = Field(None, description="model_answers _id")
     student_answer_id: Optional[str] = Field(None, description="student_assignments _id")
+
+
+class RestatementItem(BaseModel):
+    """One student line that repeats an already-credited point."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    criterion_id: str = Field(..., description="Id of the credited point being repeated")
+    line: str = Field(..., description="The student's line, verbatim")
+    why: Optional[str] = Field(None, description="Short note on why it is the same point")
+
+
+class RestatementResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    restatements: List[RestatementItem] = Field(default_factory=list)

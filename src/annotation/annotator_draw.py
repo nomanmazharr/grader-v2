@@ -173,6 +173,19 @@ def _place_score_label(
     local_fs = _detect_fontsize_at_rect(page, rect, default=float(CONFIG['criterion_score_fontsize']))
     score_font = max(7.0, min(14.0, local_fs))
 
+    # Right edge of the student's WRITING, not of the paper. These scripts are
+    # landscape (842pt) with content ending near 575, so "page.rect.width - 70"
+    # parks a mark 200pt out in blank space where it reads as belonging to
+    # nothing. Stay just beyond the text instead.
+    try:
+        _content_x1 = max(
+            (float(w[2]) for w in _page_words(page) if (w[4] or "").strip()),
+            default=page.rect.width - 70,
+        )
+    except Exception:
+        _content_x1 = page.rect.width - 70
+    margin_x = min(_content_x1 + 8, page.rect.width - 60)
+
     score_y = max(min(rect.y1 - 2, page.rect.height - 10), 10)
     nearby_boxes: list[fitz.Rect] = placed_lines_per_page.get(page_idx, [])
 
@@ -257,10 +270,39 @@ def _place_score_label(
             # when there's no room to the right.
             above_y = max(rect.y0 - (score_font + 2), 10)
             above_box = _score_box(max(score_x, 50), above_y)
-            if not any(above_box.intersects(b) for b in nearby_boxes):
+            # Must clear page TEXT as well as sibling labels. Checking only the
+            # labels let a score hop onto the row above and read as marking it:
+            # in a table with 12pt rows, two marks on the same data row were
+            # pushed up onto the COLUMN HEADER, so the reader saw 0.25 against
+            # "$" and "Rate" instead of against the figures underneath.
+            if (
+                not any(above_box.intersects(b) for b in nearby_boxes)
+                and not _box_overlaps_page_text(page, above_box)
+            ):
                 score_y = above_y
                 placed_box = above_box
                 found = True
+
+        if not found:
+            # Stay CLOSE to the anchor. Stepping straight out to the margin
+            # keeps the label on the right ROW but severs it from the value it
+            # marks - on a table row carrying three marks they all ended up
+            # stacked at the page edge, where a reader cannot tell which figure
+            # each belongs to. Walk rightward in small steps, and only reach for
+            # the margin once the row is genuinely full.
+            for _step in (14, 28, 42, 56):
+                _cx = min(score_x + _step, margin_x)
+                cb = _score_box(_cx, score_y)
+                if (
+                    not any(cb.intersects(b) for b in nearby_boxes)
+                    and not _box_overlaps_page_text(page, cb)
+                ):
+                    score_x, placed_box, found = _cx, cb, True
+                    break
+            if not found:
+                mb = _score_box(margin_x, score_y)
+                if not any(mb.intersects(b) for b in nearby_boxes):
+                    score_x, placed_box, found = margin_x, mb, True
 
         if not found:
             # Last resort: shift DOWN, but only a tiny amount — half a font
@@ -278,11 +320,30 @@ def _place_score_label(
                     break
 
     if _box_overlaps_page_text(page, placed_box):
-        shifted_y = max(score_y - 10, 10)
-        shifted_box = _score_box(max(score_x, 50), shifted_y)
-        if not any(shifted_box.intersects(b) for b in nearby_boxes):
-            score_y = shifted_y
-            placed_box = shifted_box
+        # Resolve the overlap SIDEWAYS first, staying on the anchor's row. The
+        # old behaviour jumped 10pt up, which on a normal 10-12pt row grid is
+        # exactly one line - trading an overlap for a label that appears to
+        # mark the row above.
+        resolved = False
+        for _cx in (
+            min(placed_box.x0 + 22, margin_x),
+            min(placed_box.x0 + 44, margin_x),
+            margin_x,
+            margin_x + 22,
+        ):
+            cb = _score_box(_cx, score_y)
+            if (
+                not any(cb.intersects(b) for b in nearby_boxes)
+                and not _box_overlaps_page_text(page, cb)
+            ):
+                score_x, placed_box, resolved = _cx, cb, True
+                break
+        if not resolved:
+            shifted_y = max(score_y - 10, 10)
+            shifted_box = _score_box(max(score_x, 50), shifted_y)
+            if not any(shifted_box.intersects(b) for b in nearby_boxes):
+                score_y = shifted_y
+                placed_box = shifted_box
 
     page.insert_text(
         (max(score_x, 50), score_y),
@@ -688,6 +749,14 @@ def compute_subq_y_bounds(
     if not sid_numeric:
         return result
 
+    # NOTHING TO SEPARATE. Bounding exists to stop a comment on 4.1 landing in
+    # 4.2's region. When every comment belongs to the SAME sub-question there is
+    # no neighbour to protect against, and the whole answer is fair game — so a
+    # region can only exclude valid targets. A whole-question paper carries the
+    # single prefix "1", and bounding it cut two comments that matched cleanly.
+    if len(set(sid_numeric.values())) < 2:
+        return result
+
     # Unique numeric sub-question prefixes in numerical order. Used to look up
     # the next sub-question's start position on each page.
     unique_numerics = sorted(
@@ -701,18 +770,35 @@ def compute_subq_y_bounds(
         except Exception:
             continue
 
+        # Words on this page, so a numeric label can be required to stand as its
+        # OWN token. A raw substring search for "1" matches the 1 inside
+        # "1,000,000" or "£1.2M", and one such hit in the left margin silently
+        # moved a whole page's allowed region past the content it should have
+        # covered. A label is a word like "4.1", "1." or "1)" — never a digit
+        # buried in an amount.
+        try:
+            page_words = _page_words(page) or []
+        except Exception:
+            page_words = []
+
+        def _label_hits(n: str) -> list[float]:
+            ys: list[float] = []
+            for w in page_words:
+                try:
+                    x0, y0, text = float(w[0]), float(w[1]), str(w[4])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if x0 >= 110:
+                    continue  # inline reference, not a left-margin label
+                if text.strip().rstrip(".):-") == n:
+                    ys.append(y0)
+            return sorted(ys)
+
         numeric_positions: dict[str, float] = {}
         for n in unique_numerics:
-            try:
-                instances = _page_search(page, n) or []
-            except Exception:
-                instances = []
-            for inst in instances:
-                # Sub-question labels are written near the left margin in the
-                # student answer; reject inline references like "as in 4.1".
-                if inst.x0 < 110:
-                    numeric_positions[n] = inst.y0
-                    break
+            hits = _label_hits(n)
+            if hits:
+                numeric_positions[n] = hits[0]
 
         if not numeric_positions:
             continue
@@ -814,6 +900,17 @@ def add_popup_for_comment(
             q_min_y = max(q_min_y, float(sub_min))
             q_max_y = min(q_max_y, float(sub_max))
 
+        # Icon geometry, shared by every collision pass below. add_text_annot()
+        # takes its point as the icon's TOP-LEFT, so the footprint runs down and
+        # right from (x, y) at the size the viewer actually draws.
+        _ICON_W, _ICON_H = 18.0, 18.0
+
+        def _icon_box(cx: float, cy: float) -> fitz.Rect:
+            return fitz.Rect(cx, cy, cx + _ICON_W, cy + _ICON_H)
+
+        # Words the icon must not cover. Populated once the anchor row is known.
+        row_word_boxes: list[fitz.Rect] = []
+
         if target_rect is not None:
             # Reject if anchor is outside this question's territory
             if q_min_y > 0 and target_rect.y0 < q_min_y:
@@ -847,10 +944,21 @@ def add_popup_for_comment(
             # Slide the icon rightward on the same row until it's clear of
             # any word-word bounding box.
             try:
-                _ICON_W, _ICON_H = 14.0, 14.0
-                _row_y_min = float(target_rect.y0) - 3
-                _row_y_max = float(target_rect.y1) + 3
-                row_word_boxes: list[fitz.Rect] = []
+                # Collect words over the ICON'S OWN vertical footprint, not the
+                # anchor row. An 18pt icon on a 10pt row grid always reaches
+                # into the neighbouring rows, so a row-band check declares it
+                # clear while it sits squarely on the line below - which is how
+                # a note landed on top of "12,125" and hid the student's
+                # goodwill figure completely.
+                # add_text_annot() treats its point as the icon's TOP-LEFT, so
+                # the footprint runs down-and-right from (x, y). Testing a
+                # centred box checked an area offset 9pt up and left of where
+                # the icon actually lands, which is how a note cleared its
+                # collision test and still sat on the row below.
+                _pad = 2.0
+                _row_y_min = float(y) - _pad
+                _row_y_max = float(y) + _ICON_H + _pad
+                row_word_boxes = []
                 for w in _page_words(page):
                     wx0, wy0, wx1, wy1, wt, *_ = w
                     if wy1 < _row_y_min or wy0 > _row_y_max:
@@ -858,12 +966,6 @@ def add_popup_for_comment(
                     if not (wt or "").strip():
                         continue
                     row_word_boxes.append(fitz.Rect(wx0, wy0, wx1, wy1))
-
-                def _icon_box(cx: float, cy: float) -> fitz.Rect:
-                    return fitz.Rect(
-                        cx - _ICON_W / 2, cy - _ICON_H / 2,
-                        cx + _ICON_W / 2, cy + _ICON_H / 2,
-                    )
 
                 _proposed = _icon_box(x, y)
                 if any(_proposed.intersects(wb) for wb in row_word_boxes):
@@ -900,12 +1002,20 @@ def add_popup_for_comment(
         if placed_lines_per_page:
             page_idx = page_num - 1
             score_boxes = placed_lines_per_page.get(page_idx, [])
-            comment_box = fitz.Rect(x, y - 8, x + 16, y + 8)
-            if any(comment_box.intersects(sb) for sb in score_boxes):
-                for shift_x in [20, -20, 35, -35]:
+            # Dodging a score label must not undo the word-avoidance above.
+            # This pass previously checked score boxes only, so it happily
+            # shifted an icon 20pt sideways back on top of the student's
+            # figures - which is how a note ended up covering "(3,000)" and
+            # "12,125" after correctly sliding clear of them a moment earlier.
+            def _icon_collides(bx: fitz.Rect) -> bool:
+                return any(bx.intersects(sb) for sb in score_boxes) or any(
+                    bx.intersects(wb) for wb in row_word_boxes
+                )
+
+            if _icon_collides(_icon_box(x, y)):
+                for shift_x in [20, -20, 35, -35, 55, -55, 75]:
                     nx = max(10, min(x + shift_x, page.rect.width - 20))
-                    shifted_box = fitz.Rect(nx, y - 8, nx + 16, y + 8)
-                    if not any(shifted_box.intersects(sb) for sb in score_boxes):
+                    if not _icon_collides(_icon_box(nx, y)):
                         x = nx
                         break
 

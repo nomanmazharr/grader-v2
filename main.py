@@ -128,12 +128,22 @@ async def grade_from_db_async(
     output_dir: str,
     question_num: str,
     question_type: str = "numerical",
+    reuse_student_answers_id: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """Grade a student PDF using a pre-saved model answer from MongoDB.
 
     Returns (success, message, annotated_pdf_path, grades_csv_text).
     The CSV is produced as soon as grading succeeds, so it is returned even
     when annotation later fails — that is precisely when it is most useful.
+
+    `reuse_student_answers_id` grades an extraction that already exists instead
+    of re-reading the PDF. Extraction is not stable: two passes over the same
+    script minutes apart came back 94% similar, one of them splitting the
+    £'000 heading into its own column on every row — which changes the text
+    every downstream match runs against. Re-extracting on each run therefore
+    measures the extractor and the grader at the same time, and a change to
+    either is impossible to attribute. Pass this to hold extraction fixed and
+    vary only the grading.
     """
     start_time = datetime.now()
     logger.info("=" * 70)
@@ -141,11 +151,18 @@ async def grade_from_db_async(
     logger.info(f"  model_answers_id={model_answers_id}")
     logger.info("=" * 70)
 
-    s_ok, student_answers_id = await _extract_student_async(
-        student_pdf_path, student_pages, student_name, question_num
-    )
-    if not s_ok or not student_answers_id:
-        return False, "Student answer extraction failed", None, None
+    if reuse_student_answers_id:
+        student_answers_id = str(reuse_student_answers_id)
+        logger.info(
+            f"  reusing extraction {student_answers_id} (PDF not re-read) — "
+            f"grading is the only variable"
+        )
+    else:
+        s_ok, student_answers_id = await _extract_student_async(
+            student_pdf_path, student_pages, student_name, question_num
+        )
+        if not s_ok or not student_answers_id:
+            return False, "Student answer extraction failed", None, None
 
     loop = asyncio.get_running_loop()
     try:
@@ -204,8 +221,13 @@ def grade_from_db(
     output_dir: str,
     question_num: str,
     question_type: str = "numerical",
+    reuse_student_answers_id: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[str], Optional[str]]:
-    """Sync entry point for the production grading pipeline."""
+    """Sync entry point for the production grading pipeline.
+
+    Pass `reuse_student_answers_id` to grade an existing extraction rather than
+    re-reading the PDF — see grade_from_db_async.
+    """
     return asyncio.run(
         grade_from_db_async(
             model_answers_id=model_answers_id,
@@ -215,5 +237,6 @@ def grade_from_db(
             output_dir=output_dir,
             question_num=question_num,
             question_type=question_type,
+            reuse_student_answers_id=reuse_student_answers_id,
         )
     )

@@ -8,10 +8,12 @@ from datetime import datetime
 from typing import Optional, Any, Tuple
 from bson import ObjectId
 from pydantic import BaseModel, Field
-from prompts.grading_prompts import grade_prompt, holistic_grade_prompt
+from prompts.grading_prompts import (
+    grade_prompt, holistic_grade_prompt, restatement_prompt,
+)
 from llm_setup import llm_grader
 from logging_config import logger
-from schemas.student_grades import StudentGradeDocument
+from schemas.student_grades import StudentGradeDocument, RestatementResponse
 from database.mongodb import get_collection
 from errors import GradingError, classify_error
 
@@ -35,6 +37,18 @@ class LLMGradingBreakdownItem(BaseModel):
     reason: str = Field("", description="Brief reason for award")
     evidence: list[str] = Field(default_factory=list, description="1-3 verbatim quotes from student answer")
     comments_summary: Optional[str] = Field("", description="Optional short note")
+    criterion_focus: str = Field(
+        "",
+        description=(
+            "REQUIRED. At most 8 words naming what THIS criterion tests, taken from its "
+            "wording BEFORE any 'DISAMBIGUATION' or 'CONTEXT' section. A self-check on "
+            "the criterion_id beside it. Name the ROLE, not the figure: a section often "
+            "holds two criteria quoting the SAME amount in opposite roles (a gain earned "
+            "vs that amount later eliminated; goodwill remeasured vs the exchange "
+            "movement to OCI), and those are the pairs that get mispaired. "
+            "e.g. 'revaluation gain to OCI', 'goodwill remeasured at closing rate'."
+        ),
+    )
     column_header: Optional[str] = Field(
         None,
         description=(
@@ -132,6 +146,8 @@ def _extract_parent_calc_result(desc: str) -> str | None:
 def _apply_parent_calc_verification(
     normalized_breakdown: list[dict],
     of_source_ids_map: Optional[dict] = None,
+    of_component_of_map: Optional[dict] = None,
+    of_definitions: Optional[dict] = None,
 ) -> float:
     """Context-aware crediting via parent-calculation verification.
 
@@ -172,6 +188,27 @@ def _apply_parent_calc_verification(
         parent_result = _extract_parent_calc_result(crit)
         if not parent_result:
             continue  # no parent working declared - not verifiable
+
+        # COMPONENT EXEMPTION. When the quoted "parent working" is the very
+        # TOTAL this criterion is a component of, requiring that total is
+        # backwards: the criterion marks one ROW of the working, and the
+        # examiner marks that row on its own. The £12.75m component of net
+        # assets at disposal quotes the (18,400) total for context, and a
+        # student who wrote "Retained earnings b/fwd 12,750" - which earned
+        # half a mark from the examiner - was scoring zero because 18,400
+        # never appeared. Sub-workings whose quoted result is their OWN output
+        # (25% x £7.2m x 9/12 = 1,350) are untouched: there the result IS what
+        # the criterion tests.
+        _aggregate = (of_component_of_map or {}).get(crit)
+        if _aggregate:
+            _agg_val = ((of_definitions or {}).get(_aggregate) or {}).get("value")
+            try:
+                if _agg_val is not None and abs(float(_agg_val)) == abs(
+                    float(parent_result)
+                ):
+                    continue
+            except (TypeError, ValueError):
+                pass
         ev_blob = " ".join(
             str(e) for e in (bd.get("evidence_list") or []) if e
         )
@@ -190,9 +227,30 @@ def _apply_parent_calc_verification(
         if any(v in ev_blob for v in variants) or parent_result in ev_digits_only:
             continue  # student's evidence produces the parent result
 
+        # SCALE-AWARE SECOND PASS.
+        # The variants above are literal only: {"12000", "12,000"}. Rubrics are
+        # written in £'000 but students routinely answer in millions, so a
+        # student who wrote "Cost: 375,000 shares x £32 = £12m" was judged not
+        # to have produced 12,000 and lost a mark the grader had already said
+        # was correct. _value_present_in_text knows the scale forms ("£12m",
+        # "12 million", "12,000,000") and carries the short-bare-token guard,
+        # so reuse it rather than widening the literal set by hand.
+        try:
+            if _value_present_in_text(int(float(parent_result)), ev_blob):
+                continue
+        except (ValueError, OverflowError):
+            pass
+
         # Parent result absent from evidence → student did not perform this
         # specific calculation. Revoke and record the reason.
         bd["marks_awarded"] = 0.0
+        # Tag the revoke so the aggregate-recovery pass (which runs AFTER this
+        # guard) cannot silently hand the mark straight back. Without the tag
+        # the two passes contradicted each other inside a single reason string:
+        # "Aggregate recovery (+0.25) ... Marks revoked (parent-calc
+        # verification): this criterion tests the working that produces 18400,
+        # which does not appear in the student's evidence".
+        bd["_parent_calc_revoked"] = True
         revoked_total += awarded
         prev = (bd.get("reason", "") or "").strip()
         bd["reason"] = (
@@ -202,6 +260,566 @@ def _apply_parent_calc_verification(
             f"in a different calculation. " + prev
         ).strip()
     return revoked_total
+
+
+# Phrases a grader writes when it has established the student did NOT do
+# something. An award carrying one of these in its own reason is self-
+# contradicting.
+_ABSENCE_REASON_RE = re.compile(
+    r"\b(?:no\s+\w+.{0,40}?(?:present|shown|given|calculated|provided)"
+    r"|not\s+(?:present|shown|stated|provided|calculated|performed|attempted)"
+    r"|does\s+not\s+appear"
+    r"|never\s+(?:shown|stated|calculated)"
+    r"|absent\s+from)",
+    re.IGNORECASE,
+)
+
+
+def _reject_contradictory_awards(normalized_breakdown: list[dict]) -> float:
+    """Revoke marks whose own reason says the student didn't do the thing.
+
+    A grader that writes "No 9-month NCI share working present" and awards the
+    mark anyway has contradicted itself, and the mark is not defensible to a
+    marker reading the breakdown.
+
+    Two exemptions, both load-bearing:
+      • PARTIAL awards. A criterion worth 1 mark for two things ("0.5 for the
+        equity method and 0.5 for the £630k figure") is correctly scored 0.5
+        with a reason noting the half that is missing. The absence phrase
+        describes the UNAWARDED half, so it is not a contradiction. Only a
+        FULL-credit award can contradict a finding of absence.
+      • Aggregate-recovery awards, whose reason legitimately quotes the
+        original per-criterion finding of absence and then explains that the
+        component was absorbed into a rolled-up figure.
+
+    Returns total marks revoked.
+    """
+    revoked = 0.0
+    for bd in normalized_breakdown:
+        try:
+            awarded = float(bd.get("marks_awarded", 0) or 0)
+            maxp = float(bd.get("max_possible", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if awarded <= 0:
+            continue
+        if maxp <= 0 or awarded < maxp:
+            continue  # partial award — the absence describes the missing half
+        reason = str(bd.get("reason", "") or "")
+        if "aggregate recovery" in reason.lower():
+            continue  # recovery explains the absence; not a contradiction
+        if not _ABSENCE_REASON_RE.search(reason):
+            continue
+        bd["marks_awarded"] = 0.0
+        revoked += awarded
+        bd["reason"] = (
+            "Marks revoked (self-contradicting reason): the stated reason "
+            "asserts the student did not produce this point. " + reason
+        ).strip()
+    return revoked
+
+
+# Currency / spacing that may sit between a sign marker and the digits.
+_SIGN_PREFIX_CHARS = " \t£$€"
+
+# An explicit "this is being taken away" label immediately before a figure.
+_DEDUCTION_LABEL_RE = re.compile(r"\b(?:less|deduct|minus)\b[^0-9]{0,24}$", re.IGNORECASE)
+
+
+def _value_is_explicit_deduction(magnitude: int, text: str) -> bool:
+    """True only when the student unmistakably wrote `magnitude` as a deduction.
+
+    Deliberately narrow. A rubric's `expected_amount` sign records the MODEL
+    ANSWER's presentation, and students legitimately present the same working
+    without it — a columnar working writes "net assets b/f 8,000,000 1.6
+    5,000,000" where the row label carries the sign, and a journal writes
+    "Cr revaluation reserve -300,000" where the minus is the Cr side, not a
+    negative amount. Treating either as a sign error revoked correct marks.
+
+    So only two spellings count, and only when they wrap THIS figure:
+      • parentheses around the number itself — "(3,125)"
+      • a Less / Deduct / Minus label immediately preceding it
+    A bare minus is ignored: it is far more often an arithmetic operator
+    ("2,000,000-1,875,000") or a Dr/Cr direction marker than a negation.
+    """
+    if not text:
+        return False
+    for v in _value_variants_for_search(magnitude):
+        if _SHORT_BARE_TOKEN_RE.match(v):
+            continue  # too unspecific to attribute a sign to
+        for m in re.finditer(r"(?<![\d.,])" + re.escape(v) + r"(?!\d)", text):
+            head = text[: m.start()].rstrip(_SIGN_PREFIX_CHARS)
+            tail = text[m.end():].lstrip(_SIGN_PREFIX_CHARS)
+            if head.endswith("(") and tail[:1] == ")":
+                return True
+            if _DEDUCTION_LABEL_RE.search(head):
+                return True
+    return False
+
+
+def _apply_sign_verification(
+    normalized_breakdown: list[dict],
+    expected_amount_map: dict[str, float],
+    sign_sensitive_criteria: set[str],
+) -> float:
+    """Revoke awards where the student wrote the right figure with the wrong sign.
+
+    The rubric has always carried `expected_amount` and `sign_sensitive`, but
+    nothing read them. They are what separates two criteria that quote the same
+    number in opposite roles: the Mission Mouldings goodwill working ADDS NCI at
+    acquisition (+3,125) while the net-assets-at-disposal working DEDUCTS it
+    ((3,125)). A student who wrote 3,125 once, as a deduction, was credited for
+    both — the disambiguation prose in the rubric asked the grader not to, but
+    prose is not enforcement.
+
+    One-directional by design. It fires only for a criterion whose figure is an
+    ADDITION that the student unmistakably wrote as a DEDUCTION - the direction
+    that proves the figure was reused from another working. The reverse (rubric
+    shows a deduction, student writes a bare positive) is presentation, not
+    error, and is left alone; enforcing it symmetrically revoked seven correct
+    marks on the scripts this was regression-tested against.
+
+    Own-figure answers are untouched: a student carrying a different magnitude
+    forward never matches the expected magnitude, so the check never fires.
+
+    Returns total marks revoked.
+    """
+    revoked = 0.0
+    for bd in normalized_breakdown:
+        try:
+            awarded = float(bd.get("marks_awarded", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if awarded <= 0:
+            continue
+        crit = str(bd.get("criterion", "") or "")
+        if crit not in sign_sensitive_criteria:
+            continue
+        expected = expected_amount_map.get(crit)
+        # Only the addition direction is checkable — see the docstring.
+        if expected is None or expected <= 0:
+            continue
+        ev_blob = " ".join(str(e) for e in (bd.get("evidence_list") or []) if e)
+        if not ev_blob:
+            continue
+        try:
+            magnitude = int(round(abs(float(expected))))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not _value_is_explicit_deduction(magnitude, ev_blob):
+            continue
+        bd["marks_awarded"] = 0.0
+        revoked += awarded
+        prev = (bd.get("reason", "") or "").strip()
+        bd["reason"] = (
+            f"Marks revoked (sign verification): this criterion tests "
+            f"{magnitude:,} as an addition, but the student's evidence writes "
+            f"it as a deduction - the same figure used in a different "
+            f"working. " + prev
+        ).strip()
+    return revoked
+
+
+# Everything from here on in a criterion description is cross-reference, not
+# subject matter: DISAMBIGUATION names the criteria this one must NOT be
+# confused with, and CONTEXT reproduces the whole surrounding working. Both
+# mention the neighbours by name, so matching against them tells you nothing
+# about which criterion you are looking at.
+_CRITERION_HEAD_RE = re.compile(
+    r"DISAMBIGUATION|CONTEXT|TUTORIAL NOTE|ACCEPT EITHER|NOT A DUPLICATE"
+    r"|AWARD ALSO|TWO-METHOD NOTE|ONE JOURNAL ENTRY|NO FURTHER MARKS",
+)
+
+_FOCUS_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "at", "in", "for", "and", "or", "on", "is",
+    "as", "by", "its", "it", "this", "that", "mark", "marks", "row", "line",
+})
+
+
+def _criterion_head(description: str) -> str:
+    """The part of a criterion description that states what IT tests."""
+    return _CRITERION_HEAD_RE.split(str(description or ""), maxsplit=1)[0]
+
+
+def _focus_tokens(phrase: str) -> set:
+    """Content words of a focus phrase, lowercased."""
+    return {
+        t.lower() for t in re.findall(r"[A-Za-z]{3,}", str(phrase or ""))
+        if t.lower() not in _FOCUS_STOPWORDS
+    }
+
+
+def _focus_match_score(focus_tokens: set, head: str) -> float:
+    """Share of the focus phrase's content words present in `head`.
+
+    Prefix-tolerant, so "remeasured" matches "remeasurement" and "eliminated"
+    matches "eliminates" - the model paraphrases the criterion rather than
+    quoting it exactly.
+    """
+    if not focus_tokens:
+        return 0.0
+    head_tokens = {t.lower() for t in re.findall(r"[A-Za-z]{3,}", head or "")}
+    if not head_tokens:
+        return 0.0
+    hits = 0
+    for f in focus_tokens:
+        if any(h.startswith(f[:5]) or f.startswith(h[:5]) for h in head_tokens):
+            hits += 1
+    return hits / len(focus_tokens)
+
+
+# A focus phrase must miss its own criterion this badly, and match a sibling
+# this much better, before the pairing is called into question.
+_FOCUS_OWN_MAX = 0.40
+_FOCUS_RIVAL_MIN = 0.70
+
+
+def _detect_criterion_focus_mismatch(
+    normalized_breakdown: list[dict],
+    criterion_id_by_desc: dict,
+    of_component_of_map: dict,
+    of_ids_map: dict,
+    of_source_ids_map: dict,
+) -> list[str]:
+    """Report entries whose `criterion_focus` describes a DIFFERENT criterion.
+
+    The grading model returns a criterion_id plus its reasoning, and id
+    resolution is exact - so whatever id it names receives the mark, the
+    evidence and the tick on the PDF. On criteria that quote the same figure in
+    opposite roles it pairs correct reasoning with the wrong id: the
+    revaluation GAIN criterion comes back reasoned as the LOSS, the goodwill
+    REMEASUREMENT as the OCI movement. Marks often net out, but the annotation
+    and the feedback land on the wrong point.
+
+    `criterion_focus` is the model's own one-line statement of what it just
+    graded. Checking it against the criterion's head - the wording before
+    DISAMBIGUATION/CONTEXT, which is the only part that describes THIS
+    criterion rather than its neighbours - catches the mispairing without
+    depending on the rubric's keyword lists, which are numeric and too sparse
+    to identify a concept.
+
+    Reports only; never changes a mark.
+    """
+    heads: dict[str, str] = {}
+    groups: dict[str, str] = {}
+    for desc, cid in (criterion_id_by_desc or {}).items():
+        heads[desc] = _criterion_head(desc)
+        groups[desc] = _criterion_group_key(
+            desc, criterion_id_by_desc, of_component_of_map,
+            of_ids_map, of_source_ids_map,
+        )
+
+    warnings: list[str] = []
+    for bd in normalized_breakdown:
+        focus = str(bd.get("criterion_focus", "") or "").strip()
+        if not focus:
+            continue  # model did not supply one — nothing to verify
+        desc = str(bd.get("criterion", "") or "")
+        if desc not in heads:
+            continue
+        ftok = _focus_tokens(focus)
+        if len(ftok) < 2:
+            continue  # too vague to judge either way
+        group = groups.get(desc, "")
+        own_head = heads[desc]
+        # Compare PAIRWISE, on the words that tell that pair apart. Two criteria
+        # marking the same working share most of their wording - both the
+        # revaluation gain and the revaluation loss are introduced as a
+        # "BALANCING FIGURE" - and those shared words drown out the single word
+        # that decides which is which. For each rival, keep only the focus words
+        # the two heads disagree about.
+        own, best, best_desc = 1.0, 0.0, None
+        for other_desc, other_head in heads.items():
+            if other_desc == desc or groups.get(other_desc, "") != group:
+                continue
+            disc = {
+                f for f in ftok
+                if (_focus_match_score({f}, own_head) > 0)
+                != (_focus_match_score({f}, other_head) > 0)
+            }
+            if not disc:
+                continue  # indistinguishable on this phrase — nothing to say
+            o = _focus_match_score(disc, own_head)
+            r = _focus_match_score(disc, other_head)
+            if r > best:
+                own, best, best_desc = o, r, other_desc
+        if best_desc is None or own > _FOCUS_OWN_MAX or best < _FOCUS_RIVAL_MIN:
+            continue
+        # Detection is pairwise on discriminating words; the SUGGESTION is the
+        # sibling the whole phrase fits best, which is the likelier intended
+        # criterion when several share the deciding word.
+        _suggest, _suggest_score = best_desc, 0.0
+        for other_desc, other_head in heads.items():
+            if other_desc == desc or groups.get(other_desc, "") != group:
+                continue
+            sc = _focus_match_score(ftok, other_head)
+            if sc > _suggest_score:
+                _suggest, _suggest_score = other_desc, sc
+        warnings.append(
+            f"Criterion-id mismatch: {criterion_id_by_desc.get(desc, '?')} was "
+            f"returned with focus \"{focus}\", which does not describe it "
+            f"(match {own:.2f}); it looks like "
+            f"{criterion_id_by_desc.get(_suggest, '?')} ({_suggest_score:.2f}). "
+            f"Marks left unchanged - but this mark, its evidence and its "
+            f"annotation may be attached to the wrong criterion."
+        )
+    return warnings
+
+
+def _criterion_group_key(
+    criterion: str,
+    criterion_id_by_desc: dict,
+    of_component_of_map: dict,
+    of_ids_map: dict,
+    of_source_ids_map: dict,
+) -> str:
+    """Which sub-question a criterion belongs to, as a short key.
+
+    Read from whatever the rubric already provides, most reliable first: the
+    criterion id's alphabetic prefix (MM01 -> MM, SOC03 -> SOC), else the
+    namespace of any OF id it touches (MM.OF2 -> MM). Returns "" when the rubric
+    carries neither, which disables the locality guard for that criterion rather
+    than guessing at it.
+    """
+    cid = str(criterion_id_by_desc.get(criterion, "") or "")
+    m = re.match(r"^([A-Za-z]+)", cid)
+    if m:
+        return m.group(1).upper()
+    for src in (of_component_of_map, of_ids_map, of_source_ids_map):
+        val = src.get(criterion)
+        if not val:
+            continue
+        ids = [val] if isinstance(val, str) else list(val)
+        for oid in ids:
+            head = str(oid).split(".", 1)[0].strip()
+            if head:
+                return head.upper()
+    return ""
+
+
+# A sub-question needs at least this many located awards before its own marks
+# are trusted to establish where it lives in the student's script.
+_LOCALITY_MIN_SAMPLE = 3
+
+
+def _apply_section_locality_guard(
+    normalized_breakdown: list[dict],
+    student_text: str,
+    criterion_id_by_desc: dict,
+    of_component_of_map: dict,
+    of_ids_map: dict,
+    of_source_ids_map: dict,
+) -> float:
+    """Revoke marks awarded from a DIFFERENT sub-question's writing.
+
+    A Mission Mouldings criterion must be earned by what the student wrote under
+    Mission Mouldings. It was not: the NCI-at-disposal mark was paid off the
+    opening-balance row of the statement of changes in equity, and a Team
+    Bauhaus narrative mark off a sentence in the earnings-per-share working.
+    Both are whole sub-questions away from the criterion they paid.
+
+    Self-calibrating, so it needs no mapping between rubric topics and whatever
+    the student happened to title their sections: each sub-question's own marks
+    say where it lives. Take the section holding most of a group's located
+    evidence; any award in that group whose evidence sits elsewhere is reading
+    another sub-question's answer.
+
+    Deliberately conservative - a group with fewer than three located awards, or
+    with no clear majority section, is left alone, as is any script without
+    section headers and any criterion whose rubric gives no group key.
+
+    Returns total marks revoked.
+    """
+    sections = _split_student_sections(student_text)
+    if not sections:
+        return 0.0
+
+    located: list[tuple[int, str, int]] = []
+    for i, bd in enumerate(normalized_breakdown):
+        try:
+            if float(bd.get("marks_awarded", 0) or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        crit = str(bd.get("criterion", "") or "")
+        group = _criterion_group_key(
+            crit, criterion_id_by_desc, of_component_of_map,
+            of_ids_map, of_source_ids_map,
+        )
+        if not group:
+            continue
+        idxs = {
+            _section_index_for_evidence(sections, str(ev))
+            for ev in (bd.get("evidence_list") or [])
+        }
+        idxs.discard(None)
+        if len(idxs) != 1:
+            continue  # unlocatable, or straddling sections — not safe to judge
+        located.append((i, group, idxs.pop()))
+
+    by_group: dict[str, list[tuple[int, int]]] = {}
+    for i, group, sec in located:
+        by_group.setdefault(group, []).append((i, sec))
+
+    revoked = 0.0
+    for group, items in by_group.items():
+        if len(items) < _LOCALITY_MIN_SAMPLE:
+            continue
+        counts: dict[int, int] = {}
+        for _i, sec in items:
+            counts[sec] = counts.get(sec, 0) + 1
+        home, hits = max(counts.items(), key=lambda kv: kv[1])
+        if hits * 2 <= len(items):
+            continue  # no clear majority — the group is genuinely spread out
+        for i, sec in items:
+            if sec == home:
+                continue
+            bd = normalized_breakdown[i]
+            try:
+                awarded = float(bd.get("marks_awarded", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if awarded <= 0:
+                continue
+            bd["marks_awarded"] = 0.0
+            revoked += awarded
+            prev = (bd.get("reason", "") or "").strip()
+            bd["reason"] = (
+                f"Marks revoked (section locality): this {group} criterion was "
+                f"awarded from the student's \"{sections[sec][0]}\" section, "
+                f"while {group} is answered under \"{sections[home][0]}\". A "
+                f"mark must be earned by the writing under its own "
+                f"sub-question. " + prev
+            ).strip()
+    return revoked
+
+
+# Canonical column key -> the header wording to look for in the student's table.
+# The annotator widens each of these into contiguous word n-grams, so a student
+# heading the column "Other Components of Equity" or stacking it over two lines
+# still resolves.
+_COLUMN_HEADER_TEXT = {
+    "retained_earnings": "Retained Earnings",
+    "nci": "NCI",
+    "share_option_reserve": "Share Option Reserve",
+    "other_components": "Other Components",
+    "equity_share_capital": "Equity Share Capital",
+    "share_premium": "Share Premium",
+    "total": "Total",
+}
+
+
+def _canon_column_name(s: str) -> str:
+    """Canonical key for a statement column, from a rubric tag or a table header."""
+    t = re.sub(r"[^a-z]+", " ", str(s or "").lower()).strip()
+    t = re.sub(r"\bpound\b|\b000\b", "", t).strip()
+    if not t:
+        return ""
+    if "non controlling" in t or t == "nci" or t.startswith("nci "):
+        return "nci"
+    if "retained" in t:
+        return "retained_earnings"
+    if "share premium" in t or t == "premium":
+        return "share_premium"
+    if "option" in t:
+        return "share_option_reserve"
+    if "other component" in t or "other reserve" in t:
+        return "other_components"
+    if "share capital" in t or "equity share" in t:
+        return "equity_share_capital"
+    if "total" in t:
+        return "total"
+    return re.sub(r"\s+", "_", t)
+
+
+def _parse_table_header(text: str) -> Optional[list[str]]:
+    """Canonical column keys from the first pipe-delimited header row in `text`."""
+    for line in (text or "").split("\n"):
+        if line.count("|") < 3:
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        keys = [_canon_column_name(c) for c in cells]
+        known = {
+            "retained_earnings", "nci", "share_premium",
+            "share_option_reserve", "other_components", "equity_share_capital",
+        }
+        if len(known & set(keys)) >= 2:
+            return keys
+    return None
+
+
+def _apply_column_verification(
+    normalized_breakdown: list[dict],
+    column_map: dict[str, str],
+    expected_amount_map: dict[str, float],
+    student_text: str,
+) -> float:
+    """Revoke awards where the student's figure sits in the wrong table column.
+
+    Statement-of-changes-in-equity marks are column-specific: the same figure
+    carries a different meaning in retained earnings than in non-controlling
+    interest or other components of equity. The rubric names the column in
+    prose only, so the grader matched on the number alone and credited rows
+    regardless of which column the student had used.
+
+    Best-effort throughout: no parseable header, no declared column, or no
+    identifiable cell leaves the award untouched.
+
+    Returns total marks revoked.
+    """
+    if not column_map:
+        return 0.0
+    header = _parse_table_header(student_text)
+    if not header:
+        return 0.0
+    revoked = 0.0
+    for bd in normalized_breakdown:
+        try:
+            awarded = float(bd.get("marks_awarded", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if awarded <= 0:
+            continue
+        crit = str(bd.get("criterion", "") or "")
+        want = _canon_column_name(column_map.get(crit, ""))
+        if not want or want not in header:
+            continue
+        expected = expected_amount_map.get(crit)
+        if expected is None:
+            continue
+        try:
+            magnitude = int(round(abs(float(expected))))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        want_idx = header.index(want)
+        # Look at every evidence line that is a row of this table.
+        checked_any = False
+        matched = False
+        for ev in (bd.get("evidence_list") or []):
+            cells = [c.strip() for c in str(ev).split("|")]
+            if len(cells) < 2:
+                continue
+            hit_idxs = [
+                i for i, c in enumerate(cells)
+                if _value_present_in_text(magnitude, c)
+            ]
+            if not hit_idxs:
+                continue
+            checked_any = True
+            if want_idx in hit_idxs:
+                matched = True
+                break
+        if not checked_any or matched:
+            continue
+        bd["marks_awarded"] = 0.0
+        revoked += awarded
+        prev = (bd.get("reason", "") or "").strip()
+        bd["reason"] = (
+            f"Marks revoked (column verification): this criterion tests the "
+            f"{want.replace('_', ' ')} column, but the student's figure "
+            f"{magnitude:,} appears in a different column of the row. " + prev
+        ).strip()
+    return revoked
 
 
 _RECOVERY_PER_SUB_MARK = 0.25   # award per un-earned sub-mark
@@ -261,6 +879,20 @@ def _value_variants_for_search(value: int) -> set[str]:
         variants.add(f"{scaled:,}")
         variants.add(f"{scaled:,}.00")
         variants.add(f"{scaled}.00")
+    # DECIMAL MILLIONS FORM — for ANY value, not just exact thousands.
+    # Rubric values are in £'000 but students routinely answer in millions, and
+    # the form they write is usually a decimal: "£3.125m" for 3,125, "12.75m"
+    # for 12,750, "0.4m" for 400. Previously the millions form was only
+    # generated when the value divided cleanly by 1,000, so every one of those
+    # failed to match and the mark was lost — the docstring above claimed
+    # "12750 -> 12.75m" but the guard made that unreachable.
+    # Emitted both bare ("3.125") and suffixed ("3.125m"); a bare form that is
+    # one or two digits is separately gated by _SHORT_BARE_TOKEN_RE.
+    if 0 < abs_v < 10_000_000:
+        _m = abs_v / 1000.0
+        _m_str = f"{_m:g}"          # 3.125 / 12.75 / 5.4 / 0.4 / 12
+        variants.add(_m_str)
+        variants.add(f"{_m_str}m")
     # Millions form (only when the value divides cleanly)
     if abs_v >= 1000 and abs_v % 1000 == 0:
         thousands = abs_v // 1000
@@ -274,6 +906,34 @@ def _value_variants_for_search(value: int) -> set[str]:
             else:
                 variants.add(f"{m_val}m")
     return variants
+
+
+# A variant that is just one or two bare digits — the millions abbreviation of
+# a thousands value (3,000 -> "3", 13,000 -> "13"). Too unspecific to match on
+# its own; see the guard in _value_present_in_text.
+_SHORT_BARE_TOKEN_RE = re.compile(r"^\d{1,2}$")
+
+# Above this share of digits (vs letters) a line of student evidence is a
+# working or journal line rather than a sentence. Measured on the real cases:
+# prose sits at 2-12%, calculation and journal lines at 37-74%.
+_PROSE_DIGIT_DENSITY_MAX = 0.35
+
+
+def _evidence_is_prose(evidence: str) -> bool:
+    """True when a piece of cited evidence reads as a SENTENCE rather than a
+    working line.
+
+    Used by the duplicate-evidence post-pass: one sentence can legitimately
+    earn two different criteria, whereas one arithmetic line represents a
+    single step and cannot.
+    """
+    if not evidence:
+        return False
+    digits = sum(c.isdigit() for c in evidence)
+    letters = sum(c.isalpha() for c in evidence)
+    if digits + letters == 0:
+        return False
+    return (digits / (digits + letters)) <= _PROSE_DIGIT_DENSITY_MAX
 
 
 def _value_present_in_text(value: int, text: str) -> bool:
@@ -290,8 +950,25 @@ def _value_present_in_text(value: int, text: str) -> bool:
     if not text:
         return False
     for v in _value_variants_for_search(value):
-        pattern = r"(?<![\d.,])" + re.escape(v) + r"(?!\d)"
-        if re.search(pattern, text):
+        if _SHORT_BARE_TOKEN_RE.match(v):
+            # SHORT BARE TOKEN GUARD.
+            # _value_variants_for_search abbreviates a thousands value to its
+            # millions form, so 3,000 yields "3" and 13,000 yields "13". A
+            # naked one- or two-digit token matches almost any accounting
+            # script: "3" was found inside "£3.125m" and credited the
+            # net-assets-at-acquisition working on an unrelated NCI line, and
+            # "13" was found inside "13,913 shares" and credited the
+            # net-assets-at-disposal working on the EPS page.
+            # Such a token is only meaningful when the student actually wrote
+            # it as a millions expression, so require an explicit scale word.
+            # The "3m" / "13m" spellings are separate variants and still match
+            # on their own.
+            pattern = (
+                r"(?<![\d.,])" + re.escape(v) + r"\s*(?:m\b|mn\b|million\b)"
+            )
+        else:
+            pattern = r"(?<![\d.,])" + re.escape(v) + r"(?!\d)"
+        if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
 
@@ -412,10 +1089,25 @@ def _find_working_line_for_value(value: int, student_text: str) -> Optional[str]
     # Pre-compile the boundary-aware pattern per variant. Longest-first so
     # a bare "25" doesn't win over a more-specific "25,000" match on the
     # same line (a bare "25" match is nearly always coincidental noise).
-    patterns = [
-        re.compile(r"(?<![\d.,])" + re.escape(v) + r"(?!\d)")
-        for v in sorted(variants, key=len, reverse=True)
-    ]
+    #
+    # SHORT BARE TOKEN GUARD — must mirror _value_present_in_text.
+    # _value_variants_for_search abbreviates a thousands value to its millions
+    # form, so 8,000 yields "8". Without the guard the anchor search matched
+    # the literal "8" inside "Profit to date (8 months) 4,800" and placed a
+    # New York Wheels net-assets tick on a Mission Mouldings line. The presence
+    # check already required an explicit scale word for such tokens; the anchor
+    # search did not, so the two disagreed about what counts as a match.
+    patterns = []
+    for v in sorted(variants, key=len, reverse=True):
+        if _SHORT_BARE_TOKEN_RE.match(v):
+            patterns.append(
+                re.compile(
+                    r"(?<![\d.,])" + re.escape(v) + r"\s*(?:m\b|mn\b|million\b)",
+                    re.IGNORECASE,
+                )
+            )
+        else:
+            patterns.append(re.compile(r"(?<![\d.,])" + re.escape(v) + r"(?!\d)"))
     for line in student_text.split("\n"):
         stripped = line.strip()
         if not stripped:
@@ -428,6 +1120,156 @@ def _find_working_line_for_value(value: int, student_text: str) -> Optional[str]
     return None
 
 
+# Section header emitted by _format_student_for_prompt: "--- <label> ---".
+_STUDENT_SECTION_RE = re.compile(r"^\s*-{3,}\s*(.+?)\s*-{3,}\s*$")
+
+
+def _split_student_sections(student_text: str) -> list[tuple[str, str]]:
+    """Split the flattened student answer into (label, body) sections.
+
+    `_format_student_for_prompt` writes each sub-part as "--- <label> ---"
+    followed by that sub-part's verbatim answer, so the boundaries are already
+    in the text we search. Anything before the first header becomes a leading
+    section labelled "" so no student writing is lost.
+
+    Returns [] when the text carries no headers — callers then fall back to
+    whole-text search, preserving behaviour for single-block scripts.
+    """
+    if not student_text:
+        return []
+    sections: list[tuple[str, list[str]]] = []
+    current_label = ""
+    current: list[str] = []
+    saw_header = False
+    for line in student_text.split("\n"):
+        m = _STUDENT_SECTION_RE.match(line)
+        if m:
+            saw_header = True
+            if current or current_label:
+                sections.append((current_label, current))
+            current_label = m.group(1)
+            current = []
+        else:
+            current.append(line)
+    if current or current_label:
+        sections.append((current_label, current))
+    if not saw_header:
+        return []
+    return [(lbl, "\n".join(body)) for lbl, body in sections]
+
+
+# Alphabetic tokens shorter than this are too common to identify a working
+# ("of", "at", "the", "nci" is borderline but useful, "net" is not on its own).
+_KEYWORD_MIN_TOKEN_LEN = 4
+
+# Tokens that appear on almost every line of an accounting script and so carry
+# no evidence about WHICH working a line belongs to.
+_KEYWORD_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "that", "this", "less", "add",
+    "total", "year", "value", "amount", "figure", "shares", "share",
+})
+
+
+def _keyword_word_tokens(keywords: list[str]) -> set[str]:
+    """Alphabetic, discriminating word tokens drawn from a criterion's keywords.
+
+    Numbers are deliberately dropped: the whole point of the gate these feed is
+    to require evidence BEYOND a numeric coincidence.
+    """
+    out: set[str] = set()
+    for kw in keywords or []:
+        for tok in re.findall(r"[A-Za-z]+", str(kw or "")):
+            t = tok.lower()
+            if len(t) >= _KEYWORD_MIN_TOKEN_LEN and t not in _KEYWORD_STOPWORDS:
+                out.add(t)
+    return out
+
+
+def _line_supports_group_keywords(line: str, wanted: set[str]) -> bool:
+    """True when `line` carries at least one of the criteria's word tokens."""
+    if not wanted:
+        return True
+    line_tokens = {t.lower() for t in re.findall(r"[A-Za-z]+", str(line or ""))}
+    if not line_tokens:
+        return False
+    for w in wanted:
+        if w in line_tokens:
+            return True
+        # Tolerate the student's abbreviations ("acq" for "acquisition",
+        # "reserves" for "reserve") by accepting a shared prefix of 4+ chars.
+        for lt in line_tokens:
+            if len(lt) >= _KEYWORD_MIN_TOKEN_LEN and (
+                w.startswith(lt) or lt.startswith(w)
+            ):
+                return True
+    return False
+
+
+def _norm_section_line(s: str) -> str:
+    """Normalise a line for cross-referencing evidence against section bodies."""
+    return re.sub(r"[\s,;|]+", "", str(s or "")).strip().lower()
+
+
+def _section_index_for_evidence(
+    sections: list[tuple[str, str]], evidence: str
+) -> Optional[int]:
+    """Index of the section containing `evidence`, or None if not found/ambiguous."""
+    needle = _norm_section_line(evidence)
+    if not needle or len(needle) < 8:
+        # Too short to attribute confidently — a 3-character fragment matches
+        # everywhere and would pin the scope to the wrong section.
+        return None
+    hits = [
+        i for i, (_lbl, body) in enumerate(sections)
+        if needle in _norm_section_line(body)
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _scope_text_for_group(
+    student_text: str,
+    sections: list[tuple[str, str]],
+    evidence_lines: list[str],
+) -> Optional[str]:
+    """Narrow the search text to the one student section this working lives in.
+
+    The rubric splinters a single working into many quarter-mark components, and
+    the recovery pass below proves a component by finding its value (or a
+    subset-sum of sibling values) anywhere in the script. Searching the WHOLE
+    script makes that proof worthless across section boundaries: the Mission
+    Mouldings NCI-at-disposal group has sub-results {3,125, 2,500, 1,350}, and
+    the subset {3,125 + 2,500} sums to 5,625 — which appears in the student's
+    statement of changes in equity as the OPENING NCI BALANCE, in a different
+    issue entirely. Three MM marks were awarded off that coincidence.
+
+    Scope is derived from where the group's already-credited criteria actually
+    point: if every resolvable evidence line sits in one section, search only
+    that section.
+
+    Returns None when the script HAS sections but this group's location cannot
+    be pinned to one of them - because nothing in the group was credited, or
+    its evidence straddles sections. The caller must then skip recovery rather
+    than widen the search. Falling back to the whole script in that case is
+    what let the Mission Mouldings NCI group, with not one credited component,
+    collect a mark off the statement of changes in equity in a different issue:
+    the less we know about where a working lives, the less entitled we are to
+    go looking for it everywhere.
+
+    Returns the full text unchanged for a script with no section headers at
+    all, so single-block papers behave exactly as before.
+    """
+    if not sections:
+        return student_text
+    found: set[int] = set()
+    for ev in evidence_lines:
+        idx = _section_index_for_evidence(sections, ev)
+        if idx is not None:
+            found.add(idx)
+    if len(found) != 1:
+        return None
+    return sections[found.pop()][1]
+
+
 def _apply_aggregate_value_recovery(
     normalized_breakdown: list[dict],
     of_component_of_map: dict[str, str],
@@ -436,6 +1278,7 @@ def _apply_aggregate_value_recovery(
     of_definitions: dict[str, dict],
     of_produces_map: dict[str, int] | None = None,
     student_text: str = "",
+    keywords_map: dict[str, list[str]] | None = None,
 ) -> float:
     """Post-LLM aggregate-value recovery via SUBSET-SUM detection.
 
@@ -464,6 +1307,29 @@ def _apply_aggregate_value_recovery(
     if not of_component_of_map or not student_text:
         return 0.0
     of_produces_map = of_produces_map or {}
+    keywords_map = keywords_map or {}
+    student_sections = _split_student_sections(student_text)
+
+    # Every student line the LLM credited DIRECTLY, mapped to the criterion that
+    # claimed it. A size-1 recovery match anchored on a line another criterion
+    # already earned is reading someone else's working: the New York Wheels
+    # goodwill line "Cost (2M shares * $6) 12,000,000 | 1.60 | 7,500,000" is
+    # credited to the cost-of-shares criterion, and it also happens to carry
+    # 2,000, the exchange-gain working's average-rate profit result.
+    llm_claimed_lines: dict[str, str] = {}
+    for _bd in normalized_breakdown:
+        try:
+            if float(_bd.get("marks_awarded", 0) or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if "aggregate recovery" in str(_bd.get("reason", "") or "").lower():
+            continue
+        _owner = str(_bd.get("criterion", "") or "")
+        for _ev in (_bd.get("evidence_list") or []):
+            _k = _norm_section_line(_ev)
+            if len(_k) >= 8:
+                llm_claimed_lines.setdefault(_k, _owner)
 
     # Group producers by their aggregate OF.
     producers_by_of: dict[str, list[int]] = {}
@@ -491,6 +1357,105 @@ def _apply_aggregate_value_recovery(
         if not results_to_indices:
             continue
 
+        # ── Section scoping ──────────────────────────────────────────────────
+        # Confine every presence check and anchor search below to the ONE
+        # student section this working demonstrably lives in, inferred from
+        # where the group's already-credited criteria point. See
+        # _scope_text_for_group for why whole-script search is unsafe.
+        _scope_evidence: list[str] = []
+        for _idx in producer_indices:
+            _p = normalized_breakdown[_idx]
+            try:
+                if float(_p.get("marks_awarded", 0) or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if "aggregate recovery" in str(_p.get("reason", "") or "").lower():
+                continue
+            _scope_evidence.extend(
+                str(e) for e in (_p.get("evidence_list") or []) if e
+            )
+        for _cand in normalized_breakdown:
+            if aggregate_of not in (
+                of_source_ids_map.get(str(_cand.get("criterion", "") or "")) or []
+            ):
+                continue
+            try:
+                if float(_cand.get("marks_awarded", 0) or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            _scope_evidence.extend(
+                str(e) for e in (_cand.get("evidence_list") or []) if e
+            )
+        _scoped = _scope_text_for_group(
+            student_text, student_sections, _scope_evidence
+        )
+        if _scoped is None:
+            # Location unknown — see _scope_text_for_group. No recovery.
+            continue
+        scoped_text: str = _scoped
+
+        # Alphabetic keyword tokens for every producer in this group, indexed by
+        # the sub-working value it produces. Used to gate size>=2 subset-sum
+        # matches (see _line_supports_group_keywords).
+        keywords_by_result: dict[int, set[str]] = {}
+        for _r, _idxs in results_to_indices.items():
+            _toks: set[str] = set()
+            for _i in _idxs:
+                _c = str(normalized_breakdown[_i].get("criterion", "") or "")
+                _toks.update(_keyword_word_tokens(keywords_map.get(_c) or []))
+            keywords_by_result[_r] = _toks
+
+        def _subset_is_supported(subset: list[int]) -> bool:
+            """Gate every subset-sum match on the matched line's subject matter.
+
+            A number alone proves nothing about WHICH working it came from, at
+            any subset size:
+              • size >= 2 — the student's New York Wheels cost line "Cost (2M
+                shares * $6) 12,000,000 | 1.60 | 7,500,000" carries 7,500,
+                exactly 5,000 + 2,500 from the exchange-gain group, and bought
+                0.75 marks for a working never attempted.
+              • size 1 — the SAME cost working's "Less: FV of net assets
+                (2M * $1) (2,000,000)" carries 2,000, which is the
+                average-rate profit translation's result in the exchange-gain
+                working, and bought that mark outright. Both lines sit in the
+                right SECTION, so section scoping cannot separate them.
+
+            The two sizes need different tests, because they fail differently.
+
+            size >= 2 is pure arithmetic coincidence, so demand subject matter:
+            the line must carry a WORD from one of the subset's criteria.
+
+            size 1 cannot use that test. A rubric keyword list is the model
+            answer's vocabulary, not the student's - the £12.75m component is
+            authored as "reserves" while the student writes "Retained earnings
+            b/fwd 12,750", and the examiner awarded that line. Requiring the
+            word would revoke it. What the size-1 failures DO share is that the
+            number was read off a line another criterion has already been
+            credited for, so test that instead.
+            """
+            line = _find_working_line_for_value(sum(subset), scoped_text)
+            if not line:
+                return False
+            if len(subset) < 2:
+                owner = llm_claimed_lines.get(_norm_section_line(line))
+                if owner is None:
+                    return True
+                return owner in {
+                    str(normalized_breakdown[i].get("criterion", "") or "")
+                    for r in subset
+                    for i in results_to_indices.get(r, [])
+                }
+            wanted: set[str] = set()
+            for _r in subset:
+                wanted |= keywords_by_result.get(_r, set())
+            if not wanted:
+                # No alphabetic keywords authored for this group — nothing to
+                # verify against, so leave the legacy behaviour untouched.
+                return True
+            return _line_supports_group_keywords(line, wanted)
+
         # Enumerate every non-empty subset of sub-working results and mark the
         # sub-workings whose sum appears in the student's answer as confirmed.
         # We also track which sub-workings were confirmed INDIVIDUALLY (subset
@@ -508,14 +1473,17 @@ def _apply_aggregate_value_recovery(
             for mask in range(1, 1 << n):
                 subset = [sub_results[i] for i in range(n) if mask & (1 << i)]
                 subset_sum = sum(subset)
-                if _value_present_in_text(subset_sum, student_text):
-                    matching_subsets.append(subset)
-                    if len(subset) == 1:
-                        individually_confirmed.add(subset[0])
+                if not _value_present_in_text(subset_sum, scoped_text):
+                    continue
+                if not _subset_is_supported(subset):
+                    continue
+                matching_subsets.append(subset)
+                if len(subset) == 1:
+                    individually_confirmed.add(subset[0])
         else:
             # Degenerate fallback: only check each sub-working individually.
             for r in sub_results:
-                if _value_present_in_text(r, student_text):
+                if _value_present_in_text(r, scoped_text) and _subset_is_supported([r]):
                     matching_subsets.append([r])
                     individually_confirmed.add(r)
 
@@ -648,7 +1616,9 @@ def _apply_aggregate_value_recovery(
                 subset = [sub_results[i] for i in range(n) if mask & (1 << i)]
                 if subset and all(r in recovered_sub_results for r in subset):
                     s = sum(subset)
-                    if _value_present_in_text(s, student_text):
+                    if _value_present_in_text(s, scoped_text) and _subset_is_supported(
+                        subset
+                    ):
                         matching_subsets_all_recovered.append(frozenset(subset))
 
         # For each recovered sub_result, find the LARGEST matching subset
@@ -672,7 +1642,7 @@ def _apply_aggregate_value_recovery(
         # _find_working_line_for_value call.
         anchor_line_for_subset: dict[frozenset[int], Optional[str]] = {}
         for S in set(subset_for_sub_result.values()):
-            anchor_line_for_subset[S] = _find_working_line_for_value(sum(S), student_text)
+            anchor_line_for_subset[S] = _find_working_line_for_value(sum(S), scoped_text)
 
         # Legacy group-level anchor (used when a sub_result has no subset
         # assignment - shouldn't normally happen, but keeps behaviour safe).
@@ -682,7 +1652,7 @@ def _apply_aggregate_value_recovery(
                 sum(S) for S in matching_subsets_all_recovered
             ]
             for s in sorted(set(recovered_only_sums), reverse=True):
-                line = _find_working_line_for_value(s, student_text)
+                line = _find_working_line_for_value(s, scoped_text)
                 if line:
                     anchor_line = line
                     break
@@ -697,10 +1667,10 @@ def _apply_aggregate_value_recovery(
                     subset = [sub_results[i] for i in range(n) if mask & (1 << i)]
                     if all(r in confirmed_results for r in subset):
                         s = sum(subset)
-                        if _value_present_in_text(s, student_text):
+                        if _value_present_in_text(s, scoped_text):
                             candidate_sums.append(s)
                 for s in sorted(set(candidate_sums), reverse=True):
-                    line = _find_working_line_for_value(s, student_text)
+                    line = _find_working_line_for_value(s, scoped_text)
                     if line:
                         anchor_line = line
                         break
@@ -776,7 +1746,7 @@ def _apply_aggregate_value_recovery(
         # the result (e.g. "=12750000+(7200000*9/12)" computes 5,400,000 but
         # never states it). Computed once — the check below runs per criterion
         # and inside a sort key.
-        computed_values = _computed_values_in_text(student_text)
+        computed_values = _computed_values_in_text(scoped_text)
 
         def _idx_is_individually_confirmed(idx: int) -> bool:
             crit = str(normalized_breakdown[idx].get("criterion", "") or "")
@@ -814,6 +1784,12 @@ def _apply_aggregate_value_recovery(
             # these would double-award for the same student writing.
             _reason_l = str(bd.get("reason", "") or "").lower()
             if "marks given above" in _reason_l or "marks given below" in _reason_l:
+                continue
+            # The parent-calc guard already established that the student never
+            # performed THIS working. Recovery must not overturn that finding —
+            # it produced self-contradicting awards where one reason string both
+            # revoked and restored the same quarter mark.
+            if bd.get("_parent_calc_revoked"):
                 continue
             # Fix B anchor-collision skip. Compute the prospective anchor for
             # THIS producer up front. If it collides with a line an LLM-
@@ -1096,6 +2072,11 @@ def _merge_aggregate_recovered_entries(
                     pass
 
         merged_entry = {
+            # The aggregate's own OF id doubles as its criterion id. Without
+            # one, nothing downstream can refer to this entry - the restatement
+            # pass skipped both merged workings on the first live run, 2.0
+            # marks' worth, including the two the marker points at.
+            "criterion_id": str(aggregate_of or "").strip().upper(),
             "criterion": merged_criterion,
             "marks_awarded": total_awarded,
             "max_possible": total_max,
@@ -1140,6 +2121,21 @@ def _merge_aggregate_recovered_entries(
         new_breakdown.extend(remaining)
 
     return new_breakdown
+
+
+def _norm_for_evidence_match_static(s: str) -> str:
+    """Module-level twin of the normaliser nested in _build_grade_doc.
+
+    Kept byte-identical so that a line judged "already earning marks" here is
+    judged the same way when the note is placed.
+    """
+    if not s or not isinstance(s, str):
+        return ""
+    s = s.replace("\u00a0", " ").replace("\u00d7", "x")
+    s = s.replace("\u2013", "-").replace("-", "-")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = re.sub(r"[^a-z0-9%/().,\- ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 class StudentGrader:
@@ -1198,6 +2194,10 @@ class StudentGrader:
         # Cache rubric order (description → position) for post-processing heuristics.
         self._rubric_criteria_order_last_run: list[str] = []
         self._rubric_position_last_run: dict[str, int] = {}
+        # Short rubric id -> canonical criterion description. The model returns
+        # the id instead of retyping the description, so we can resolve the
+        # criterion exactly rather than by matching 600 characters of prose.
+        self._criterion_id_map_last_run: dict[str, str] = {}
         # OF metadata caches (populated from rubric each run).
         # `of_ids`: criteria that ORIGINATE OF values (list - 1 or 2 entries).
         # `of_source_ids`: criteria that DEPEND on upstream OFs. Presence is a strong
@@ -1219,6 +2219,10 @@ class StudentGrader:
         # aggregated value (like 3,850 = 2,500 + 1,350) that implies they did
         # the working via a different decomposition.
         self._of_produces_by_criterion_last_run: dict[str, int] = {}
+        self._keywords_by_criterion_last_run: dict[str, list[str]] = {}
+        self._expected_amount_by_criterion_last_run: dict[str, float] = {}
+        self._sign_sensitive_criteria_last_run: set[str] = set()
+        self._column_by_criterion_last_run: dict[str, str] = {}
 
         self.grades_coll = get_collection(self.COLLECTION_NAME)
 
@@ -1243,6 +2247,20 @@ class StudentGrader:
         except Exception:
             self.holistic_chain_structured = None
         self.holistic_chain_text = holistic_grade_prompt | llm_grader
+
+        # Restatement pass. Runs AFTER grading, because only then is it known
+        # which line each mark landed on - aggregate recovery, subset-sum
+        # recovery and the guardrails all move awards after the grading model
+        # has replied. Its only job is to find lines where the student repeats
+        # an already-credited point, so a marker's "Marks given above/below"
+        # note can be placed there.
+        self.restatement_chain = None
+        try:
+            self.restatement_chain = restatement_prompt | llm_grader.with_structured_output(
+                RestatementResponse
+            )
+        except Exception:
+            self.restatement_chain = None
 
     @staticmethod
     def _extract_structured_args_from_message(output: Any) -> Optional[dict]:
@@ -1814,6 +2832,7 @@ class StudentGrader:
                     _entry["exact_match"] = it["exact_match"]
                 # Preserve OF metadata through dedup.
                 for _fld in (
+                    "criterion_id",
                     "of_ids", "of_id", "of_source_ids", "of_component_of",
                     "of_produces",
                     "of_value", "of_value_unit", "of_value_label",
@@ -2028,9 +3047,19 @@ class StudentGrader:
                 desc = str(it.get("description", "") or "").strip()
                 if not desc:
                     continue
+                # A criterion_id means a human authored this criterion, so its
+                # wording is deliberate. These phrases only signal commentary in
+                # rubrics SCRAPED from a marking guide; an authored criterion may
+                # legitimately carry a "TUTORIAL NOTE:" or note that a figure
+                # "appears to have been correctly dealt with" as part of what it
+                # is testing. Matching on a substring deleted those whole.
+                if it.get("criterion_id"):
+                    out.append(it)
+                    continue
                 dnorm = _norm_desc_key(desc)
                 if any(p in dnorm for p in commentary_phrases):
                     dropped += 1
+                    logger.debug(f"Dropped commentary criterion: {desc[:80]}")
                     continue
                 out.append(it)
 
@@ -2225,6 +3254,7 @@ class StudentGrader:
                             "description": combined_desc,
                         }
                         for _fld in (
+                            "criterion_id",
                             "of_ids", "of_id", "of_source_ids",
                             "of_value", "of_value_unit", "of_value_label",
                             "exact_match",
@@ -2245,10 +3275,24 @@ class StudentGrader:
                     # marks for that section.
                     if description and isinstance(marks, (int, float)) and marks > 0:
                         if self._is_valid_criterion(description):
-                            combined_criteria.append({
+                            _parent_entry: dict[str, Any] = {
                                 "marks": marks,
                                 "description": description,
-                            })
+                            }
+                            # Carry the parent's own metadata. Rebuilding a bare
+                            # dict here stripped `category`, so a section_header
+                            # came back as a gradeable criterion and the section
+                            # cap could be awarded a second time on top of its
+                            # own per-row criteria.
+                            for _fld in (
+                                "criterion_id", "category", "exact_match",
+                                "of_ids", "of_id", "of_source_ids",
+                                "of_component_of", "of_produces",
+                                "of_value", "of_value_unit", "of_value_label",
+                            ):
+                                if criteria_item.get(_fld) is not None:
+                                    _parent_entry[_fld] = criteria_item[_fld]
+                            combined_criteria.append(_parent_entry)
                     continue
 
                 # Leaf criterion
@@ -2285,6 +3329,7 @@ class StudentGrader:
                     _crit_entry["category"] = _cat
                 # Preserve OF metadata + exact_match flag for downstream caching.
                 for _fld in (
+                    "criterion_id",
                     "of_ids", "of_id", "of_source_ids", "of_component_of",
                     "of_produces",
                     "of_value", "of_value_unit", "of_value_label",
@@ -2536,12 +3581,17 @@ class StudentGrader:
         exact_match: set[str] = set()
         ordered: list[str] = []
         pos_map: dict[str, int] = {}
+        id_map: dict[str, str] = {}
         of_ids_map: dict[str, list[str]] = {}
         of_source_map: dict[str, list[str]] = {}
         of_value_map: dict[str, dict[str, Any]] = {}
         of_defs: dict[str, dict[str, Any]] = {}
         of_component_map: dict[str, str] = {}
         of_produces_map: dict[str, int] = {}
+        keywords_map: dict[str, list[str]] = {}
+        expected_amount_map: dict[str, float] = {}
+        sign_sensitive_set: set[str] = set()
+        column_map: dict[str, str] = {}
 
         def _reset_of_caches() -> None:
             self._of_ids_by_criterion_last_run = {}
@@ -2550,6 +3600,10 @@ class StudentGrader:
             self._of_definitions_last_run = {}
             self._of_component_of_by_criterion_last_run = {}
             self._of_produces_by_criterion_last_run = {}
+            self._keywords_by_criterion_last_run = {}
+            self._expected_amount_by_criterion_last_run = {}
+            self._sign_sensitive_criteria_last_run = set()
+            self._column_by_criterion_last_run = {}
 
         try:
             answers = (model_data or {}).get("answers")
@@ -2560,6 +3614,7 @@ class StudentGrader:
                 self._exact_match_criteria_last_run = set()
                 self._rubric_criteria_order_last_run = []
                 self._rubric_position_last_run = {}
+                self._criterion_id_map_last_run = {}
                 _reset_of_caches()
                 return
 
@@ -2572,6 +3627,7 @@ class StudentGrader:
                 self._exact_match_criteria_last_run = set()
                 self._rubric_criteria_order_last_run = []
                 self._rubric_position_last_run = {}
+                self._criterion_id_map_last_run = {}
                 _reset_of_caches()
                 return
 
@@ -2603,6 +3659,13 @@ class StudentGrader:
                     continue
 
                 allowed.add(desc)
+                # CRITERION ID -> canonical description.
+                # The model returns the id rather than retyping the whole
+                # description, so resolution is exact and a near-identical
+                # twin can no longer absorb another criterion's marks.
+                _cid = str(it.get("criterion_id", "") or "").strip()
+                if _cid and _cid not in id_map:
+                    id_map[_cid] = desc
                 if desc not in pos_map:
                     pos_map[desc] = len(ordered)
                     ordered.append(desc)
@@ -2645,6 +3708,23 @@ class StudentGrader:
                     except (TypeError, ValueError):
                         pass
 
+                # Authored fields the post-processing guards rely on. These
+                # have always been present in the rubric but were never read.
+                _kw_raw = it.get("keywords")
+                if isinstance(_kw_raw, list) and _kw_raw:
+                    keywords_map[desc] = [str(x) for x in _kw_raw if x is not None]
+                _amt_raw = it.get("expected_amount")
+                if _amt_raw is not None:
+                    try:
+                        expected_amount_map[desc] = float(_amt_raw)
+                    except (TypeError, ValueError):
+                        pass
+                if it.get("sign_sensitive"):
+                    sign_sensitive_set.add(desc)
+                _col_raw = str(it.get("column", "") or "").strip()
+                if _col_raw:
+                    column_map[desc] = _col_raw
+
         finally:
             self._allowed_criteria_last_run = allowed
             self._criterion_max_map_last_run = max_map
@@ -2652,12 +3732,138 @@ class StudentGrader:
             self._exact_match_criteria_last_run = exact_match
             self._rubric_criteria_order_last_run = ordered
             self._rubric_position_last_run = pos_map
+            self._criterion_id_map_last_run = id_map
             self._of_ids_by_criterion_last_run = of_ids_map
             self._of_source_ids_by_criterion_last_run = of_source_map
             self._of_value_by_criterion_last_run = of_value_map
             self._of_definitions_last_run = of_defs
             self._of_component_of_by_criterion_last_run = of_component_map
             self._of_produces_by_criterion_last_run = of_produces_map
+            self._keywords_by_criterion_last_run = keywords_map
+            self._expected_amount_by_criterion_last_run = expected_amount_map
+            self._sign_sensitive_criteria_last_run = sign_sensitive_set
+            self._column_by_criterion_last_run = column_map
+
+    def _find_restatements(
+        self, credited_by_id: dict[str, dict]
+    ) -> list[tuple[str, str]]:
+        """Where does the student repeat a point that was already credited?
+
+        Returns (criterion_id, student_line) pairs. Best-effort: any failure
+        yields nothing, because a missing marker's note is a cosmetic loss
+        while a wrong one actively misleads the student.
+        """
+        logger.info("=" * 62)
+        logger.info("RESTATEMENT PASS - finding repeats of already-credited points")
+        logger.info("=" * 62)
+        if not credited_by_id:
+            logger.info("  SKIPPED: no criterion scored above 0, nothing to point at")
+            return []
+        if self.restatement_chain is None:
+            logger.info("  SKIPPED: chain unavailable (provider has no structured output)")
+            return []
+        student_text = getattr(self, "_student_text_last_run", "") or ""
+        if not student_text.strip():
+            logger.info("  SKIPPED: student text empty for this run")
+            return []
+
+        # Credited points, grouped by the WORKING each belongs to. A criterion
+        # description ends with "CONTEXT - <the working>", shared verbatim by
+        # every row of that working, so it groups them and carries the
+        # working's own result - which is what a prose line usually restates.
+        def _ctx_key(desc: str) -> str:
+            _m = re.search(r"CONTEXT\s*[-\u2014:]?\s*(.+)$", desc, re.S)
+            return re.sub(r"\s+", " ", _m.group(1)).strip()[:300] if _m else ""
+
+        _groups: dict[str, list[tuple[str, str, str]]] = {}
+        for _cid, _bi in sorted(credited_by_id.items()):
+            _desc = re.sub(r"\s+", " ", str(_bi.get("criterion", "") or ""))
+            _ev = str(_bi.get("evidence", "") or "").split(";")[0].strip()[:100]
+            if not _ev:
+                continue
+            _groups.setdefault(_ctx_key(_desc), []).append(
+                (_cid, _desc.split("CONTEXT")[0][:100], _ev)
+            )
+
+        _lines_out: list[str] = []
+        for _ctx, _members in _groups.items():
+            if _ctx:
+                _lines_out.append(f"WORKING: {_ctx}")
+            for _cid, _short, _ev in _members:
+                _lines_out.append(f"   {_cid} | {_short} | CREDITED ON: {_ev}")
+        if not _lines_out:
+            return []
+
+        # Which student lines already earn marks? Containment either way, so a
+        # formatting difference cannot leave a scoring line in the candidate
+        # set - that is how a note ends up printed on top of a score.
+        _rows = [ln.strip() for ln in student_text.splitlines() if ln.strip()]
+        _rows_norm = [_norm_for_evidence_match_static(_r) for _r in _rows]
+        _paid_idx: set[int] = set()
+        for _bi in credited_by_id.values():
+            for _e in (_bi.get("evidence_list") or []):
+                _en = _norm_for_evidence_match_static(_e)
+                if not _en:
+                    continue
+                _exact = [_i for _i, _rn in enumerate(_rows_norm) if _rn and _rn == _en]
+                if _exact:
+                    _paid_idx.update(_exact)
+                    continue
+                # No exact row: the snippet may join or trim one. Claim the
+                # single closest row, never every row it happens to contain -
+                # a short row repeated later in the script must stay available.
+                _cands = [_i for _i, _rn in enumerate(_rows_norm)
+                          if _rn and (_rn in _en or _en in _rn)]
+                if _cands:
+                    _paid_idx.add(max(_cands, key=lambda _i: len(_rows_norm[_i])))
+        _unmarked = [_r for _i, _r in enumerate(_rows)
+                     if _i not in _paid_idx and _rows_norm[_i]]
+        if not _unmarked:
+            logger.info("  every student line already earns marks - nothing to flag")
+            return []
+
+        logger.info(f"  sending {len(credited_by_id)} credited point(s) in "
+                    f"{len(_groups)} working(s); {len(_unmarked)} of {len(_rows)} "
+                    f"line(s) earn nothing and are up for decision")
+        try:
+            _result = self.restatement_chain.invoke({
+                "credited": "\n".join(_lines_out),
+                "unmarked_lines": "\n".join(
+                    f"{_i + 1}. {_l}" for _i, _l in enumerate(_unmarked)
+                ),
+            })
+        except Exception as e:
+            logger.warning(f"  FAILED: {e} - grading is unaffected, no notes added")
+            return []
+
+        if isinstance(_result, BaseModel):
+            _result = _result.model_dump()
+        if not isinstance(_result, dict):
+            return []
+
+        _raw = _result.get("restatements") or []
+        logger.info(f"  model returned {len(_raw)} candidate line(s)")
+        _out: list[tuple[str, str]] = []
+        for _item in _raw:
+            if not isinstance(_item, dict):
+                logger.info(f"    DROP  malformed entry: {_item!r:.80}")
+                continue
+            _cid = str(_item.get("criterion_id", "") or "").strip().upper()
+            _line = str(_item.get("line", "") or "").strip()
+            _why = str(_item.get("why", "") or "").strip()
+            if not _line:
+                logger.info(f"    DROP  [{_cid or '?'}] empty line")
+                continue
+            if _cid not in credited_by_id:
+                logger.info(f"    DROP  [{_cid or '?'}] unknown or uncredited id "
+                            f"| {_line[:60]}")
+                continue
+            logger.info(f"    KEEP  [{_cid}] {_line[:60]}")
+            if _why:
+                logger.info(f"          why: {_why[:80]}")
+            _out.append((_cid, _line))
+        logger.info(f"  {len(_out)} candidate(s) passed id checks")
+        return _out
 
     def _fetch_doc(self, collection_name: str, doc_id: str) -> Optional[dict[str, Any]]:
         """Fetch document by _id."""
@@ -5329,9 +6535,30 @@ class StudentGrader:
         evidence_warnings = []
         sum_awarded_calc = 0.0  # debug only
 
+        _id_map = self._criterion_id_map_last_run or {}
         for item in main_grade.get("breakdown", []) or []:
             criterion = item.get("criterion", "Unknown")
             criterion = str(criterion or "").strip()
+
+            # CRITERION ID takes precedence over the echoed text.
+            # The model returns e.g. "TB03" and we substitute the rubric's own
+            # wording, so a criterion can no longer be lost to a near-identical
+            # twin, paraphrased into unrecognisability, or dropped because
+            # retyping 600 characters was too costly.
+            if _id_map and not self._holistic_grading:
+                _rid = str(item.get("criterion_id", "") or "").strip().upper()
+                _canon_by_id = _id_map.get(_rid)
+                if _canon_by_id:
+                    if criterion != _canon_by_id:
+                        logger.debug(
+                            f"Resolved criterion by id {_rid}: "
+                            f"'{criterion[:60]}' -> '{_canon_by_id[:60]}'"
+                        )
+                    criterion = _canon_by_id
+                    item["criterion"] = _canon_by_id
+                    _claimed_canonicals.add(_canon_by_id)
+                elif _rid:
+                    logger.debug(f"Unknown criterion_id '{_rid}' - falling back to text match")
 
             # Strictly require that the criterion exists in the rubric we provided.
             # This prevents the LLM from inventing criteria or grading headings/commentary.
@@ -5616,6 +6843,12 @@ class StudentGrader:
                         w for w in re.findall(r"[a-z]{4,}", _crit_lower) if w not in _NEG_STOP
                     ]
                     _ev_combined = " ".join(evid_list).lower()
+                    # "no of ord shares" is an abbreviation of "number of",
+                    # not a negation. Left in, the guard reads it as "no ...
+                    # shares" and revokes a correct answer - it cost EPS03 its
+                    # 0.5 on a share count that was right. Same for "no." and
+                    # "nos.", which students use for the same thing.
+                    _ev_combined = re.sub(r"\bnos?\.?\s+of\b", "number of", _ev_combined)
                     for _kw in _crit_key[:6]:
                         # Match "no <optional words> <keyword-prefix>" - covers "no impairments"
                         # when keyword is "impairment" and similar plural/suffix variations.
@@ -5864,6 +7097,31 @@ class StudentGrader:
                 "comments_summary": item.get("comments_summary", ""),
                 "is_of_mark": _is_of_mark,
             }
+            # Carry the rubric's own id onto the saved entry. Without it the
+            # graded document gives no way to tell which criterion an entry is,
+            # short of diffing 600 characters of description - and no way to
+            # tell whether the model returned an id at all.
+            _rubric_cid = ""
+            for _cid_k, _cid_desc in (_id_map or {}).items():
+                if _cid_desc == criterion:
+                    _rubric_cid = _cid_k
+                    break
+            if _rubric_cid:
+                bd_item["criterion_id"] = _rubric_cid
+            bd_item["_llm_returned_criterion_id"] = str(
+                item.get("criterion_id", "") or "").strip().upper()
+            # The model's own one-line statement of what it just graded, used
+            # below to verify it paired its reasoning with the right id.
+            _focus = str(item.get("criterion_focus", "") or "").strip()
+            if _focus:
+                bd_item["criterion_focus"] = _focus
+            # Lines where the student repeats this point for no extra marks.
+            # Turned into "Marks given above/below" notes further down.
+            _restated = item.get("restated_at")
+            if isinstance(_restated, list):
+                _clean = [str(r).strip() for r in _restated if str(r or "").strip()]
+                if _clean:
+                    bd_item["_restated_at"] = _clean[:4]
             # LLM-provided column header for tabular disambiguation. Only
             # forwarded when the LLM populated it (non-empty string). The
             # annotator uses this to disambiguate values that appear in
@@ -5874,6 +7132,21 @@ class StudentGrader:
                 _col_hdr_str = str(_col_hdr).strip()
                 if _col_hdr_str:
                     bd_item["_column_header"] = _col_hdr_str
+            # RUBRIC COLUMN WINS when the mark scheme declares one. The LLM's
+            # hint is a guess at what the student's table looks like; `column`
+            # is the author's statement of which column the mark is FOR. Without
+            # it the annotator takes the first matching number on the row, so a
+            # revaluation-loss mark for OTHER COMPONENTS underlined the (300) in
+            # retained earnings and put its score beside the (600) total.
+            _rubric_col = (self._column_by_criterion_last_run or {}).get(
+                str(bd_item.get("criterion", "") or "")
+            )
+            if _rubric_col:
+                _hdr = _COLUMN_HEADER_TEXT.get(
+                    _canon_column_name(_rubric_col), ""
+                )
+                if _hdr:
+                    bd_item["_column_header"] = _hdr
             # Populate _target_value from the rubric's of_value / of_produces
             # so the annotator can narrow the underline+score to the specific
             # value cell on the resolved evidence line. Model-side info — no
@@ -5978,6 +7251,30 @@ class StudentGrader:
                     _crit = str(normalized_breakdown[i].get("criterion", "") or "")
                     return bool(self._of_component_of_by_criterion_last_run.get(_crit, ""))
 
+                # Where each piece of evidence sits in the student's script, so
+                # the annotation can point the reader the right way. A marker
+                # writes "Marks given BELOW" against an earlier mention whose
+                # marks are awarded further down (the student states the
+                # goodwill figure in prose, then shows the working underneath),
+                # and "Marks given ABOVE" when the credit came first.
+                _student_hay = _norm_for_evidence_match(
+                    getattr(self, "_student_text_last_run", "") or ""
+                )
+
+                def _evidence_pos(i: int) -> int:
+                    _ev = _norm_for_evidence_match(_ev_per_idx.get(i, "") or "")
+                    if not _ev or not _student_hay:
+                        return -1
+                    return _student_hay.find(_ev)
+
+                def _direction_word(keeper_i: int, dup_i: int) -> str:
+                    _kp, _dp = _evidence_pos(keeper_i), _evidence_pos(dup_i)
+                    # Fall back to "above" when either side cannot be located -
+                    # that is the historical wording and the commoner case.
+                    if _kp < 0 or _dp < 0 or _kp == _dp:
+                        return "above"
+                    return "below" if _kp > _dp else "above"
+
                 for _ev_key, _idxs in _ev_index.items():
                     # De-dupe while preserving order (a criterion could land
                     # in both its own group and the absorbed-into group).
@@ -6042,29 +7339,52 @@ class StudentGrader:
                         )
                         if _keeper_component and _dup_component:
                             continue  # both aggregate sub-marks — never cross-null
-                        # RUBRIC-DECLARED DISTINCTNESS (opt-in).
-                        # The narrative-wrapper guard below exists to revoke a
-                        # high-level criterion that merely restates a
-                        # calculation the sub-marks already credited. But the
-                        # same machinery also fires on two GENUINELY DIFFERENT
-                        # points that happen to share a figure — e.g. the
-                        # narrative "MM contributes £5.4m to profit" against
-                        # the £7.2m × 9/12 component of net assets at disposal,
-                        # or "goodwill initially measured at £2.5m" against the
-                        # '$4m @ 1.6 (2,500)' row of the exchange gain working.
-                        # Mechanically those look identical to the wrapper case,
-                        # so only the rubric author can tell them apart. When a
-                        # description carries an explicit DISAMBIGUATION note
-                        # AND the two criteria sit in different working
-                        # sections, honour it and keep both marks. Rubrics that
-                        # do not use DISAMBIGUATION are unaffected.
+                        # ONE SIDE IS A BUCKET SUB-MARK, THE OTHER IS NOT.
+                        # These live in different structures: a sub-mark of a
+                        # rolled-up working total versus a standalone narrative
+                        # or calculation point. The rubric says so in as many
+                        # words - "do NOT treat it as the same point as the
+                        # narrative statement ... which is a separate 0.5
+                        # criterion" - and this guard used to fall through and
+                        # null the standalone one anyway. On Amber that cost
+                        # 1.5 marks across MM09, NYW05 and NYW12, and printed
+                        # "Marks given above" on the very line that was being
+                        # awarded 0.25.
+                        if bool(_keeper_component) != bool(_dup_component):
+                            continue
+                        # DIFFERENT COLUMNS OF THE SAME TABLE ROW.
+                        # A SOCIE row carries one figure per column and the
+                        # rubric marks several of them separately. Both items
+                        # quote the whole row, so they look identical here -
+                        # only the resolved column tells them apart.
+                        _keep_col = str(normalized_breakdown[_idxs_sorted[0]].get(
+                            "_column_header", "") or "").strip().lower()
+                        _dup_col = str(normalized_breakdown[_dup_idx].get(
+                            "_column_header", "") or "").strip().lower()
+                        if _keep_col and _dup_col and _keep_col != _dup_col:
+                            continue
                         _dup_crit_raw = str(
                             normalized_breakdown[_dup_idx].get("criterion", "") or ""
                         )
-                        if _keeper_component != _dup_component and (
-                            "disambiguation:" in _keep_crit_lower
-                            or "disambiguation:" in _dup_crit
-                        ):
+                        # PROSE EVIDENCE CARRIES MORE THAN ONE POINT.
+                        # What the two criteria share decides this, not what
+                        # they are. A sentence of prose can legitimately make
+                        # two different points at once — "treated as an
+                        # associate from 1 March 20X4" is both the
+                        # becomes-an-associate mark AND the equity-accounting
+                        # mark, and revoking one of them cost a student 0.5.
+                        # A CALCULATION LINE cannot: the student performed one
+                        # arithmetic step, so a narrative criterion citing that
+                        # same line is restating the calculation rather than
+                        # making its own point. Crediting both there awarded
+                        # 1.5 marks a marker would not give — the narrative
+                        # "MM contributes £5.4m to profit" and the 1-mark "NCI
+                        # is allocated 25%" both scored on working lines the
+                        # student never wrote a statement about.
+                        # Digit density separates the two cleanly: the prose
+                        # cases sit at 2-12%, the working and journal lines at
+                        # 37-74%.
+                        if _evidence_is_prose(_keeper_ev or _dup_ev):
                             continue
                         # JOURNAL vs WORKING never cross-null. A journal
                         # legitimately re-presents figures derived in a working;
@@ -6096,10 +7416,29 @@ class StudentGrader:
                                 normalized_breakdown[_dup_idx]["marks_awarded"] = 0.0
                                 sum_awarded_calc -= _dup_marks
                                 _prev_reason = (normalized_breakdown[_dup_idx].get("reason", "") or "").strip()
-                                normalized_breakdown[_dup_idx]["reason"] = (
-                                    f"Marks given above: same evidence already credited for "
-                                    f"'{_keeper_crit[:60]}'. " + _prev_reason
-                                ).strip()
+                                _dir = _direction_word(_idxs_sorted[0], _dup_idx)
+                                # A marker writes "Marks given above/below" to
+                                # point AWAY from the line - "you made this
+                                # point here too, the marks are over there".
+                                # When both criteria resolved to the SAME line
+                                # there is nowhere to point, and the annotator
+                                # draws the note on top of the score already
+                                # printed there. Zero it, but say so plainly
+                                # rather than printing a pointer to itself.
+                                _same_line = (
+                                    _evidence_pos(_idxs_sorted[0]) ==
+                                    _evidence_pos(_dup_idx)
+                                )
+                                if _same_line:
+                                    normalized_breakdown[_dup_idx]["reason"] = (
+                                        f"Credited once: this line is already marked for "
+                                        f"'{_keeper_crit[:60]}'. " + _prev_reason
+                                    ).strip()
+                                else:
+                                    normalized_breakdown[_dup_idx]["reason"] = (
+                                        f"Marks given {_dir}: same evidence already credited for "
+                                        f"'{_keeper_crit[:60]}'. " + _prev_reason
+                                    ).strip()
             except Exception:
                 pass  # Guard must never fail the grader
 
@@ -6175,6 +7514,8 @@ class StudentGrader:
                 _revoked = _apply_parent_calc_verification(
                     normalized_breakdown,
                     of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                    of_component_of_map=self._of_component_of_by_criterion_last_run,
+                    of_definitions=self._of_definitions_last_run,
                 )
                 sum_awarded_calc -= _revoked
             except Exception:
@@ -6210,10 +7551,77 @@ class StudentGrader:
                     of_definitions=self._of_definitions_last_run,
                     of_produces_map=self._of_produces_by_criterion_last_run,
                     student_text=self._student_text_last_run or "",
+                    keywords_map=self._keywords_by_criterion_last_run,
                 )
                 sum_awarded_calc += _recovered
             except Exception:
                 pass  # Guard must never fail the grader
+
+        # ── Sign / column / self-consistency guards (numerical mode only) ────
+        # These read rubric fields that were authored from the start but never
+        # enforced: `expected_amount` + `sign_sensitive` separate two criteria
+        # quoting the same figure in opposite roles, and `column` pins a
+        # statement row to the column the mark is actually for. Run AFTER
+        # recovery so a recovered mark is held to the same standard as a direct
+        # one. Each is best-effort and independently guarded.
+        if normalized_breakdown and not self._holistic_grading:
+            for _guard_name, _guard in (
+                (
+                    "sign",
+                    lambda: _apply_sign_verification(
+                        normalized_breakdown,
+                        expected_amount_map=self._expected_amount_by_criterion_last_run,
+                        sign_sensitive_criteria=self._sign_sensitive_criteria_last_run,
+                    ),
+                ),
+                (
+                    "column",
+                    lambda: _apply_column_verification(
+                        normalized_breakdown,
+                        column_map=self._column_by_criterion_last_run,
+                        expected_amount_map=self._expected_amount_by_criterion_last_run,
+                        student_text=self._student_text_last_run or "",
+                    ),
+                ),
+                (
+                    "focus-mismatch",
+                    lambda: (
+                        evidence_warnings.extend(
+                            _detect_criterion_focus_mismatch(
+                                normalized_breakdown,
+                                criterion_id_by_desc={
+                                    d: c for c, d in
+                                    (self._criterion_id_map_last_run or {}).items()
+                                },
+                                of_component_of_map=self._of_component_of_by_criterion_last_run,
+                                of_ids_map=self._of_ids_by_criterion_last_run,
+                                of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                            )
+                        ) or 0.0
+                    ),
+                ),
+                (
+                    "section-locality",
+                    lambda: _apply_section_locality_guard(
+                        normalized_breakdown,
+                        student_text=self._student_text_last_run or "",
+                        criterion_id_by_desc={
+                            d: c for c, d in
+                            (self._criterion_id_map_last_run or {}).items()
+                        },
+                        of_component_of_map=self._of_component_of_by_criterion_last_run,
+                        of_ids_map=self._of_ids_by_criterion_last_run,
+                        of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                    ),
+                ),
+                ("contradiction", lambda: _reject_contradictory_awards(
+                    normalized_breakdown
+                )),
+            ):
+                try:
+                    sum_awarded_calc -= _guard()
+                except Exception:
+                    logger.debug(f"{_guard_name} guard skipped", exc_info=True)
 
         # Broad-criterion gating (generic) - SKIP for holistic grading:
         # If a high-mark narrative criterion sits next to many micro-criteria (<= 0.5 each),
@@ -6426,6 +7834,168 @@ class StudentGrader:
         if total_max > 0:
             rounded_total = min(rounded_total, total_max)
 
+        # ── Rubric completeness ─────────────────────────────────────────────
+        # Every scoreable rubric criterion must appear in the saved breakdown,
+        # even when the grading model never returned it. Without this an
+        # omission is SILENT: the criterion simply vanishes from the CSV and
+        # the annotated PDF, so a student can lose a mark for work they plainly
+        # did and nobody can see why it happened. Observed repeatedly on
+        # "Fair value adjustment (land) = 400", where the student wrote
+        # "Land fair value uplift 0.4m" and the criterion was never assessed.
+        #
+        # Appended at 0 marks with an explicit reason, so this NEVER changes a
+        # score — total_max comes from the model answer's max_marks, not from
+        # summing the breakdown. It only makes the gap visible for review.
+        if not self._holistic_grading and self._allowed_criteria_last_run:
+            try:
+                _seen_crits: set[str] = set()
+                for _bi in normalized_breakdown:
+                    _c = _bi.get("criterion")
+                    if isinstance(_c, str):
+                        _seen_crits.add(_c)
+                    # Components folded into a [Combined] entry are represented
+                    # there and must not be re-added as missing.
+                    for _comp in (_bi.get("components") or []):
+                        _cd = _comp.get("criterion_description")
+                        if isinstance(_cd, str):
+                            _seen_crits.add(_cd)
+
+                _cat_map = self._criterion_category_map_last_run or {}
+                _max_map = self._criterion_max_map_last_run or {}
+                _pos_map = self._rubric_position_last_run or {}
+                _never_returned = [
+                    _c for _c in self._allowed_criteria_last_run
+                    if _c not in _seen_crits
+                    and (_cat_map.get(_c, "") or "").lower() != "section_header"
+                ]
+                # Keep rubric order so the CSV reads in mark-scheme sequence.
+                _never_returned.sort(key=lambda c: _pos_map.get(c, 10 ** 6))
+
+                for _c in _never_returned:
+                    normalized_breakdown.append({
+                        "criterion": _c,
+                        "marks_awarded": 0.0,
+                        "max_possible": float(_max_map.get(_c, 0) or 0),
+                        "reason": (
+                            "NOT ASSESSED - the grading model did not return "
+                            "this criterion, so no judgement was made on it "
+                            "either way. Added at 0 for visibility; review "
+                            "manually before releasing the mark."
+                        ),
+                        "evidence": "",
+                        "evidence_list": [],
+                        "comments_summary": "",
+                        "_not_returned_by_model": True,
+                    })
+
+                if _never_returned:
+                    _lost = sum(float(_max_map.get(_c, 0) or 0) for _c in _never_returned)
+                    logger.warning(
+                        f"Rubric completeness: {len(_never_returned)} of "
+                        f"{len(self._allowed_criteria_last_run)} criteria were never "
+                        f"returned by the grading model ({_lost:g} marks unassessed). "
+                        f"Added at 0 marks for visibility:"
+                    )
+                    for _c in _never_returned[:20]:
+                        logger.warning(f"  not-returned: '{_c[:100]}...'")
+            except Exception:
+                # Visibility aid only - must never break a grading run.
+                logger.warning("Rubric completeness check failed", exc_info=True)
+
+        # ── "Marks given above / below" notes ────────────────────────────────
+        # A marker writes these beside a line where the student REPEATS a point
+        # that was credited somewhere else, pointing the reader to where the
+        # marks actually are. The breakdown carries exactly one entry per
+        # criterion, and that entry's evidence is the credited line - so the
+        # repeat has no slot of its own. We give it one here: a zero-mark,
+        # zero-max entry anchored on the repeated line, which the annotator
+        # already knows how to render as the note.
+        #
+        # Scores are untouched: marks_awarded and max_possible are both 0, and
+        # the totals above are already final.
+        try:
+            _student_hay_notes = _norm_for_evidence_match(
+                getattr(self, "_student_text_last_run", "") or ""
+            )
+            _already_anchored = {
+                _norm_for_evidence_match(_e)
+                for _bi in normalized_breakdown
+                for _e in (_bi.get("evidence_list") or [])
+                if str(_e or "").strip()
+            }
+            # Ask the restatement pass where the student repeats a credited
+            # point, and merge anything the grading model happened to volunteer
+            # in `restated_at`. Both feed the same list.
+            _by_id: dict[str, dict] = {}
+            for _bi in normalized_breakdown:
+                _cid_k = str(_bi.get("criterion_id", "") or "").strip().upper()
+                if _cid_k and float(_bi.get("marks_awarded", 0) or 0) > 0:
+                    _by_id.setdefault(_cid_k, _bi)
+            for _cid_k, _line in self._find_restatements(_by_id):
+                _tgt = _by_id.get(_cid_k)
+                if _tgt is not None:
+                    _tgt.setdefault("_restated_at", [])
+                    if _line not in _tgt["_restated_at"]:
+                        _tgt["_restated_at"].append(_line)
+
+            _notes: list[dict] = []
+            for _bi in list(normalized_breakdown):
+                _lines = _bi.get("_restated_at") or []
+                if not _lines or float(_bi.get("marks_awarded", 0) or 0) <= 0:
+                    continue
+                _credited_ev = _norm_for_evidence_match(_bi.get("evidence", "") or "")
+                _credited_pos = (_student_hay_notes.find(_credited_ev)
+                                 if _credited_ev else -1)
+                _cid_log = _bi.get("criterion_id", "") or "?"
+                for _line in _lines:
+                    _ln_norm = _norm_for_evidence_match(_line)
+                    # Never put a note on a line that earns marks somewhere.
+                    if not _ln_norm:
+                        logger.info(f"    DROP  [{_cid_log}] line normalises to nothing")
+                        continue
+                    if _ln_norm in _already_anchored:
+                        logger.info(f"    DROP  [{_cid_log}] line already earns marks "
+                                    f"elsewhere | {_line[:55]}")
+                        continue
+                    _ln_pos = _student_hay_notes.find(_ln_norm)
+                    if _ln_pos < 0:
+                        logger.info(f"    DROP  [{_cid_log}] not verbatim in the script "
+                                    f"| {_line[:55]}")
+                        continue
+                    if _credited_pos < 0 or _credited_pos == _ln_pos:
+                        _dir_note = "above"
+                    else:
+                        _dir_note = "below" if _credited_pos > _ln_pos else "above"
+                    _already_anchored.add(_ln_norm)
+                    logger.info(f"    NOTE  [{_cid_log}] \"Marks given {_dir_note}\" on: "
+                                f"{_line[:55]}")
+                    logger.info(f"          marks are at: "
+                                f"{(_bi.get('evidence') or '')[:55]}")
+                    _notes.append({
+                        "criterion_id": _bi.get("criterion_id", ""),
+                        "criterion": _bi.get("criterion", ""),
+                        "marks_awarded": 0.0,
+                        "max_possible": 0.0,
+                        "reason": (
+                            f"Marks given {_dir_note}: this point is credited at "
+                            f"'{(_bi.get('evidence') or '')[:60]}'."
+                        ),
+                        "evidence": _line,
+                        "evidence_list": [_line],
+                        "comments_summary": "",
+                        "_restated_note": True,
+                    })
+            if _notes:
+                normalized_breakdown.extend(_notes)
+                _above = sum(1 for _n in _notes if "given above" in _n["reason"])
+                logger.info(f"  ADDED {len(_notes)} note(s): {_above} above, "
+                            f"{len(_notes) - _above} below")
+            else:
+                logger.info("  ADDED 0 notes - no repeated point survived the checks")
+            logger.info("=" * 62)
+        except Exception:
+            logger.warning("Restatement note generation failed", exc_info=True)
+
         # Debug logs
         logger.info(f"Raw LLM breakdown count: {len(main_grade.get('breakdown', []))}")
         if _dropped_out_of_rubric:
@@ -6485,6 +8055,36 @@ class StudentGrader:
                     )
             except Exception:
                 logger.warning("Aggregate merge pass failed - keeping un-merged breakdown", exc_info=True)
+
+        # ── Restore mark-scheme order ────────────────────────────────────────
+        # Until here the breakdown sits in the order the grading model happened
+        # to emit criteria, so the CSV and the marker's review jump around the
+        # paper - MM22 before MM15, ESR05 before ESR03, the restatement notes
+        # all bunched at the end away from the criteria they annotate. Sort by
+        # the criterion's position in the rubric so both read in mark-scheme
+        # sequence. A merged aggregate entry has no rubric description of its
+        # own, so it takes the earliest position among its components.
+        try:
+            _pos = self._rubric_position_last_run or {}
+            if _pos:
+                _END = 10 ** 6
+
+                def _rubric_pos(item: dict) -> int:
+                    crit = str(item.get("criterion", "") or "")
+                    if crit in _pos:
+                        return _pos[crit]
+                    best = _END
+                    for comp in (item.get("components") or []):
+                        cd = comp.get("criterion_description")
+                        if isinstance(cd, str) and cd in _pos:
+                            best = min(best, _pos[cd])
+                    return best
+
+                # Stable, so criteria sharing a position (a criterion plus its
+                # "marks given above/below" notes) keep their existing order.
+                normalized_breakdown.sort(key=_rubric_pos)
+        except Exception:
+            logger.warning("Rubric-order sort failed - keeping emitted order", exc_info=True)
 
         doc = {
             "student_id": self.student_name,

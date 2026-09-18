@@ -73,11 +73,16 @@ Avoid double-counting:
 • If marks have already been awarded for a calculation in an earlier criterion, do NOT award again for the same calculation in a later criterion.
 
 DUPLICATE POINTS (CRITICAL):
-• Same calculation / journal / narrative point written twice → credit ONLY the first occurrence. Use the FIRST occurrence as the evidence (so the tick lands on it).
-• For the DUPLICATE occurrence, do NOT add it as evidence anywhere. Instead emit a comment:
-  "<5-10 word verbatim quote from the duplicate> → Marks already given above for this point. <one-sentence improvement>."
-  (use "below" if the duplicate is earlier than the primary occurrence).
-• Marks follow the WORK, not the conclusion. Award at the location where the student actually performs the calculation or writes the journal; later references to the same result earn nothing extra.
+• The same calculation / journal / narrative point made twice → credit it ONCE.
+• Credit the occurrence that SHOWS THE WORK, not the one that merely states the answer. Marks follow the working. If the student asserts a figure in a sentence and derives it in a working or table elsewhere, the marks belong on the DERIVATION and `evidence` must quote that line — even when the bare statement came first.
+• Then list the OTHER occurrence in `restated_at`. This is how a real marker writes "Marks given above" / "Marks given below" beside the repeated line, and it is the ONLY way to produce that note — you still emit exactly ONE breakdown entry per criterion_id, so the repeat has nowhere else to go.
+    "criterion_id": "MM16",
+    "marks_awarded": 0.25,
+    "evidence": ["less goodwill -11,725,000.00"],          <- where the marks are
+    "restated_at": ["Firstly, the goodwill on acquisition was: 11,725,000."]
+  You do NOT write the words "above" or "below" — the direction is worked out from where the lines actually sit on the page.
+• Put a line in `restated_at` whenever the student makes the same point a second time and it earns nothing extra: a figure asserted in prose and derived in a working, a total repeated in a later working, a sentence that announces what a table below will show. Quote it VERBATIM. Leave the field out when there is no repeat.
+• Never let a `restated_at` line be the `evidence` of any criterion — it earns no marks, so nothing may be anchored on it.
 • A working (e.g. W2: NCI at disposal = £6,975,000) and a subsequent journal that USES that figure (Dr NCI 6,975,000) are NOT duplicates — each is a distinct skill, each criterion earns its own marks.
 • Two DISTINCT calculations that happen to share wording (different amounts, different accounts) are NOT duplicates — keep them separate.
 
@@ -88,58 +93,21 @@ Many rubrics deliberately assess the SAME numeric value at MULTIPLE DIFFERENT po
   • Reserves 2,750 (acq-date), Land 400, and other figures may each appear at multiple working sections in the model answer.
 When a criterion carries `of_component_of: OFX` in the rubric, that tag identifies the WORKING SECTION the criterion belongs to. Two criteria with DIFFERENT `of_component_of` values (e.g., #5 = OF1 for net assets at acq, #12 = OF12 for net assets at disposal) are testing DIFFERENT SKILLS at DIFFERENT POINTS in the answer — they are NOT duplicates.
 
-Rule: if the student's answer shows the required value in BOTH working contexts (e.g., a `disposal date | acq date | post acq` table with 250 in both the disposal and acq columns), award BOTH criteria their full marks. Do NOT emit "Marks given above" across different `of_component_of` groups.
+Rule: if the student's answer shows the required value in BOTH working contexts (e.g., a `disposal date | acq date | post acq` table with 250 in both the disposal and acq columns), award BOTH criteria their full marks. Do NOT emit "Marks given above" or "Marks given below" across different `of_component_of` groups.
 
-Only emit "Marks given above" when the two criteria are in the SAME working section (same `of_component_of`, or when neither has an OF group and the criteria describe conceptually identical points).
+Only emit "Marks given above"/"Marks given below" when the two criteria are in the SAME working section (same `of_component_of`, or when neither has an OF group and the criteria describe conceptually identical points).
 
-COLUMN-HEADER HINT FOR TABULAR DATA (MANDATORY when same value appears in multiple columns):
+COLUMN-HEADER HINT FOR TABULAR DATA (MANDATORY when the same value appears in multiple columns):
 
-When the student's answer contains a TABLE ROW where the SAME numeric value appears in MULTIPLE COLUMNS (e.g. `share cap | 250,000 | 250,000 | 0` — 250,000 in both disposal-date and acq-date columns), you MUST tell the annotator WHICH column your target is in.
+When your target value appears in MORE THAN ONE COLUMN of the student's table row, add a field `_column_header` to the breakdown item holding the EXACT column-header text from the student's answer. The annotator finds that header's x-position and picks the matching value aligned under it; without the hint it takes the first match on the row, which is often the wrong column.
 
-Do this by adding a field `_column_header` to the breakdown item, containing the EXACT column-header text from the student's PDF (e.g., "acq date", "disposal date", "post acq").
-
-The annotator uses this to disambiguate: it finds the header's x-position on the page, then picks the value hit whose x-position aligns with that column.
-
-When to emit `_column_header`:
-  • The criterion targets a specific value AND the same value appears in >1 column of the student's row.
-  • Skip when the value is unique on the row (annotator's default first-hit rule is fine).
-  • Skip for non-tabular criteria.
-
-Examples (from the Bauhaus MM table with columns `disposal date | acq date | post acq`):
-
-  Student wrote:
-    net assets w2 | disposal date | acq date | post acq
-    share cap | 250,000 | 250,000 | 0
-    reserves w4 | 18,150,000.00 | 2,750,000 | 15,400,000.00
-    land | 400000 | 400000 | 0
-
-  Criterion "Share capital (500,000 x 50p) = 250" (target = 250,000 in ACQ DATE column):
-    evidence_list = ["share cap | 250,000 | 250,000 | 0"]
+  Student row:  `share cap | 250,000 | 250,000 | 0`
+  under headers `disposal date | acq date | post acq`
+  A criterion targeting the ACQUISITION-date figure emits:
+    evidence_list  = ["share cap | 250,000 | 250,000 | 0"]
     _column_header = "acq date"
 
-  Criterion "Net assets at disposal — share-capital component £0.25m" (target = 250,000 in DISPOSAL DATE column):
-    evidence_list = ["share cap | 250,000 | 250,000 | 0"]
-    _column_header = "disposal date"
-
-  Criterion "Reserves = 2,750" (target = 2,750,000 in ACQ DATE column — but unique on row):
-    evidence_list = ["reserves w4 | 18,150,000.00 | 2,750,000 | 15,400,000.00"]
-    _column_header = "acq date"   (optional here since the value is unique, but harmless to include)
-
-  Criterion "[Combined] Net assets at disposal" merged (target = 18,150,000.00 in DISPOSAL DATE column, unique):
-    evidence_list = ["reserves w4 | 18,150,000.00 | 2,750,000 | 15,400,000.00"]
-    _column_header = "disposal date"
-
-  Criterion "Fair value adjustment (land) = 400" (target = 400000 in ACQ DATE column):
-    evidence_list = ["land | 400000 | 400000 | 0"]
-    _column_header = "acq date"
-
-Why this works: the annotator finds "acq date" (or "disposal date") on the page, gets its x-center, then among all matches of the target value on the row, picks the one closest to the column's x-center.
-
-`_column_header` VALUE RULES:
-  • Copy the header text VERBATIM from the student's PDF (case-sensitive-ish; searching handles minor case differences).
-  • Do NOT invent column names that don't exist in the student's text.
-  • Do NOT include pipe delimiters — just the header words (e.g. "acq date", NOT "| acq date |").
-  • If you can't find a clear header for the target column, leave `_column_header` unset — the annotator will fall back to first-hit.
+Rules: copy the header VERBATIM from the student's text; no pipe delimiters; never invent a header that isn't there; omit the field when the value is unique on the row, when the criterion isn't tabular, or when no clear header exists.
 
 
 EVIDENCE FOR NARRATIVE CRITERIA — SINGLE STATEMENT, NO WORKINGS (MANDATORY):
@@ -174,6 +142,85 @@ When a criterion's `category` in the rubric is "narrative" (or the criterion des
     • Two criteria = two separate evidence anchors. Never share.
 
 "Own figure" (OF) rule (CRITICAL):
+
+DECIDE IT IN THIS ORDER. Do not weigh the case as a whole — work the steps and
+stop at the first that applies. Graded three times, the same script has scored
+8.5, 7.0 and 7.5 purely because this call was made differently each time, so
+treat it as a procedure, not a judgement.
+
+  STEP 1 — Does the criterion's OWN text grant own figures? Wording such as
+  "Award on the student's own X", "the student's own figures are acceptable",
+  or "award on their own figure if theirs differs" is the rubric author telling
+  you the figure is NOT what is being tested here. If present, and the student
+  applied the right method, AWARD FULL MARKS and stop. Do not reopen the
+  question because the number differs from the model answer — that the number
+  differs is the situation the wording exists for.
+
+  STEP 2 — TRACE THE OF TO ITS ORIGIN AND READ THE STUDENT'S VALUE THERE.
+  An own figure is not a feeling about whether the answer looks close. Every OF
+  is created at exactly one place, and that place is marked in the rubric. Do
+  this lookup rather than estimating:
+
+    (a) The criterion lists `of_source_ids`. For each id, find its ORIGIN — the
+        criterion whose `of_ids` holds that id, or, for a virtual origin, the
+        entry in `of_definitions`.
+    (b) Take the origin's `of_value_label` ("Net assets at acquisition",
+        "Goodwill (working total)") and find the STUDENT'S OWN figure for it in
+        their script. For a virtual origin, it is whatever their component lines
+        sum to.
+    (c) THAT figure is the student's OF value for this id. It replaces the model
+        answer's value everywhere downstream, for this student.
+    (d) Award FULL MARKS if the criterion you are grading applies the model
+        answer's METHOD to that figure. Whether the figure equals the model
+        answer's is irrelevant and must not enter the decision.
+
+  THE ONE DISTINCTION THAT MATTERS AT THE ORIGIN — wrong number vs wrong method:
+    • Wrong NUMBER at the origin → the method was right, the input was not.
+      OF carries downstream. Goodwill computed as cost + NCI − net assets, where
+      the student used net assets of 3,000 instead of 3,400 and reached 12,125:
+      that is the right method. Every later use of 12,125 earns its mark.
+    • Wrong METHOD at the origin → nothing to carry. A student who measures a
+      share-based payment at the £210 EXERCISE PRICE where the £24 grant-date
+      FAIR VALUE was required has not mis-keyed an input; they have valued the
+      wrong thing. Their 9,840 is not an own figure, and criteria downstream of
+      it score 0.
+  Tell the two apart by asking: could a correct method have produced this figure
+  from some earlier number of theirs? If yes it is a wrong number; if the shape
+  of the calculation itself is wrong, it is a wrong method.
+
+  APPLY THAT TEST AT THIS CRITERION'S OWN LEVEL — DO NOT FOLLOW THE CHAIN DOWN.
+  Ask only: is the step THIS criterion tests performed correctly on the
+  student's figure? What happened further upstream is that criterion's business,
+  and the student was already marked there. Following the chain down charges
+  them twice for one mistake, which is exactly what own-figure marking exists to
+  prevent.
+    Worked example — the release of goodwill on disposal:
+      The student's net-assets-at-acquisition working omits the £400k land
+      adjustment, so it reads 3,000 instead of 3,400, and their goodwill comes
+      out at 12,125 instead of 11,725. They then release 12,125 on disposal.
+      • The omission is marked at the NET-ASSETS criterion, which scores 0.
+      • The DISPOSAL criterion tests whether goodwill is released. They released
+        their goodwill correctly → FULL MARKS on their own figure of 12,125.
+      A reason such as "goodwill released is based on an incomplete
+      acquisition-date net-assets calculation" is this error: the incompleteness
+      belongs to the criterion above, not this one.
+
+  STEP 3 — Withhold ONLY for a reason on this list. There are no others:
+      • Dr/Cr direction reversed
+      • a fundamentally different account (Revenue where NCI was required)
+      • a genuinely different formula shape, not the same formula with a
+        different input
+      • the ORIGIN of the OF was a wrong METHOD, not a wrong number (STEP 2)
+      • the student never produced the figure at all — it appears from nowhere
+        and traces to no earlier working of theirs
+
+NEVER withhold an OF mark with a reason of the form "X is incorrectly
+calculated as N" or "uses incorrect figure N". A figure differing from the
+model answer is the PREMISE of own-figure marking, never a ground for refusing
+it. The student was already penalised where that figure was computed; charging
+them again downstream is double-penalising one mistake. If you find yourself
+writing such a reason, STEP 1 or STEP 2 almost certainly applied.
+
 When a student's earlier working produced a wrong value and they then use THAT SAME wrong value in a downstream criterion:
 • CALCULATION downstream → award FULL marks if the method/formula matches the model answer. UK professional-exam convention: the method is what's tested; students are not penalised twice for one wrong input.
 • JOURNAL downstream → award FULL max marks if:
@@ -272,8 +319,9 @@ Worked example (this is a real over-award to avoid):
 
 Rule of thumb: if a sub-component's parent calc would produce value X but the student's working produces a different value Y, the sub-component belongs to Y's criterion (not X's). Never credit sub-components for a parent calc the student did not perform.
 
-One-student-working-earns-one-credit (CRITICAL):
-When a student wrote a calculation or narrative ONCE, credit AT MOST ONE criterion for it. Multiple rubric criteria may all reference the same numbers (e.g., a 9-month profit derivation is an input to a subsidiary contribution criterion AND a balance-sheet component criterion AND several NCI sub-mark criteria). But the student who wrote `7.2m × 9/12 = 5.4m` ONCE has demonstrated ONE piece of accounting work — a real marker awards ONE mark. Do NOT award every criterion whose expected values happen to appear inside that single working. Pick the criterion the working MOST DIRECTLY demonstrates, credit that, and set the others to 0 (they can still earn marks if the student SEPARATELY performed their specific work).
+Judge each criterion_id on its own merits (CRITICAL):
+Work through the criterion_id list one id at a time and ask only: does the student's answer satisfy THIS criterion? Do not withhold a criterion because a neighbouring criterion already scored on the same page or the same working - the rubric decides what is separately assessable, not you. Many rubrics deliberately award several sub-marks out of one working (see `of_component_of` above): when the student's figures satisfy each of those sub-criteria, award each of them.
+The one thing you must not do is credit the SAME criterion twice, or use a value the student never wrote. Genuine repetition of an identical point is handled by the DUPLICATE POINTS rule above.
 
 Totals:
 • score MUST equal the exact sum of marks_awarded values in breakdown.
@@ -346,9 +394,37 @@ CRITERION DESCRIPTIONS (CRITICAL)
 ═══════════════════════════════════════════════════
 MANDATORY COMPLETENESS
 ═══════════════════════════════════════════════════
-• Output ONE breakdown entry for EVERY criterion in model_data.marking_criteria.
+• Every criterion carries a short "criterion_id" (e.g. MM07, TB03, NYW12).
+  Before you write the JSON, list every criterion_id in model_data.marking_criteria.
+  Your breakdown must contain EXACTLY ONE entry per id on that list — same count,
+  no id missing, no id twice, no id invented.
+• A criterion with NO criterion_id is a section heading, not something to
+  grade: leave it out of the breakdown entirely.
 • Criteria worth 0 marks must still appear with marks_awarded = 0.
-• Never combine multiple criteria into one entry.
+• Never combine multiple criteria into one entry. Two criteria may look almost
+  identical and differ by one figure, one date, or one column — they are still
+  two separate ids and each needs its own entry, judged on its own merits.
+
+• `criterion_focus` (REQUIRED on every entry). A phrase of at most 8 words
+  naming what THIS criterion tests, taken from the criterion's own wording
+  BEFORE any "DISAMBIGUATION" or "CONTEXT" section. It is a self-check on the
+  id you just wrote: if the focus you write does not describe the criterion
+  whose id you put beside it, you have paired the wrong id with your reasoning.
+
+  Name the ROLE, not just the figure. Sections routinely contain two criteria
+  quoting the SAME amount in OPPOSITE roles, and those are the pairs that get
+  swapped:
+      the 300 EARNED as a revaluation gain   ≠  the 300 later ELIMINATED
+      goodwill REMEASURED at the closing rate ≠  the exchange movement taken to OCI
+      Andrea's figure being WRONG             ≠  full consolidation being REQUIRED
+  "300" or "goodwill" alone does not distinguish these; "revaluation gain to
+  OCI" and "existing surplus eliminated" do.
+
+  Examples:
+      criterion_id "ESR03" → criterion_focus "revaluation gain to OCI"
+      criterion_id "ESR05" → criterion_focus "revaluation loss balancing figure"
+      criterion_id "NYW06" → criterion_focus "goodwill remeasured at closing rate"
+      criterion_id "NYW12" → criterion_focus "exchange movement to OCI and SOCIE"
 
 ═══════════════════════════════════════════════════
 TABLES AND JOURNALS
@@ -453,11 +529,13 @@ OUTPUT FORMAT — return ONLY valid JSON, nothing else
       "correct_words": ["<verbatim phrase from student>", "..."],
       "breakdown": [
         {{
-          "criterion": "<exact criterion description from marking_criteria>",
+          "criterion_id": "<the criterion_id copied EXACTLY, e.g. TB03>",
+          "criterion": "<first 8 words of the criterion description — the id identifies it, do NOT retype the whole description>",
           "marks_awarded": <number>,
           "max_possible": <number>,
           "reason": "<brief reason for award or zero>",
-          "evidence": ["<verbatim phrase from student answer>", "..."]
+          "evidence": ["<verbatim phrase from student answer>", "..."],
+          "restated_at": ["<verbatim line where the student repeats this same point for no extra marks>"]
         }}
       ],
       "not_required_points": [
@@ -1038,3 +1116,81 @@ Constraints:
 
 grade_prompt = ChatPromptTemplate.from_template(GRADE_PROMPT_TEMPLATE)
 holistic_grade_prompt = ChatPromptTemplate.from_template(HOLISTIC_GRADE_PROMPT_TEMPLATE)
+
+
+RESTATEMENT_PROMPT_TEMPLATE = """
+You are helping a marker finish annotating an exam script. The marking is DONE
+and you must not change any of it.
+
+A marker reads down the page. Every so often they meet a line where the student
+makes a point they have ALREADY given marks for somewhere else, and they write
+"Marks given above" or "Marks given below" beside it, so the student knows the
+point was seen and credited, just not there.
+
+Your job is that read-through. Below is every line of the student's answer that
+earned NOTHING. Go through them IN ORDER and decide, for each one: is this the
+student making a point that already got marks elsewhere?
+
+You never write "above" or "below" - the direction is worked out afterwards
+from the page positions. You only say WHICH line and WHICH point.
+
+═══════════════════════════════════════════════════
+THE POINTS THAT WERE CREDITED, GROUPED BY WORKING
+═══════════════════════════════════════════════════
+{credited}
+
+═══════════════════════════════════════════════════
+LINES THAT EARNED NOTHING - DECIDE ABOUT EACH ONE
+═══════════════════════════════════════════════════
+{unmarked_lines}
+
+═══════════════════════════════════════════════════
+HOW TO DECIDE
+═══════════════════════════════════════════════════
+Flag the line when a marker reading it would think "the student is making that
+same point again here". The usual shapes:
+
+  • A figure ANNOUNCED in a sentence and then derived in a working below it.
+    "Firstly, the goodwill on acquisition was: 11,725,000." announces the result
+    of the goodwill working. The working's credited rows are its components -
+    12,000, 3,125, (3,400) - and none of them contains 11,725,000. It is still
+    the same point. This is why the working's RESULT is given to you above.
+  • A sentence announcing what a table below is about to show.
+    "The journal entries should be as follows:" restates the journal beneath it.
+  • A total built in one working and carried into a later one.
+    "b/f reserves 18,150,000.00" where that figure was credited in the net
+    assets working; "add back nci 6,975,000.00" where the NCI working earned
+    the marks.
+  • A conclusion restated in a summary after the work was done.
+
+Do NOT flag a line when:
+  • It is a DIFFERENT step that happens to use the same number. A working that
+    produces a figure and a journal that posts it are two different pieces of
+    work, each with its own marks - not one point made twice.
+  • It merely contains a similar number with no connection to the credited point.
+  • It is simply wrong, or an attempt that earned nothing anywhere. A line that
+    was never credited at all gets no pointer - there is nothing to point to.
+
+Match on the POINT, not on the digits. Work through the whole list rather than
+stopping at the first few; a long script usually has ten to fifteen of these,
+and returning only one or two means the list was skimmed. Where you genuinely
+cannot tell, leave it out.
+
+═══════════════════════════════════════════════════
+OUTPUT FORMAT - return ONLY valid JSON, nothing else
+═══════════════════════════════════════════════════
+{{
+  "restatements": [
+    {{
+      "criterion_id": "<id of the credited point being repeated>",
+      "line": "<the line, copied EXACTLY as it appears in the list above>",
+      "why": "<a few words: what makes this the same point>"
+    }}
+  ]
+}}
+
+Copy each line character-for-character, without its leading number. A line that
+cannot be matched back to the list is discarded.
+"""
+
+restatement_prompt = ChatPromptTemplate.from_template(RESTATEMENT_PROMPT_TEMPLATE)
